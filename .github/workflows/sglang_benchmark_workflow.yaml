@@ -56,6 +56,7 @@ jobs:
           RUN git clone https://github.com/ZLkanyo009/aiter.git /aiter && \
             cd /aiter && \
             git checkout "qwen3vl-project" && \
+            git checkout caa3a9b404b757f15effb7acfafb1bfa7573ecac && \
             git submodule sync && git submodule update --init --recursive && \
             python3 setup.py develop
 
@@ -64,6 +65,7 @@ jobs:
           RUN git clone https://github.com/zejunchen-zejun/sglang.git /sglang-checkout && \
               cd /sglang-checkout && \
               git checkout dev/perf && \
+              git checkout 610bd8bf9cd121edc1f4188495a43b7765b78fbf && \
               git rev-parse HEAD && \
               pip install --upgrade pip && \
               pip install "transformers>=4.57.0" && \

@@ -93,9 +93,12 @@ CPP_DTYPE_MAP = {
     torch.float: "fp32_t",
     torch.float16: "fp16_t",
     torch.bfloat16: "bf16_t",
+<<<<<<< HEAD
     torch.int8: "int8_t",
     torch.int32: "int32_t",
     torch.int64: "int64_t",
+=======
+>>>>>>> 19cbc6a12 (Revert "[jit kernel] Support per_token_group_quant_8bit jit kernel" (#19131))
 }
 
 

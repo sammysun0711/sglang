@@ -636,7 +636,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None or forward_batch.forward_mode.is_idle():
+            if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
@@ -2163,6 +2163,23 @@ class AiterAttnBackend(AttentionBackend):
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
 
+                if layer.layer_id == 0 and _use_mla_ps_kernel:
+                    self.make_mla_meta_data(
+                        self.forward_metadata.qo_indptr,
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_last_page_len,
+                        work_metadata,
+                        work_info_set,
+                        work_indptr,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                        self.forward_metadata.max_q_len,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
+
                 mla_decode_fwd(
                     q,
                     K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -2204,6 +2221,23 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map = self.forward_metadata.reduce_partial_map
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
+
+                if layer.layer_id == 0 and _use_mla_ps_kernel:
+                    self.make_mla_meta_data(
+                        self.forward_metadata.qo_indptr,
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_last_page_len,
+                        work_metadata,
+                        work_info_set,
+                        work_indptr,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                        self.forward_metadata.max_q_len,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
 
                 if self.forward_metadata.run_graph is not True:
 
@@ -2421,6 +2455,23 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map = self.forward_metadata.reduce_partial_map
 
             num_kv_splits = self.forward_metadata.num_kv_splits
+
+            if layer.layer_id == 0 and _use_mla_ps_kernel:
+                self.make_mla_meta_data(
+                    self.forward_metadata.qo_indptr,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_last_page_len,
+                    work_metadata,
+                    work_info_set,
+                    work_indptr,
+                    reduce_indptr,
+                    reduce_final_map,
+                    reduce_partial_map,
+                    self.forward_metadata.max_q_len,
+                    fast_mode=fast_mode,
+                    max_split_per_batch=num_kv_splits,
+                    intra_batch_mode=intra_batch_mode,
+                )
 
             mla_decode_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

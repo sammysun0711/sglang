@@ -1,4 +1,4 @@
-from __future__ import annotations
+sfrom __future__ import annotations
 
 import bisect
 from typing import TYPE_CHECKING, Callable

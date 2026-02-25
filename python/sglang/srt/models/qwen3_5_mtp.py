@@ -22,7 +22,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import Qwen3_5RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -58,7 +58,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.pp_group = get_pp_group()
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-        RMSNorm_cls = GemmaRMSNorm
+        RMSNorm_cls = Qwen3_5RMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
         )

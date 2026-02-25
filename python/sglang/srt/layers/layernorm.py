@@ -523,6 +523,151 @@ class GemmaRMSNorm(MultiPlatformOp):
         return self._forward_impl(x, residual, post_residual_addition)
 
 
+class Qwen3_5RMSNorm(MultiPlatformOp):
+    """vLLM-style Gemma RMSNorm for Qwen3.5 only.
+
+    Same math as GemmaRMSNorm (x * (1 + w), cast after scale) but uses
+    PyTorch-native + torch.compile on CUDA/HIP to match vLLM custom ops.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    @staticmethod
+    def _forward_static_no_residual(
+        weight: torch.Tensor,
+        variance_epsilon: float,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + variance_epsilon)
+        x = x * (1.0 + weight.float())
+        return x.to(orig_dtype)
+
+    @staticmethod
+    def _forward_static_with_residual(
+        weight: torch.Tensor,
+        variance_epsilon: float,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = x.dtype
+        x = (
+            x.float() + residual.float()
+            if orig_dtype == torch.float16
+            else x + residual
+        )
+        residual = x
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + variance_epsilon)
+        x = x * (1.0 + weight.float())
+        return x.to(orig_dtype), residual
+
+    def _forward_vllm_style(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None or post_residual_addition is not None:
+            if residual is None:
+                residual = post_residual_addition
+            elif post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            if torch.compiler.is_compiling():
+                return self.forward_native(x, residual, None)
+            if not getattr(self, "_qwen35_rms_compiled", False):
+                self._compiled_with_residual = torch.compile(
+                    Qwen3_5RMSNorm._forward_static_with_residual
+                )
+                self._compiled_no_residual = torch.compile(
+                    Qwen3_5RMSNorm._forward_static_no_residual
+                )
+                self._qwen35_rms_compiled = True
+            return self._compiled_with_residual(
+                self.weight.data, self.variance_epsilon, x, residual
+            )
+        if torch.compiler.is_compiling():
+            return self.forward_native(x, None, None)
+        if not getattr(self, "_qwen35_rms_compiled", False):
+            self._compiled_with_residual = torch.compile(
+                Qwen3_5RMSNorm._forward_static_with_residual
+            )
+            self._compiled_no_residual = torch.compile(
+                Qwen3_5RMSNorm._forward_static_no_residual
+            )
+            self._qwen35_rms_compiled = True
+        return self._compiled_no_residual(
+            self.weight.data, self.variance_epsilon, x
+        )
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None or post_residual_addition is not None:
+            if residual is None:
+                residual = post_residual_addition
+            elif post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            x = x + residual
+            residual = x
+        orig_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        x = x * (1.0 + self.weight.float())
+        x = x.to(orig_dtype)
+        return x if residual is None else (x, residual)
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self._forward_vllm_style(x, residual, post_residual_addition)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self._forward_vllm_style(x, residual, post_residual_addition)
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual, post_residual_addition)
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual, post_residual_addition)
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual, post_residual_addition)
+
+
 class Gemma3RMSNorm(MultiPlatformOp):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()

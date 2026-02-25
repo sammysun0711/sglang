@@ -47,8 +47,8 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 
-# Layers - Others
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+# Layers - Others (Qwen3.5 uses vLLM-style Gemma RMSNorm)
+from sglang.srt.layers.layernorm import Qwen3_5RMSNorm
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -363,8 +363,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_communicator = LayerCommunicator(
@@ -536,13 +536,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -697,7 +697,7 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Final normalization
         if self.pp_group.is_last_rank:
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens

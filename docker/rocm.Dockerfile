@@ -40,6 +40,16 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.11.post1"
 
 # ===============================
+# Base image 942 with rocm720 and args
+FROM $BASE_IMAGE_942_ROCM720 AS gfx942-rocm720
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.10.post3"
+
+# ===============================
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
@@ -47,7 +57,11 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+<<<<<<< HEAD
 ENV AITER_COMMIT="v0.1.11.post1"
+=======
+ENV AITER_COMMIT="v0.1.10.post3"
+>>>>>>> 3c5434127 ([AMD] Merge Dockerfiles for ROCm (#19203))
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -57,7 +71,11 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+<<<<<<< HEAD
 ENV AITER_COMMIT="v0.1.11.post1"
+=======
+ENV AITER_COMMIT="v0.1.10.post3"
+>>>>>>> 3c5434127 ([AMD] Merge Dockerfiles for ROCm (#19203))
 
 # ===============================
 # Chosen arch and args
@@ -172,7 +190,10 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter \
+<<<<<<< HEAD
  && pip install flydsl==0.0.1.dev95158637 \
+=======
+>>>>>>> 3c5434127 ([AMD] Merge Dockerfiles for ROCm (#19203))
  && pip install psutil pybind11 # Required by AITER setup.py
 RUN git clone ${AITER_REPO} \
  && cd aiter \
@@ -193,10 +214,14 @@ RUN set -eux; \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
         ;; \
     esac
+<<<<<<< HEAD
 # [WA] from kk-huang
 # add sed -i '/c1 = torch.empty((M, D, S1 + S3) for aiter triton gemm config issue
 # the corresponding pr is https://github.com/ROCm/aiter/pull/2173
 # it will be removed when server launched issue is fixed by aiter
+=======
+
+>>>>>>> 3c5434127 ([AMD] Merge Dockerfiles for ROCm (#19203))
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && sed -i '/c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)/i\    config = dict(config)' aiter/ops/triton/gemm/fused/fused_gemm_afp4wfp4_split_cat.py \
@@ -207,7 +232,11 @@ RUN cd aiter \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
         else \
+<<<<<<< HEAD
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \
+=======
+          sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+>>>>>>> 3c5434127 ([AMD] Merge Dockerfiles for ROCm (#19203))
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 

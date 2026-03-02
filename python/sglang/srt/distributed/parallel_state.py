@@ -377,7 +377,11 @@ class GroupCoordinator:
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         elif self.world_size > 1 and is_hip():
-            logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
+            logger.info(
+                "[AR] All-reduce call path for group '%s': NCCL (custom AR disabled). "
+                "TP group uses custom AR + QuickReduce when enabled.",
+                self.unique_name,
+            )
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -589,7 +593,19 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
+        # When ROCM_QUICK_REDUCE_QUANTIZATION is set (INT4/INT6/INT8/FP), prefer
+        # QuickReduce over custom allreduce so the quick reduce kernel is used
+        # when the tensor meets size/dtype constraints (see _QR_MIN_SIZE in
+        # quick_all_reduce.py). Otherwise custom allreduce is tried first.
+        use_quick_reduce_env = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE") not in ("NONE", "")
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+            and use_quick_reduce_env
+        ):
+            outplace_all_reduce_method = "qr"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)

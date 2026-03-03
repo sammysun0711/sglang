@@ -632,41 +632,23 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
-        rmsnorm_type: int = 0,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator.
-
-        rmsnorm_type: 0 = standard RMSNorm (scale = weight), 1 = Gemma RMSNorm (scale = 1 + weight).
-        """
+        """Attempt fused all-reduce + standard RMSNorm via custom all-reduce communicator."""
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
 
-        # Prefer communicator-native fused API when provided.
         if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
             try:
                 return ca_comm.fused_allreduce_rmsnorm(
-                    input_, residual_inp_, weight_, eps, rmsnorm_type
+                    input_, residual_inp_, weight_, eps
                 )
-            except TypeError:
-                # Backend may not support rmsnorm_type (e.g. older aiter); try without.
-                try:
-                    return ca_comm.fused_allreduce_rmsnorm(
-                        input_, residual_inp_, weight_, eps
-                    )
-                except Exception:
-                    pass
             except Exception:
-                # Fall back to custom_fused_ar_rms path below.
                 pass
 
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage policy for fused AR+RMSNorm:
-        # 1) Explicit env override wins.
-        # 2) Deterministic inference forces 1-stage for reproducibility.
-        # 3) Otherwise follow AITER's heuristic (small payloads only).
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
@@ -681,25 +663,58 @@ class GroupCoordinator:
                 4096,
             }
 
-        try:
-            fused_outputs = ca_comm.custom_fused_ar_rms(
-                input_,
-                residual_inp_,
-                weight_,
-                eps,
-                use_1stage_ar,
-                rmsnorm_type=rmsnorm_type,
-            )
-        except TypeError:
-            # Backend may not support rmsnorm_type.
-            fused_outputs = ca_comm.custom_fused_ar_rms(
-                input_,
-                residual_inp_,
-                weight_,
-                eps,
-                use_1stage_ar,
-            )
-        return fused_outputs
+        return ca_comm.custom_fused_ar_rms(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+        )
+
+    def fused_allreduce_gemma_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Attempt fused all-reduce + Gemma RMSNorm via custom all-reduce communicator."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        if hasattr(ca_comm, "fused_allreduce_gemma_rmsnorm"):
+            try:
+                return ca_comm.fused_allreduce_gemma_rmsnorm(
+                    input_, residual_inp_, weight_, eps
+                )
+            except Exception:
+                pass
+
+        if not hasattr(ca_comm, "custom_fused_ar_gemma_rms"):
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            use_1stage_ar = True
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            hidden_dim = input_.shape[-1]
+            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
+                512,
+                1024,
+                2048,
+                4096,
+            }
+
+        return ca_comm.custom_fused_ar_gemma_rms(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+        )
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str

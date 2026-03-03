@@ -10,6 +10,10 @@ It reports:
 - fused availability (whether fused path returns non-None)
 - correctness (fused output matches split allreduce + rmsnorm reference)
 
+RMSNorm variants (--rmsnorm-type):
+- standard: scale = weight (default, e.g. Qwen3)
+- gemma: scale = 1 + weight (Gemma3-style)
+
 Usage example:
   torchrun --nproc_per_node=8 \
     benchmark/kernels/all_reduce/benchmark_fused_ar_rms_amd.py \
@@ -17,6 +21,11 @@ Usage example:
     --prefill-shapes 2048x8192,8192x8192 \
     --decode-shapes 1x8192,4x8192,16x8192 \
     --warmup 10 --iters 30 --repeats 5
+
+  # Gemma RMSNorm test:
+  torchrun --nproc_per_node=8 \
+    benchmark/kernels/all_reduce/benchmark_fused_ar_rms_amd.py \
+    --rmsnorm-type gemma --dtype bfloat16
 """
 
 import argparse
@@ -169,16 +178,31 @@ def _make_inputs(
 
 
 def _split_reference(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    rmsnorm_type: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference: allreduce + residual + RMSNorm. rmsnorm_type 0=standard, 1=Gemma (scale=1+weight)."""
     ar_out = tensor_model_parallel_all_reduce(x.clone())
     residual_out = ar_out + residual
-    out = F.rms_norm(
-        input=residual_out,
-        normalized_shape=(residual_out.shape[-1],),
-        weight=weight,
-        eps=eps,
-    )
+    if rmsnorm_type == 1:
+        # Gemma: scale = 1 + weight
+        scale = 1.0 + weight.to(residual_out.dtype)
+        out = F.rms_norm(
+            input=residual_out,
+            normalized_shape=(residual_out.shape[-1],),
+            weight=scale,
+            eps=eps,
+        )
+    else:
+        out = F.rms_norm(
+            input=residual_out,
+            normalized_shape=(residual_out.shape[-1],),
+            weight=weight,
+            eps=eps,
+        )
     return out, residual_out
 
 
@@ -190,12 +214,13 @@ def bench_eager(
     warmup: int,
     iters: int,
     repeats: int,
+    rmsnorm_type: int = 0,
 ) -> Dict[str, object]:
-    split_fn = lambda: _split_reference(x, residual, weight, eps)
+    split_fn = lambda: _split_reference(x, residual, weight, eps, rmsnorm_type)
     split_us, split_stats = _measure_us(split_fn, warmup, iters, repeats, x.device)
 
     fused_probe = tensor_model_parallel_fused_allreduce_rmsnorm(
-        x.clone(), residual.clone(), weight, eps
+        x.clone(), residual.clone(), weight, eps, rmsnorm_type
     )
     fused_available = fused_probe is not None
 
@@ -203,14 +228,14 @@ def bench_eager(
     fused_stats: Optional[Dict[str, float]] = None
     if fused_available:
         fused_fn = lambda: tensor_model_parallel_fused_allreduce_rmsnorm(
-            x, residual, weight, eps
+            x, residual, weight, eps, rmsnorm_type
         )
         fused_us, fused_stats = _measure_us(fused_fn, warmup, iters, repeats, x.device)
 
-    ref_out, ref_residual = _split_reference(x, residual, weight, eps)
+    ref_out, ref_residual = _split_reference(x, residual, weight, eps, rmsnorm_type)
     if fused_available:
         fused_out, fused_residual = tensor_model_parallel_fused_allreduce_rmsnorm(
-            x.clone(), residual.clone(), weight, eps
+            x.clone(), residual.clone(), weight, eps, rmsnorm_type
         )
         out_ok, out_detail = check_close(fused_out, ref_out, x.dtype)
         res_ok, res_detail = check_close(fused_residual, ref_residual, x.dtype)
@@ -239,6 +264,7 @@ def bench_graph(
     warmup: int,
     iters: int,
     repeats: int,
+    rmsnorm_type: int = 0,
 ) -> Dict[str, object]:
     split_x = x.clone()
     split_res = residual.clone()
@@ -247,7 +273,9 @@ def bench_graph(
     with graph_capture() as gc:
         split_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(split_graph, stream=gc.stream):
-            split_graph_out, _ = _split_reference(split_x, split_res, weight, eps)
+            split_graph_out, _ = _split_reference(
+                split_x, split_res, weight, eps, rmsnorm_type
+            )
 
     def split_replay():
         split_graph.replay()
@@ -255,7 +283,7 @@ def bench_graph(
     split_us, split_stats = _measure_us(split_replay, warmup, iters, repeats, x.device)
 
     fused_probe = tensor_model_parallel_fused_allreduce_rmsnorm(
-        x.clone(), residual.clone(), weight, eps
+        x.clone(), residual.clone(), weight, eps, rmsnorm_type
     )
     fused_available = fused_probe is not None
 
@@ -263,6 +291,7 @@ def bench_graph(
     fused_stats: Optional[Dict[str, float]] = None
     fused_graph_out: Optional[torch.Tensor] = None
     fused_graph_residual: Optional[torch.Tensor] = None
+    fused_graph = None
 
     if fused_available:
         fused_x = x.clone()
@@ -272,7 +301,7 @@ def bench_graph(
             with torch.cuda.graph(fused_graph, stream=gc.stream):
                 fused_graph_out, fused_graph_residual = (
                     tensor_model_parallel_fused_allreduce_rmsnorm(
-                        fused_x, fused_res, weight, eps
+                        fused_x, fused_res, weight, eps, rmsnorm_type
                     )
                 )
 
@@ -283,9 +312,10 @@ def bench_graph(
             fused_replay, warmup, iters, repeats, x.device
         )
 
-    ref_out, ref_residual = _split_reference(x, residual, weight, eps)
+    ref_out, ref_residual = _split_reference(x, residual, weight, eps, rmsnorm_type)
     if (
         fused_available
+        and fused_graph is not None
         and fused_graph_out is not None
         and fused_graph_residual is not None
     ):
@@ -335,6 +365,13 @@ def parse_args():
         help="Use residual=x (self) to match aiter test behavior by default.",
     )
     parser.add_argument(
+        "--rmsnorm-type",
+        type=str,
+        default="standard",
+        choices=["standard", "gemma"],
+        help="RMSNorm variant: standard (scale=weight) or gemma (scale=1+weight).",
+    )
+    parser.add_argument(
         "--prefill-shapes",
         type=str,
         default="2048x8192,8192x8192,16384x8192",
@@ -373,6 +410,8 @@ def main():
     torch.cuda.set_device(local_rank % torch.cuda.device_count())
     device = torch.device(f"cuda:{local_rank % torch.cuda.device_count()}")
 
+    rmsnorm_type = 1 if args.rmsnorm_type == "gemma" else 0
+
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
@@ -390,6 +429,7 @@ def main():
         print(
             "Config: "
             f"world_size={world_size}, dtype={dtype}, residual_mode={args.residual_mode}, "
+            f"rmsnorm_type={args.rmsnorm_type} ({rmsnorm_type}), "
             f"warmup={args.warmup}, iters={args.iters}, repeats={args.repeats}"
         )
 
@@ -432,6 +472,7 @@ def main():
                     warmup=args.warmup,
                     iters=args.iters,
                     repeats=args.repeats,
+                    rmsnorm_type=rmsnorm_type,
                 )
             else:
                 metrics = bench_graph(
@@ -442,6 +483,7 @@ def main():
                     warmup=args.warmup,
                     iters=args.iters,
                     repeats=args.repeats,
+                    rmsnorm_type=rmsnorm_type,
                 )
 
             split_us = _mean_across_ranks(float(metrics["split_us"]), device)
@@ -494,6 +536,7 @@ def main():
                         "dtype": str(dtype),
                         "world_size": world_size,
                         "residual_mode": args.residual_mode,
+                        "rmsnorm_type": args.rmsnorm_type,
                         "warmup": args.warmup,
                         "iters": args.iters,
                         "repeats": args.repeats,
@@ -517,6 +560,7 @@ def main():
             "dtype",
             "world_size",
             "residual_mode",
+            "rmsnorm_type",
             "warmup",
             "iters",
             "repeats",

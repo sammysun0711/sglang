@@ -632,8 +632,12 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
+        rmsnorm_type: int = 0,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
+        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator.
+
+        rmsnorm_type: 0 = standard RMSNorm (scale = weight), 1 = Gemma RMSNorm (scale = 1 + weight).
+        """
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -642,8 +646,16 @@ class GroupCoordinator:
         if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
             try:
                 return ca_comm.fused_allreduce_rmsnorm(
-                    input_, residual_inp_, weight_, eps
+                    input_, residual_inp_, weight_, eps, rmsnorm_type
                 )
+            except TypeError:
+                # Backend may not support rmsnorm_type (e.g. older aiter); try without.
+                try:
+                    return ca_comm.fused_allreduce_rmsnorm(
+                        input_, residual_inp_, weight_, eps
+                    )
+                except Exception:
+                    pass
             except Exception:
                 # Fall back to custom_fused_ar_rms path below.
                 pass
@@ -669,13 +681,24 @@ class GroupCoordinator:
                 4096,
             }
 
-        fused_outputs = ca_comm.custom_fused_ar_rms(
-            input_,
-            residual_inp_,
-            weight_,
-            eps,
-            use_1stage_ar,
-        )
+        try:
+            fused_outputs = ca_comm.custom_fused_ar_rms(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+                rmsnorm_type=rmsnorm_type,
+            )
+        except TypeError:
+            # Backend may not support rmsnorm_type.
+            fused_outputs = ca_comm.custom_fused_ar_rms(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+            )
         return fused_outputs
 
     def _all_reduce_out_place(

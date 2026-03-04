@@ -522,6 +522,39 @@ class GemmaRMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
 
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward method with allreduce fusion, using AITER fused
+        allreduce + Gemma RMSNorm when available.
+        """
+        if residual is not None and _use_aiter:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+                tensor_model_parallel_fused_allreduce_gemma_rmsnorm,
+            )
+
+            if get_tensor_model_parallel_world_size() > 1:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+
+                fused_result = tensor_model_parallel_fused_allreduce_gemma_rmsnorm(
+                    x, residual, self.weight, self.variance_epsilon
+                )
+                if fused_result is not None:
+                    return fused_result
+
+                if get_global_server_args().enable_aiter_allreduce_fusion:
+                    x = tensor_model_parallel_all_reduce(x)
+                    return self.forward(x, residual, None)
+
+        return self.forward(x, residual, post_residual_addition)
+
 
 class Gemma3RMSNorm(MultiPlatformOp):
     def __init__(self, dim: int, eps: float = 1e-6):

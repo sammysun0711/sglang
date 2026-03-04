@@ -799,7 +799,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            hidden_states,
+            forward_batch,
+            use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         )
 
         if should_allreduce_fusion:

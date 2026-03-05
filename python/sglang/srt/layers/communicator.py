@@ -439,25 +439,39 @@ class LayerCommunicator:
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
-            if (
-                residual is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+            use_fused_path = (
+                hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
-            ):
-                if (
+                and (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
-                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    hidden_states, residual = (
-                        self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual
-                        )
+                )
+                and hasattr(self.input_layernorm, "forward_with_allreduce_fusion")
+            )
+            if use_fused_path:
+                # Fused allreduce + layernorm (with residual or zeros for first layer).
+                if residual is None:
+                    residual = torch.zeros_like(
+                        hidden_states,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
                     )
-                else:
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                    hidden_states, residual = self.input_layernorm(
+                hidden_states, residual = (
+                    self.input_layernorm.forward_with_allreduce_fusion(
                         hidden_states, residual
                     )
+                )
+            elif (
+                hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                and hidden_states._sglang_needs_allreduce_fusion
+            ):
+                # Flag set but fusion not available: allreduce then layernorm.
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if residual is None:
+                    residual = hidden_states
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
             else:
                 if residual is None:
                     residual = hidden_states

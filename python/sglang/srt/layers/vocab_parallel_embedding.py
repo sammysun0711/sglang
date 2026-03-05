@@ -18,7 +18,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator import (
+    apply_aiter_all_reduce_fusion,
+    apply_flashinfer_allreduce_fusion,
+    get_attn_tp_context,
+)
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     get_attention_tp_rank,
@@ -492,11 +497,20 @@ class VocabParallelEmbedding(torch.nn.Module):
             # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             if not get_attn_tp_context().input_scattered:
-                if self.use_attn_tp_group:
-                    output_parallel = attn_tp_all_reduce(output_parallel)
+                fuse_with_first_layer = (
+                    apply_aiter_all_reduce_fusion(output_parallel)
+                    or apply_flashinfer_allreduce_fusion(output_parallel.shape[0])
+                )
+                if fuse_with_first_layer:
+                    # Skip allreduce; first layer will do fused allreduce + layernorm.
+                    output_parallel._sglang_needs_allreduce_fusion = True
                 else:
-                    # Reduce across all the model parallel GPUs.
-                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+                    if self.use_attn_tp_group:
+                        output_parallel = attn_tp_all_reduce(output_parallel)
+                    else:
+                        output_parallel = tensor_model_parallel_all_reduce(
+                            output_parallel
+                        )
         return output_parallel
 
     def extra_repr(self) -> str:

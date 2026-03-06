@@ -12,19 +12,15 @@ echo "max concurrency: ${max_concurrency}"
 echo "num prompts: ${num_prompts}"
 echo "dataset-name: ${dataset_name}"
 
-export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export SGLANG_USE_AITER=1
-
 python3 -m sglang.bench_serving \
     --backend sglang \
     --model ${model} \
     --dataset-name ${dataset_name} \
     --host localhost \
-    --port 8000 \
+    --port 9000 \
     --num-prompts ${num_prompts} \
     --random-input ${input_tokens} \
     --random-output ${output_tokens} \
     --random-range-ratio 1.0 \
-    --max-concurrency ${max_concurrency} \
-    --flush-cache --profile \
+    --max-concurrency ${max_concurrency}
     2>&1 | tee pure_text_perf.log

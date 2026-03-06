@@ -1,10 +1,10 @@
 # Set Environment
 
 1. Docker image:
-
    ```
    rocm/sgl-dev:v0.5.9-rocm720-mi30x-20260301
    ```
+
 2. Install aiter:
    ```
    pip uninstall aiter
@@ -14,7 +14,8 @@
    git submodule sync && git submodule update --init --recursive
    python3 setup.py develop
    ```
-4. Install sglang:
+
+3. Install sglang:
    ```
    pip uninstall sglang
    git clone -b dev/perf https://github.com/sammysun0711/sglang.git
@@ -43,7 +44,7 @@
     ```
 
     - Download the original FP8 model from Hugging Face:
-    huggingface-cli download Qwen/Qwen3.5-397B-A17B --local-dir /models/Qwen/Qwen3.5-397B-A17B-FP8
+    huggingface-cli download Qwen/Qwen3.5-397B-A17B-FP8 --local-dir /models/Qwen/Qwen3.5-397B-A17B-FP8
 
 - launch server:
 
@@ -64,7 +65,6 @@
 # Curl request
    curl a single request to quickly check the functionality
 
- ### TODO
    Then curl a single quickly request
    ```
     curl --request POST \
@@ -100,7 +100,7 @@
    ```
 
 # Benchmark
-The benchmarks for Qwen3.5-397B-A17B are conducted in three distinct scenarios.
+The benchmarks guide for Qwen3.5-397B-A17B 
 
 ## Pure Text
     ```bash

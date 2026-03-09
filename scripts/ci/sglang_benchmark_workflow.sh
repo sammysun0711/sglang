@@ -29,6 +29,11 @@ if [[ "${TYPE}" == "launch" ]]; then
         export SGLANG_USE_AITER=1
         export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 
+        echo "********** AOT Prebuild aiter kernel start ... **********"
+        cd /aiter
+        python3 op_tests/test_gemma_rms_norm.py
+        echo "********** AOT Prebuild aiter kernel finished ... **********"
+
         python -m sglang.launch_server \
             --model-path "${model_path}" \
             --port 9000 \

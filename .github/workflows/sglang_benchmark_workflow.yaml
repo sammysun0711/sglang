@@ -61,8 +61,8 @@ jobs:
           ENV PYTORCH_ROCM_ARCH="gfx950"
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
           RUN pip uninstall -y aiter amd-aiter
-          RUN rm -rf /opt/aiter/aiter/jit/build
-          RUN rm -rf /opt/aiter/aiter/jit/*.so
+          RUN rm -rf /sgl-workspace/aiter/aiter/jit/build
+          RUN rm -rf /sgl-workspace/aiter/aiter/jit/*.so
           RUN rm -rf ~/.aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
@@ -140,7 +140,7 @@ jobs:
           set -ex
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/models/Qwen3.5-397B-A17B/ 8 60"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen3.5-397B-A17B/ 8 60"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -152,7 +152,7 @@ jobs:
         run: |
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/models/Qwen3.5-397B-A17B/ 8"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen3.5-397B-A17B/ 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -164,7 +164,7 @@ jobs:
         run: |
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/models/Qwen3.5-397B-A17B/ 8"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/Qwen3.5-397B-A17B/ 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1

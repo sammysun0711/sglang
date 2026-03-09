@@ -57,8 +57,8 @@ jobs:
         run: |
           cat <<'EOF' > Dockerfile.mod
           FROM ${{ env.IMAGE }}
-          ENV GPU_ARCHS="gfx950"
-          ENV PYTORCH_ROCM_ARCH="gfx950"
+          ENV GPU_ARCHS="gfx942;gfx950"
+          ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
           RUN pip uninstall -y aiter amd-aiter
           RUN rm -rf /sgl-workspace/aiter/aiter/jit/build
@@ -116,15 +116,17 @@ jobs:
 
           echo "Starting container: sglang_test:ci"
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
-          --ipc=host --group-add video \
+          --device=/dev/mem \
+          --ipc=host  --network=host --group-add video \
           --shm-size 16g \
-          --network=host \
           --privileged \
+          --cap-add=CAP_SYS_ADMIN \
           --cap-add=SYS_PTRACE \
           -v /data/models:/models \
           --security-opt seccomp=unconfined \
           -w /sglang-checkout \
           --name sglang_test \
+          sglang_test:ci
           sglang_test:ci
 
       - name: Show Aiter version
@@ -177,3 +179,4 @@ jobs:
           docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" 2>/dev/null || true
           docker stop sglang_test 2>/dev/null || true
           docker rm sglang_test 2>/dev/null || true
+          docker image prune -f 2>/dev/null || true

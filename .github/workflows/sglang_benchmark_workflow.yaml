@@ -14,7 +14,7 @@ on:
         description: 'Image to use for the benchmark (default: "rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301")'
         required: true
         default: "rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301"
-  
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -63,6 +63,7 @@ jobs:
           RUN pip uninstall -y aiter amd-aiter
           RUN rm -rf /sgl-workspace/aiter/aiter/jit/build
           RUN rm -rf /sgl-workspace/aiter/aiter/jit/*.so
+          RUN rm -rf /sgl-workspace/aiter/
           RUN rm -rf ~/.aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11

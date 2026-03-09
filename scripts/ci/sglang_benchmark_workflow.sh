@@ -33,7 +33,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         cd /aiter
         python3 op_tests/test_gemma_rms_norm.py
         echo "********** AOT Prebuild aiter kernel finished ... **********"
-
+        cd /sglang-checkout
         python -m sglang.launch_server \
             --model-path "${model_path}" \
             --port 9000 \
@@ -70,39 +70,39 @@ if [[ "${TYPE}" == "launch" ]]; then
         exit 1
     fi
 
-    # echo
-    # echo "========== TESTING SERVER ========"
-    # echo "Testing server with test image"
-    # curl --request POST \
-    #      --url "http://localhost:9000/v1/chat/completions" \
-    #      --header "Content-Type: application/json" \
-    #      --data '{
-    #                 "model": "/models/Qwen3.5-397B-A17B",
-    #                 "messages": [
-    #                 {
-    #                     "role": "user",
-    #                     "content": [
-    #                     {
-    #                         "type": "image_url",
-    #                         "image_url": {
-    #                         "url": "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3.5/demo/CI_Demo/mathv-1327.jpg"
-    #                         }
-    #                     },
-    #                     {
-    #                         "type": "text",
-    #                         "text": "Describe this image in detail."
-    #                     }
-    #                     ]
-    #                 }
-    #                 ],
-    #                 "temperature": 0.0,
-    #                 "top_p": 1.0,
-    #                 "max_tokens": 100
-    #             }'
-    # else
-    #     echo "Unknown model_name: ${model_name}"
-    #     exit 1
-    # fi
+    echo
+    echo "========== TESTING SERVER ========"
+    echo "Testing server with test image"
+    curl --request POST \
+         --url "http://localhost:9000/v1/chat/completions" \
+         --header "Content-Type: application/json" \
+         --data '{
+                    "model": ${model_path}",
+                    "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                            "url": "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3.5/demo/CI_Demo/mathv-1327.jpg"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in detail."
+                        }
+                        ]
+                    }
+                    ],
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "max_tokens": 100
+                }'
+    else
+        echo "Unknown model_name: ${model_name}"
+        exit 1
+    fi
 
 elif [[ "${TYPE}" == "evaluation" ]]; then
     echo
@@ -113,7 +113,7 @@ elif [[ "${TYPE}" == "evaluation" ]]; then
             --max-new-tokens 512 \
             | tee vision_model_evaluation_${model_name}_TP${TP}.log
 
-elif [[ "${TYPE}" == "performance" ]] || [[ "${TYPE}" == "benchmark" ]]; then
+elif [[ "${TYPE}" == "benchmark" ]]; then
     echo
     echo "========== STARTING PERFORMANCE BENCHMARK =========="
     model="${model_path}"
@@ -145,7 +145,7 @@ elif [[ "${TYPE}" == "performance" ]] || [[ "${TYPE}" == "benchmark" ]]; then
 
 else
     echo "Unknown TYPE: ${TYPE}"
-    echo "Usage: $0 {launch|evaluation|performance|benchmark} [model_name] [model_path] [TP] [TIMEOUT]"
+    echo "Usage: $0 {launch|evaluation|benchmark} [model_name] [model_path] [TP] [TIMEOUT]"
     exit 1
 fi
 

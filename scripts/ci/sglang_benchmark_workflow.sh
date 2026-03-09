@@ -11,7 +11,7 @@ TIMEOUT=${5:-60}
 export SGLANG_TORCH_PROFILER_DIR=./
 export SGLANG_PROFILE_WITH_STACK=1
 export SGLANG_PROFILE_RECORD_SHAPES=1
-#echo "GPU_ARCHS: ${GPU_ARCHS}"
+
 echo "PYTORCH_ROCM_ARCH: ${PYTORCH_ROCM_ARCH}"
 
 echo "Detect TYPE ${TYPE}"
@@ -77,7 +77,7 @@ if [[ "${TYPE}" == "launch" ]]; then
          --url "http://localhost:9000/v1/chat/completions" \
          --header "Content-Type: application/json" \
          --data '{
-                    "model": ${model_path}",
+                    "model": "${model_path}",
                     "messages": [
                     {
                         "role": "user",

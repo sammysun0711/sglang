@@ -127,7 +127,6 @@ jobs:
           -w /sglang-checkout \
           --name sglang_test \
           sglang_test:ci
-          sglang_test:ci
 
       - name: Show Aiter version
         run: |

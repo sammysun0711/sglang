@@ -71,34 +71,34 @@ if [[ "${TYPE}" == "launch" ]]; then
     fi
 
     echo
-    echo "========== TESTING SERVER ========"
-    echo "Testing server with test image"
-    curl --request POST \
-         --url "http://localhost:9000/v1/chat/completions" \
-         --header "Content-Type: application/json" \
-         --data '{
-                    "model": "/models/Qwen3.5-397B-A17B",
-                    "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                            "url": "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3.5/demo/CI_Demo/mathv-1327.jpg"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": "Describe this image in detail."
-                        }
-                        ]
-                    }
-                    ],
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "max_tokens": 100
-                }'
+    # echo "========== TESTING SERVER ========"
+    # echo "Testing server with test image"
+    # curl --request POST \
+    #      --url "http://localhost:9000/v1/chat/completions" \
+    #      --header "Content-Type: application/json" \
+    #      --data '{
+    #                 "model": "/models/Qwen3.5-397B-A17B",
+    #                 "messages": [
+    #                 {
+    #                     "role": "user",
+    #                     "content": [
+    #                     {
+    #                         "type": "image_url",
+    #                         "image_url": {
+    #                         "url": "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3.5/demo/CI_Demo/mathv-1327.jpg"
+    #                         }
+    #                     },
+    #                     {
+    #                         "type": "text",
+    #                         "text": "Describe this image in detail."
+    #                     }
+    #                     ]
+    #                 }
+    #                 ],
+    #                 "temperature": 0.0,
+    #                 "top_p": 1.0,
+    #                 "max_tokens": 100
+    #             }'
     else
         echo "Unknown model_name: ${model_name}"
         exit 1

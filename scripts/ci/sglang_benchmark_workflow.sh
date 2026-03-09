@@ -99,10 +99,6 @@ if [[ "${TYPE}" == "launch" ]]; then
                     "top_p": 1.0,
                     "max_tokens": 100
                 }'
-    else
-        echo "Unknown model_name: ${model_name}"
-        exit 1
-    fi
 
 elif [[ "${TYPE}" == "evaluation" ]]; then
     echo

@@ -70,7 +70,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         exit 1
     fi
 
-    echo
+    # echo
     # echo "========== TESTING SERVER ========"
     # echo "Testing server with test image"
     # curl --request POST \
@@ -99,10 +99,10 @@ if [[ "${TYPE}" == "launch" ]]; then
     #                 "top_p": 1.0,
     #                 "max_tokens": 100
     #             }'
-    else
-        echo "Unknown model_name: ${model_name}"
-        exit 1
-    fi
+    # else
+    #     echo "Unknown model_name: ${model_name}"
+    #     exit 1
+    # fi
 
 elif [[ "${TYPE}" == "evaluation" ]]; then
     echo

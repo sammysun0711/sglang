@@ -25,23 +25,6 @@ env:
   SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
-  # Runs on GitHub-hosted runner so you can confirm the workflow triggers; does not wait for self-hosted runner.
-  debug:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Workflow context
-        run: |
-          echo "=== Workflow debug ==="
-          echo "event: ${{ github.event_name }}"
-          echo "ref: ${{ github.ref }}"
-          echo "sha: ${{ github.sha }}"
-          echo "repository: ${{ github.repository }}"
-          echo "run_id: ${{ github.run_id }}"
-          echo "run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "requested_runner_label: mi350x-1node-8gpus"
-          echo "model_list: ${{ github.event.inputs.model_list || '[\"Qwen3.5-397B-A17B\"]' }}"
-          echo "=== If 'benchmark' stays queued, check: repo Settings → Actions → Runners → your runner has label 'mi350x-1node-8gpus' and status Idle/Busy (not offline) ==="
-
   benchmark:
     runs-on: mi350x-1node-8gpus
     strategy:
@@ -152,26 +135,36 @@ jobs:
           docker exec sglang_test bash -c "df -h /dev/shm"
 
       - name: Launch the server
-        timeout-minutes: 90
+        timeout-minutes: 60
         run: |
           set -ex
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            # docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/models/Qwen3.5-397B-A17B/ 8 8 90"
-            docker exec sglang_test bash -c "echo 'Not implemented yet'"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/models/Qwen3.5-397B-A17B/ 8 60"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
           fi
-      
+
       - name: Run vision model evaluation
         continue-on-error: true
         timeout-minutes: 60
         run: |
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            # docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/models/Qwen3.5-397B-A17B/ 8 8"
-            docker exec sglang_test bash -c "echo 'Not implemented yet'"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/models/Qwen3.5-397B-A17B/ 8"
+          else
+            echo "Unknown model_name: ${model_name}"
+            exit 1
+          fi
+
+      - name: Run vision model benchmark
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          model_name=${{ matrix.model }}
+          if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/models/Qwen3.5-397B-A17B/ 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -180,4 +173,6 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" || true
+          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" 2>/dev/null || true
+          docker stop sglang_test 2>/dev/null || true
+          docker rm sglang_test 2>/dev/null || true

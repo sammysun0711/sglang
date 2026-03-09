@@ -43,7 +43,7 @@ if [[ "${TYPE}" == "launch" ]]; then
             --reasoning-parser qwen3 \
             --attention-backend triton \
             --disable-radix-cache \
-            --disable-cuda-graph \
+            --cuda-graph-max-bs 64 \
             --watchdog-timeout 1200 &
         sglang_pid=$!
     else

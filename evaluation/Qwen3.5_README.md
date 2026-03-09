@@ -2,7 +2,7 @@
 
 1. Docker image:
    ```
-   rocm/sgl-dev:v0.5.9-rocm720-mi30x-20260301
+   rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301
    ```
 
 2. Install aiter:
@@ -50,7 +50,7 @@
 
     The example command:
     ```bash
-    python -m sglang.launch_server \
+    ROCM_QUICK_REDUCE_QUANTIZATION=INT4 python -m sglang.launch_server \
         --model-path /models/Qwen3.5-397B-A17B \
         --port 9000 \
         --tp-size 8 \

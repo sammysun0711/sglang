@@ -84,10 +84,10 @@ jobs:
               pip install --upgrade pip && \
               pip install "transformers>=4.57.0" && \
               cd sgl-kernel && \
-              python3 setup_rocm.py install && \
+              AMDGPU_TARGET=gfx950 python3 setup_rocm.py install && \
               cd .. && \
               rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && \
-              pip install -e "python[all_hip]"
+              AMDGPU_TARGET=gfx950 PYTORCH_ROCM_ARCH="gfx950" pip install -e "python[all_hip]"
           RUN echo "=== sgl-kernel version after installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version after installation ===" && pip show sglang || true
           EOF

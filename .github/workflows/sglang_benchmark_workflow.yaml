@@ -183,5 +183,6 @@ jobs:
           docker stop sglang_test 2>/dev/null || true
           docker rm sglang_test 2>/dev/null || true
           docker image rm sglang_test:ci 2>/dev/null || true
+          docker rmi -f $(docker images -f "dangling=true" -q) || true
           docker image prune -f 2>/dev/null || true
           docker builder prune -f 2>/dev/null || true

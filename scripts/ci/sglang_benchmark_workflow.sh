@@ -20,7 +20,6 @@ echo "Detect model_path ${model_path}"
 echo "Detect TP ${TP}"
 echo "Detect TIMEOUT ${TIMEOUT}"
 
-
 if [[ "${TYPE}" == "launch" ]]; then
     echo
     echo "========== LAUNCHING SERVER ========"
@@ -77,7 +76,7 @@ if [[ "${TYPE}" == "launch" ]]; then
          --url "http://localhost:9000/v1/chat/completions" \
          --header "Content-Type: application/json" \
          --data '{
-                    "model": "${model_path}",
+                    "model": "'"${model_path}"'",
                     "messages": [
                     {
                         "role": "user",
@@ -103,11 +102,11 @@ if [[ "${TYPE}" == "launch" ]]; then
 elif [[ "${TYPE}" == "evaluation" ]]; then
     echo
     echo "========== STARTING MODEL EVALUATION =========="
-        python3 benchmark/mmmu/bench_sglang.py \
-            --port 9000 \
-            --concurrency 64 \
-            --max-new-tokens 512 \
-            | tee vision_model_evaluation_${model_name}_TP${TP}.log
+    python3 benchmark/mmmu/bench_sglang.py \
+        --port 9000 \
+        --concurrency 64 \
+        --max-new-tokens 512 \
+        | tee vision_model_evaluation_${model_name}_TP${TP}.log
 
 elif [[ "${TYPE}" == "benchmark" ]]; then
     echo

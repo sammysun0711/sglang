@@ -99,7 +99,11 @@ jobs:
       - name: Build Docker image
         run: |
           docker build --no-cache --network=host -t "sglang_test:ci" -f Dockerfile.mod .
-    
+          # Remove dangling images from this build to free disk
+          docker image prune -f
+          # Remove build cache to free more disk
+          docker builder prune -f
+
 
       - name: Start CI container
         run: |
@@ -180,3 +184,4 @@ jobs:
           docker rm sglang_test 2>/dev/null || true
           docker image rm sglang_test:ci 2>/dev/null || true
           docker image prune -f 2>/dev/null || true
+          docker builder prune -f 2>/dev/null || true

@@ -1,9 +1,11 @@
-name: SGLang Benchmark Workflow
+name: SGLang Benchmark Workflow - MI355X
 
 on:
-  pull_request:
-    branches:
-      - dev/perf
+  # Run after MI355X completes (lower priority; self-hosted MI350X may be offline)
+  workflow_run:
+    workflows: ["SGLang Benchmark (MI355X)"]
+    types: [completed]
+    branches: [dev/perf]
   workflow_dispatch:
     inputs:
       model_list:
@@ -21,11 +23,14 @@ concurrency:
 
 env:
   IMAGE: ${{ github.event.inputs.image || 'rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301' }}
-  SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || format('{0}/{1}.git', github.server_url, github.repository) }}
-  SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+  # When triggered by workflow_run (after MI355X), use that run's ref; else use default (workflow_dispatch)
+  SGLANG_GITHUB_REPO_URL: ${{ github.event.workflow_run.head_repository.clone_url || format('{0}/{1}.git', github.server_url, github.repository) }}
+  SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   benchmark:
+    # Only run when MI355X succeeded (so we test the same commit) or when manually dispatched
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: mi350x-1node-8gpus
     strategy:
       fail-fast: false
@@ -35,6 +40,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SGLANG_GITHUB_COMMIT_SHA }}
         
       - name: Download SGLang Image
         run: |

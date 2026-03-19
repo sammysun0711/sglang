@@ -34,6 +34,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         echo "********** AOT Prebuild aiter kernel finished ... **********"
         cd /sglang-checkout
         python -m sglang.launch_server \
+            --model ${model_path} \
             --model-path "${model_path}" \
             --port 9000 \
             --tp-size ${TP} \
@@ -111,7 +112,6 @@ elif [[ "${TYPE}" == "evaluation" ]]; then
 elif [[ "${TYPE}" == "benchmark" ]]; then
     echo
     echo "========== STARTING PERFORMANCE BENCHMARK =========="
-    model="${model_path}"
     input_tokens=8000
     output_tokens=500
     num_prompts=32
@@ -127,7 +127,7 @@ elif [[ "${TYPE}" == "benchmark" ]]; then
 
     python3 -m sglang.bench_serving \
         --backend sglang \
-        --model ${model} \
+        --model ${model_path} \
         --dataset-name ${dataset_name} \
         --host localhost \
         --port 9000 \

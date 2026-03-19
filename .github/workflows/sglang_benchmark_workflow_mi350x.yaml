@@ -1,4 +1,4 @@
-name: SGLang Benchmark Workflow
+name: SGLang Benchmark (MI350X)
 
 on:
   pull_request:

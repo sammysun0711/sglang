@@ -1,4 +1,4 @@
-name: SGLang Benchmark Workflow
+name: SGLang Benchmark (MI355X)
 
 on:
   pull_request:
@@ -149,9 +149,9 @@ jobs:
           set -ex
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen3.5-397B-A17B/ 8 60"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name Qwen/Qwen3.5-397B-A17B/ 8 60"
           elif [ "$model_name" == "Qwen3.5-397B-A17B-FP8" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen3.5-397B-A17B-FP8/ 8 60"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name Qwen/Qwen3.5-397B-A17B-FP8/ 8 60"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -163,9 +163,9 @@ jobs:
         run: |
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen3.5-397B-A17B/ 8"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name Qwen/Qwen3.5-397B-A17B/ 8"
           elif [ "$model_name" == "Qwen3.5-397B-A17B-FP8" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen3.5-397B-A17B-FP8/ 8"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name Qwen/Qwen3.5-397B-A17B-FP8/ 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -177,9 +177,9 @@ jobs:
         run: |
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/Qwen3.5-397B-A17B/ 8"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name Qwen/Qwen3.5-397B-A17B/ 8"
           elif [ "$model_name" == "Qwen3.5-397B-A17B-FP8" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/Qwen3.5-397B-A17B-FP8/ 8"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name Qwen/Qwen3.5-397B-A17B-FP8/ 8"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1

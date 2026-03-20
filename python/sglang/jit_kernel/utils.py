@@ -10,6 +10,7 @@ import torch
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
+
 F = TypeVar("F", bound=Callable[..., Any])
 _FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
 
@@ -91,7 +92,6 @@ class CPPArgList(list[str]):
 CPP_DTYPE_MAP = {
     torch.float: "fp32_t",
     torch.float16: "fp16_t",
-    torch.float8_e4m3fn: "fp8_e4m3_t",
     torch.bfloat16: "bf16_t",
     torch.int8: "int8_t",
     torch.int32: "int32_t",

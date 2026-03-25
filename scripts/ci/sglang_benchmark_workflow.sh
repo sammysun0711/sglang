@@ -36,7 +36,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         python -m sglang.launch_server \
             --model ${model_path} \
             --model-path "${model_path}" \
-            --port 9000 \
+            --port 9100 \
             --tp-size ${TP} \
             --mem-fraction-static 0.8 \
             --context-length 262144 \
@@ -56,7 +56,7 @@ if [[ "${TYPE}" == "launch" ]]; then
     max_retries=${TIMEOUT}
     retry_interval=60
     for ((i=1; i<=max_retries; i++)); do
-        if curl -s http://localhost:9000/v1/completions -o /dev/null; then
+        if curl -s http://localhost:9100/v1/completions -o /dev/null; then
             echo "SGLang server is up."
             break
         fi
@@ -64,7 +64,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         sleep $retry_interval
     done
 
-    if ! curl -s http://localhost:9000/v1/completions -o /dev/null; then
+    if ! curl -s http://localhost:9100/v1/completions -o /dev/null; then
         echo "SGLang server did not start after $((max_retries * retry_interval)) seconds."
         kill $sglang_pid
         exit 1
@@ -74,7 +74,7 @@ if [[ "${TYPE}" == "launch" ]]; then
     echo "========== TESTING SERVER ========"
     echo "Testing server with test image"
     curl --request POST \
-         --url "http://localhost:9000/v1/chat/completions" \
+         --url "http://localhost:9100/v1/chat/completions" \
          --header "Content-Type: application/json" \
          --data '{
                     "model": "'"${model_path}"'",
@@ -104,7 +104,7 @@ elif [[ "${TYPE}" == "evaluation" ]]; then
     echo
     echo "========== STARTING MODEL EVALUATION =========="
     python3 benchmark/mmmu/bench_sglang.py \
-        --port 9000 \
+        --port 9100 \
         --concurrency 64 \
         --max-new-tokens 512 \
         | tee vision_model_evaluation_${model_name}_TP${TP}.log
@@ -130,7 +130,7 @@ elif [[ "${TYPE}" == "benchmark" ]]; then
         --model ${model_path} \
         --dataset-name ${dataset_name} \
         --host localhost \
-        --port 9000 \
+        --port 9100 \
         --num-prompts ${num_prompts} \
         --random-input ${input_tokens} \
         --random-output ${output_tokens} \

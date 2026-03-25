@@ -7,7 +7,7 @@
 
 2. Install aiter:
    ```bash
-   pip uninstall aiter
+   pip uninstall -y aiter
    git clone -b dev/perf https://github.com/sammysun0711/aiter.git
    cd aiter
    git checkout <target_commit>
@@ -17,7 +17,7 @@
 
 3. Install sglang:
    ```bash
-   pip uninstall sglang
+   pip uninstall -y sglang
    git clone -b dev/perf https://github.com/sammysun0711/sglang.git
    cd sglang
    git checkout <target_commit>
@@ -34,7 +34,7 @@
 
 4. Setup Triton
     ```bash
-    pip uninstall triton
+    pip uninstall -y triton
     git clone https://github.com/ROCm/triton -b gluon_ext
     cd triton
     pip install -r python/requirements.txt
@@ -44,6 +44,7 @@
 
 5. Setup pyhip
     ```bash
+    pip uninstall -y pyhip
     git clone https://github.com/tingqli/pyhip.git
     cd pyhip && git checkout fed8898cfd79f3db9474750c22891e704a8329b9
     pip install -e .

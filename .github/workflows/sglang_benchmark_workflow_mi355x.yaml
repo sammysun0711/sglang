@@ -92,7 +92,7 @@ jobs:
           RUN echo "=== sglang version after installation ===" && pip show sglang || true
 
           RUN echo "=== triton version before installation ===" && pip show triton || true
-          RUN pip uninstall triton && \
+           RUN pip uninstall -y triton && \
               git clone https://github.com/ROCm/triton -b gluon_ext && \
               cd triton && \
               pip install -r python/requirements.txt && \
@@ -101,7 +101,8 @@ jobs:
 
           RUN echo "=== triton version after installation ===" && pip show triton || true
 
-          RUN git clone https://github.com/tingqli/pyhip.git && \
+          RUN pip uninstall -y pyhip && \
+              git clone https://github.com/tingqli/pyhip.git && \
               cd pyhip && git checkout fed8898cfd79f3db9474750c22891e704a8329b9 && \
               pip install -e . && \
               cd ..

@@ -118,7 +118,7 @@ elif [[ "${TYPE}" == "benchmark" ]]; then
     max_concurrency=1
     dataset_name="random"
 
-    echo "bench model: ${model}"
+    echo "bench model: ${model_name}"
     echo "input tokens: ${input_tokens}"
     echo "output tokens: ${output_tokens}"
     echo "max concurrency: ${max_concurrency}"

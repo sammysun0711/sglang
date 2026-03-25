@@ -1,12 +1,12 @@
 # Set Environment
 
 1. Docker image:
-   ```
+   ```bash
    rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301
    ```
 
 2. Install aiter:
-   ```
+   ```bash
    pip uninstall aiter
    git clone -b dev/perf https://github.com/sammysun0711/aiter.git
    cd aiter
@@ -16,7 +16,7 @@
    ```
 
 3. Install sglang:
-   ```
+   ```bash
    pip uninstall sglang
    git clone -b dev/perf https://github.com/sammysun0711/sglang.git
    cd sglang
@@ -32,6 +32,23 @@
    pip install -e "python[all_hip]"
    ```
 
+4. Setup Triton
+    ```bash
+    pip uninstall triton
+    git clone https://github.com/ROCm/triton -b gluon_ext
+    cd triton
+    pip install -r python/requirements.txt
+    pip install -e .
+    cd ..
+    ```
+
+5. Setup pyhip
+    ```bash
+    git clone https://github.com/tingqli/pyhip.git
+    cd pyhip && git checkout fed8898cfd79f3db9474750c22891e704a8329b9
+    pip install -e .
+    cd ..
+    ```
 
 # Launch server
 
@@ -50,7 +67,8 @@
 
     The example command:
     ```bash
-    ROCM_QUICK_REDUCE_QUANTIZATION=INT4 python -m sglang.launch_server \
+
+    OPTFLAG="w8a8_gemm,moe" ROCM_QUICK_REDUCE_QUANTIZATION=INT4 python -m sglang.launch_server \
         --model-path /models/Qwen3.5-397B-A17B \
         --port 9000 \
         --tp-size 8 \

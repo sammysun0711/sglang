@@ -27,7 +27,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
         export SGLANG_USE_AITER=1
         export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
-
+        export OPTFLAG="w8a8_gemm,moe"
         echo "********** AOT Prebuild aiter kernel start ... **********"
         cd /aiter
         python3 op_tests/test_gemma_rms_norm.py

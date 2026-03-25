@@ -88,27 +88,29 @@ jobs:
               cd .. && \
               rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && \
               AMDGPU_TARGET=gfx950 PYTORCH_ROCM_ARCH="gfx950" pip install -e "python[all_hip]" && \
-              pip install "transformers==4.57.1" && \
-              cd ..
+              pip install "transformers==4.57.1"
+
           RUN echo "=== transformers version after installation ===" && pip show transformers || true
           RUN echo "=== sgl-kernel version after installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version after installation ===" && pip show sglang || true
 
           RUN echo "=== triton version before installation ===" && pip show triton || true
-           RUN pip uninstall -y triton && \
-              git clone https://github.com/ROCm/triton -b gluon_ext && \
-              cd triton && \
+          RUN pip uninstall -y triton && \
+              git clone https://github.com/ROCm/triton /triton-checkout && \
+              cd /triton-checkout && \
+              git checkout gluon_ext && \
+              git rev-parse HEAD && \
               pip install -r python/requirements.txt && \
-              pip install -e . && \
-              cd ..
+              pip install -e .
 
           RUN echo "=== triton version after installation ===" && pip show triton || true
 
           RUN pip uninstall -y pyhip && \
-              git clone https://github.com/tingqli/pyhip.git && \
-              cd pyhip && git checkout fed8898cfd79f3db9474750c22891e704a8329b9 && \
-              pip install -e . && \
-              cd ..
+              git clone https://github.com/tingqli/pyhip.git /pyhip-checkout && \
+              cd /pyhip-checkout && \
+              git checkout fed8898cfd79f3db9474750c22891e704a8329b9 && \
+              git rev-parse HEAD && \
+              pip install -e .
 
           RUN echo "=== pyhip version after installation ===" && pip show pyhip || true
           EOF

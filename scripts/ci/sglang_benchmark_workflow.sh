@@ -77,7 +77,8 @@ if [[ "${TYPE}" == "launch" ]]; then
         python3 op_tests/test_gemma_rms_norm.py
         echo "********** AOT Prebuild aiter kernel finished ... **********"
         cd /sglang-checkout
-        python -m sglang.launch_server \
+        launch_log="sglang_launch_${model_name}_TP${TP}.log"
+        nohup python -m sglang.launch_server \
             --model ${model_path} \
             --model-path "${model_path}" \
             --port "${PORT}" \
@@ -88,8 +89,11 @@ if [[ "${TYPE}" == "launch" ]]; then
             --attention-backend triton \
             --disable-radix-cache \
             --cuda-graph-max-bs 64 \
-            --watchdog-timeout 1200  2>&1 | tee sglang_launch_${model_name}_TP${TP}.log &
+            --watchdog-timeout 1200 \
+            >"${launch_log}" 2>&1 &
         sglang_pid=$!
+        disown "${sglang_pid}" 2>/dev/null || true
+        echo "launch_server PID ${sglang_pid}, log ${launch_log}"
     else
         echo "Unknown model_name: ${model_name}"
         exit 1

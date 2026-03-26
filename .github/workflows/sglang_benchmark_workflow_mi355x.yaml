@@ -83,7 +83,7 @@ jobs:
               git checkout gluon_ext && \
               git rev-parse HEAD && \
               pip install -r python/requirements.txt && \
-              pip setup.py install
+              python setup.py install
 
           RUN echo "=== triton version after installation ===" && pip show triton || true
 

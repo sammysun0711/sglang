@@ -44,7 +44,7 @@ if [[ "${TYPE}" == "launch" ]]; then
             --attention-backend triton \
             --disable-radix-cache \
             --cuda-graph-max-bs 64 \
-            --watchdog-timeout 1200 &
+            --watchdog-timeout 1200  2>&1 | tee sglang_launch_${model_name}_TP${TP}.log &
         sglang_pid=$!
     else
         echo "Unknown model_name: ${model_name}"
@@ -107,7 +107,7 @@ elif [[ "${TYPE}" == "evaluation" ]]; then
         --port 9000 \
         --concurrency 64 \
         --max-new-tokens 512 \
-        | tee vision_model_evaluation_${model_name}_TP${TP}.log
+        2>&1 | tee vision_model_evaluation_${model_name}_TP${TP}.log
 
 elif [[ "${TYPE}" == "benchmark" ]]; then
     echo

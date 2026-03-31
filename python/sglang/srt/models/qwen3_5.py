@@ -146,23 +146,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("in_proj_z", prefix),
         )
-        self.in_proj_b = ColumnParallelLinear(
+        self.in_proj_ab = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=self.num_v_heads,
+            output_sizes=[self.num_v_heads, self.num_v_heads],
             bias=False,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_b", prefix),
-        )
-        self.in_proj_a = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_a", prefix),
+            prefix=add_prefix("in_proj_ab", prefix),
         )
 
         # Conv1d weight loader setup
@@ -281,11 +272,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
         z, _ = self.in_proj_z(hidden_states)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b, _ = self.in_proj_b(hidden_states)
-        a, _ = self.in_proj_a(hidden_states)
-
-        b = b.contiguous()
-        a = a.contiguous()
+        ab, _ = self.in_proj_ab(hidden_states)
+        a, b = torch.chunk(ab, 2, dim=-1)
 
         core_attn_out = self.attn.forward(
             forward_batch=forward_batch,
@@ -842,6 +830,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("in_proj_ab", "in_proj_a", 0),
+            ("in_proj_ab", "in_proj_b", 1),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1056,6 +1046,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("in_proj_ab", "in_proj_a", 0),
+            ("in_proj_ab", "in_proj_b", 1),
         ]
 
         loaded_params: Set[str] = set()
@@ -1148,6 +1140,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("in_proj_ab", "in_proj_a", 0),
+            ("in_proj_ab", "in_proj_b", 1),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales

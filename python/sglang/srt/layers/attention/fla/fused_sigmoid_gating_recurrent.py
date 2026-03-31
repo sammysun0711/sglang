@@ -35,6 +35,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    A_STRIDE: tl.constexpr,
+    B_STRIDE: tl.constexpr,
     HK_STRIDE: tl.constexpr = 0,
     HV_STRIDE: tl.constexpr = 0,
 ):
@@ -67,7 +69,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_q = q + bos * HK_STRIDE + i_h * K + o_k
     p_k = k + bos * HK_STRIDE + i_h * K + o_k
     p_v = v + bos * HV_STRIDE + i_hv * V + o_v
-    p_b = b + bos * HV + i_hv
+    if IS_KDA:
+        p_b = b + bos * HV + i_hv
+    else:
+        p_b = b + bos * B_STRIDE + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
@@ -76,7 +81,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * A_STRIDE + i_hv
         p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -154,8 +159,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_k += HK_STRIDE
         p_o += HV * V
         p_v += HV_STRIDE
-        p_b += HV
-        p_a += HV
+        if IS_KDA:
+            p_b += HV
+            p_a += HV
+        else:
+            p_b += B_STRIDE
+            p_a += A_STRIDE
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
@@ -204,6 +213,8 @@ def fused_sigmoid_gating_delta_rule_update(
     num_warps = 1
     HK_STRIDE = q.stride(1)
     HV_STRIDE = v.stride(1)
+    A_STRIDE = a.stride(-2)
+    B_STRIDE = b.stride(-2)
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -242,6 +253,8 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
+        A_STRIDE=A_STRIDE,
+        B_STRIDE=B_STRIDE,
         HK_STRIDE=HK_STRIDE,
         HV_STRIDE=HV_STRIDE,
     )

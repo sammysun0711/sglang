@@ -85,8 +85,8 @@ class RadixLinearAttention(nn.Module):
             )
             unified_linear_attention_with_output(
                 mixed_qkv,
-                a,
-                b,
+                a.contiguous() if a is not None else None,
+                b.contiguous() if b is not None else None,
                 output,
                 self.layer_id,
             )

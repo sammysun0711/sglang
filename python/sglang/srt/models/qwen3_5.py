@@ -126,43 +126,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # Split projection layers (following vLLM's implementation)
-        # Instead of fused in_proj_qkvz and in_proj_ba, use separate layers
-        self.in_proj_qkv = MergedColumnParallelLinear(
+        self.in_proj_qkvz = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+            output_sizes=[self.key_dim, self.key_dim, self.value_dim, self.value_dim],
             bias=False,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_qkv", prefix),
+            prefix=add_prefix("in_proj_qkvz", prefix),
         )
-        self.in_proj_z = ColumnParallelLinear(
+        self.in_proj_ab = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=self.value_dim,
+            output_sizes=[self.num_v_heads, self.num_v_heads],
             bias=False,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_z", prefix),
-        )
-        self.in_proj_b = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_b", prefix),
-        )
-        self.in_proj_a = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.num_v_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_a", prefix),
+            prefix=add_prefix("in_proj_ab", prefix),
         )
 
         # Conv1d weight loader setup
@@ -277,15 +257,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         3. Output projection
         """
         seq_len, _ = hidden_states.shape
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        mixed_qkv, z = torch.split(mixed_qkvz, [(self.key_dim + self.key_dim + self.value_dim) // self.attn_tp_size, self.value_dim // self.attn_tp_size], dim=-1)
 
-        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-        z, _ = self.in_proj_z(hidden_states)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b, _ = self.in_proj_b(hidden_states)
-        a, _ = self.in_proj_a(hidden_states)
-
-        b = b.contiguous()
-        a = a.contiguous()
+        ab, _ = self.in_proj_ab(hidden_states)
+        a, b = torch.chunk(ab, 2, dim=-1)
 
         core_attn_out = self.attn.forward(
             forward_batch=forward_batch,
@@ -842,6 +819,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("in_proj_ab", "in_proj_a", 0),
+            ("in_proj_ab", "in_proj_b", 1),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1036,6 +1015,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.quant_config = quant_config
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1048,6 +1028,50 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def expand_fused_qkv(self, weights):
+        """Split in_proj_qkv checkpoint tensor into 3 virtual weights.
+
+        Used with stacked_params_mapping to load Q/K/V as shards 0-2 of in_proj_qkvz.
+        """
+        num_k_heads = self.config.linear_num_key_heads
+        head_k_dim = self.config.linear_key_head_dim
+        key_dim = head_k_dim * num_k_heads
+        if self.quant_config.get_name() == 'fp8':
+            block_size = self.quant_config.weight_block_size[0]
+            key_dim_block = key_dim // block_size
+        for name, tensor in weights:
+            if ".in_proj_qkv." in name:
+                if name.endswith(".weight"):
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_q"),
+                        tensor[:key_dim],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_k"),
+                        tensor[key_dim : 2 * key_dim],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_v"),
+                        tensor[2 * key_dim :],
+                    )
+                elif name.endswith(".weight_scale_inv"):
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_q"),
+                        tensor[:key_dim_block],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_k"),
+                        tensor[key_dim_block : 2 * key_dim_block],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_v"),
+                        tensor[2 * key_dim_block :],
+                    )
+                else:
+                    raise ValueError(f"unkown name: {name}")
+            else:
+                yield name, tensor
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1056,7 +1080,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("in_proj_ab", "in_proj_a", 0),
+            ("in_proj_ab", "in_proj_b", 1),
+            ("in_proj_qkvz", "in_proj_q", 0),
+            ("in_proj_qkvz", "in_proj_k", 1),
+            ("in_proj_qkvz", "in_proj_v", 2),
+            ("in_proj_qkvz", "in_proj_z", 3),
         ]
+
+        weights = self.expand_fused_qkv(weights=weights)
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -1128,6 +1160,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.quant_config = quant_config
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1140,6 +1173,50 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def expand_fused_qkv(self, weights):
+        """Split in_proj_qkv checkpoint tensor into 3 virtual weights.
+
+        Used with stacked_params_mapping to load Q/K/V as shards 0-2 of in_proj_qkvz.
+        """
+        num_k_heads = self.config.linear_num_key_heads
+        head_k_dim = self.config.linear_key_head_dim
+        key_dim = head_k_dim * num_k_heads
+        if self.quant_config.get_name() == 'fp8':
+            block_size = self.quant_config.weight_block_size[0]
+            key_dim_block = key_dim // block_size
+        for name, tensor in weights:
+            if ".in_proj_qkv." in name:
+                if name.endswith(".weight"):
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_q"),
+                        tensor[:key_dim],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_k"),
+                        tensor[key_dim : 2 * key_dim],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_v"),
+                        tensor[2 * key_dim :],
+                    )
+                elif name.endswith(".weight_scale_inv"):
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_q"),
+                        tensor[:key_dim_block],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_k"),
+                        tensor[key_dim_block : 2 * key_dim_block],
+                    )
+                    yield (
+                        name.replace("in_proj_qkv", "in_proj_v"),
+                        tensor[2 * key_dim_block :],
+                    )
+                else:
+                    raise ValueError(f"unkown name: {name}")
+            else:
+                yield name, tensor
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1148,7 +1225,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("in_proj_ab", "in_proj_a", 0),
+            ("in_proj_ab", "in_proj_b", 1),
+            ("in_proj_qkvz", "in_proj_q", 0),
+            ("in_proj_qkvz", "in_proj_k", 1),
+            ("in_proj_qkvz", "in_proj_v", 2),
+            ("in_proj_qkvz", "in_proj_z", 3),
         ]
+
+        weights = self.expand_fused_qkv(weights=weights)
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)

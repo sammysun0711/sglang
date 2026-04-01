@@ -35,6 +35,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    A_STRIDE: tl.constexpr,
+    B_STRIDE: tl.constexpr,
+    HK_STRIDE: tl.constexpr = 0,
+    HV_STRIDE: tl.constexpr = 0,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -57,10 +61,18 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
-    p_b = b + bos * HV + i_hv
+    if HK_STRIDE == 0:
+        HK_STRIDE = H * K
+    if HV_STRIDE == 0:
+        HV_STRIDE = HV * V
+
+    p_q = q + bos * HK_STRIDE + i_h * K + o_k
+    p_k = k + bos * HK_STRIDE + i_h * K + o_k
+    p_v = v + bos * HV_STRIDE + i_hv * V + o_v
+    if IS_KDA:
+        p_b = b + bos * HV + i_hv
+    else:
+        p_b = b + bos * B_STRIDE + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
@@ -69,7 +81,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * A_STRIDE + i_hv
         p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -143,12 +155,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # Update pointers for next timestep
-        p_q += H * K
-        p_k += H * K
+        p_q += HK_STRIDE
+        p_k += HK_STRIDE
         p_o += HV * V
-        p_v += HV * V
-        p_b += HV
-        p_a += HV
+        p_v += HV_STRIDE
+        if IS_KDA:
+            p_b += HV
+            p_a += HV
+        else:
+            p_b += B_STRIDE
+            p_a += A_STRIDE
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
@@ -164,7 +180,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-@input_guard
+#@input_guard
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -195,6 +211,10 @@ def fused_sigmoid_gating_delta_rule_update(
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
     num_warps = 1
+    HK_STRIDE = q.stride(1)
+    HV_STRIDE = v.stride(1)
+    A_STRIDE = a.stride(-2)
+    B_STRIDE = b.stride(-2)
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -233,6 +253,10 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
+        A_STRIDE=A_STRIDE,
+        B_STRIDE=B_STRIDE,
+        HK_STRIDE=HK_STRIDE,
+        HV_STRIDE=HV_STRIDE,
     )
     o = o.squeeze(0)
     return o

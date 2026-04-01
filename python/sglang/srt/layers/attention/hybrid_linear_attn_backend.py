@@ -1686,7 +1686,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 q,
                 k,
                 v,
-                mixed_qkv,
+                mixed_qkv.contiguous() if mixed_qkv is not None else None,
                 a.contiguous() if a is not None else None,
                 b.contiguous() if b is not None else None,
                 **kwargs,

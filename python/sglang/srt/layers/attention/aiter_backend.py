@@ -59,6 +59,11 @@ _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
 
+# Dense flash-attn varlen prefill (gather paged KV) for parity / verification vs mha_batch_prefill_func.
+_use_mha_prefill_flash_varlen = get_bool_env_var(
+    "SGLANG_AITER_MHA_PREFILL_FLASH_VARLEN", "False"
+)
+
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
 # intra_batch_mode=False if _use_mla_ps_kernel else True
@@ -1155,7 +1160,7 @@ class AiterAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-
+        # print("================ forward extend ===========================")
         self.logits_soft_cap = layer.logit_cap
 
         if k is not None:
@@ -1169,6 +1174,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
         if self.use_mla:
+            #print("================ use_mla ===========================")
             max_q_len = self.forward_metadata.max_q_len
             max_kv_len = self.forward_metadata.max_kv_len
             kv_indptr = self.forward_metadata.kv_indptr
@@ -1512,6 +1518,8 @@ class AiterAttnBackend(AttentionBackend):
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+            #print(f"=================== k_cache: {k_cache.shape} ===========================")
+            #print(f"=================== v_cache: {v_cache.shape} ===========================")
 
             bs0 = forward_batch.batch_size + 1
 
@@ -1521,21 +1529,48 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-            )
+            q_flat = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            qo_ptr = self.qo_indptr[:bs0]
+            kv_ptr = self.forward_metadata.kv_indptr[:bs0]
+            kv_indices = self.forward_metadata.kv_indices
+            max_q_len = self.forward_metadata.max_q_len
+            max_kv_len = self.forward_metadata.max_kv_len
+            if _use_mha_prefill_flash_varlen:
+                total_kv = int(kv_ptr[-1].item())
+                k_dense = k_cache[kv_indices[:total_kv]].to(q_flat.dtype)
+                v_dense = v_cache[kv_indices[:total_kv]].to(q_flat.dtype)
+                gqa_ratio = layer.tp_q_head_num // layer.tp_k_head_num
+                if gqa_ratio > 1:
+                    k_dense = torch.repeat_interleave(k_dense, gqa_ratio, dim=1)
+                    v_dense = torch.repeat_interleave(v_dense, gqa_ratio, dim=1)
+                # print(f"=================== _use_mha_prefill_flash_varlen: {_use_mha_prefill_flash_varlen} ===========================")
+                o = flash_attn_varlen_func(
+                    q_flat,
+                    k_dense,
+                    v_dense,
+                    qo_ptr,
+                    kv_ptr,
+                    max_q_len,
+                    max_kv_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+            else:
+                o = mha_batch_prefill_func(
+                    q_flat,
+                    k_cache,
+                    v_cache,
+                    qo_ptr,
+                    kv_ptr,
+                    kv_indices,
+                    max_q_len,
+                    max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

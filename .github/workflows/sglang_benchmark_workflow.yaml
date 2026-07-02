@@ -141,13 +141,13 @@ jobs:
           case "${model_name}" in
             offical_qwen3p5_397B_ptpc)
               model_path="/models/offical_qwen3p5_397B_ptpc"
-              model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_8e85368_aiter_303a583_qwen3_5_20260417_v2"
+              model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_9b3cca1_aiter_dd9d1b_ck_c61dc42_qwen3.5_20260625_2"
               model_tp="8"
               model_vlm_cache_size_mb="0"
               ;;
             Qwen3.5-27B-PTPC-compressor)
               model_path="/models/Qwen3.5-27B-PTPC-compressor"
-              model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_8e85368_aiter_303a583_qwen3_5_20260417_v2"
+              model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_9b3cca1_aiter_dd9d1b_ck_c61dc42_qwen3.5_20260625_2"
               model_tp="1"
               model_vlm_cache_size_mb="8192"
               ;;

@@ -67,6 +67,17 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
+# Force the AITER CK a8w8 blockscale kernel (uses per-shape tuned configs) instead of
+# the Triton fallback on non-gfx95 archs (e.g. MI300X / gfx942).
+_use_aiter_ck_blockscale_gfx942 = _use_aiter and get_bool_env_var(
+    "SGLANG_USE_AITER_CK_BLOCKSCALE"
+)
+# Use the weight-preshuffled AITER CK a8w8 blockscale kernel (reads the
+# AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE tuned configs). Requires the weight to
+# be shuffled at load time and the activation scale transposed at runtime.
+_use_aiter_ck_blockscale_bpreshuffle_gfx942 = _use_aiter and get_bool_env_var(
+    "SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE"
+)
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -814,8 +825,17 @@ def aiter_w8a8_block_fp8_linear(
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     elif _use_aiter_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    elif _use_aiter_ck_blockscale_bpreshuffle_gfx942:
+        use_triton = False
+    elif _use_aiter_ck_blockscale_gfx942:
+        use_triton = False
     else:
         use_triton = True
+
+    # The weight-preshuffled CK kernel consumes a transposed activation scale.
+    use_bpreshuffle = not use_triton and (
+        _use_aiter_bpreshuffle_gfx95 or _use_aiter_ck_blockscale_bpreshuffle_gfx942
+    )
 
     # if input_scale not None, input is quanted
     if input_scale is not None:
@@ -829,12 +849,12 @@ def aiter_w8a8_block_fp8_linear(
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=(_use_aiter_bpreshuffle_gfx95 and not use_triton),
+            transpose_scale=use_bpreshuffle,
         )
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
-    elif _use_aiter_bpreshuffle_gfx95:
+    elif use_bpreshuffle:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale

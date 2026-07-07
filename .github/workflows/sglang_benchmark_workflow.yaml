@@ -172,6 +172,23 @@ jobs:
           echo "Resolved model_tp: ${model_tp}"
           echo "Resolved model_vlm_cache_size_mb: ${model_vlm_cache_size_mb}"
 
+      - name: Docker login
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
       - name: Prepare SGLang image
         run: |
           set -euo pipefail

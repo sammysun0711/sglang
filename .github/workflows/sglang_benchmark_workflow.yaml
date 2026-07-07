@@ -173,7 +173,7 @@ jobs:
           echo "Resolved model_vlm_cache_size_mb: ${model_vlm_cache_size_mb}"
 
       - name: Docker login
-        if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
+        if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
         env:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |

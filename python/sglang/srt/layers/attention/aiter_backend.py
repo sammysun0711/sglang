@@ -63,6 +63,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
+    forward_target_verify_vectorized_5d,
 )
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -2283,9 +2284,35 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
-                # target_verify goes through unified_attention when topk == 1
-                # (the linear draft chain gives a pure causal mask). MLA and
-                # draft_extend still use the legacy extend_attention_fwd path.
+                # A SHUFFLE 5D cache must be consumed in its physical layout.
+                # For top-k-1 target verification, pa_decode_gluon implements
+                # the same causal multi-token decode mask and accepts the 5D
+                # buffers directly. The NHD path below remains unchanged.
+                if self.kv_cache_is_vectorized_5d:
+                    if not self._use_unified_verify:
+                        raise RuntimeError(
+                            "vectorized-5D TARGET_VERIFY requires top-k 1 and "
+                            "SGLANG_AITER_UNIFIED_VERIFY=1; the legacy fallback "
+                            "cannot safely consume SHUFFLE 5D KV storage"
+                        )
+                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    forward_target_verify_vectorized_5d(
+                        self,
+                        q,
+                        layer,
+                        forward_batch,
+                        k_cache,
+                        v_cache,
+                        o,
+                        sinks,
+                    )
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+                # NHD target_verify goes through unified_attention when topk
+                # == 1 (the linear draft chain gives a pure causal mask). MLA
+                # and draft_extend retain their existing paths.
                 if (
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()

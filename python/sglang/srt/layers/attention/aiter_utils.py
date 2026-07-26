@@ -307,3 +307,156 @@ def forward_decode_vectorized_5d(
         sliding_window=sliding_window_arg,
         ps=True,
     )
+
+
+def forward_target_verify_vectorized_5d(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    output: torch.Tensor,
+    sinks,
+) -> None:
+    """Run top-k-1 target verification directly on a SHUFFLE 5D KV pool.
+
+    ``TARGET_VERIFY`` has a fixed query length per request.  For a linear
+    draft chain (top-k 1), its mask is the causal multi-token decode mask that
+    ``pa_decode_gluon`` implements for query lengths up to four.  The verify
+    page table already contains the freshly written draft-token slots, so the
+    kernel receives the physical 5D buffers unchanged and uses
+    ``seq_lens + query_length`` as its total KV lengths.
+
+    This helper deliberately validates the complete Gluon contract before
+    allocating workspaces.  Falling through to the legacy unified-attention
+    path is not safe: reshaping SHUFFLE 5D storage as NHD changes only the view,
+    not the physical cache permutation.
+    """
+    if pa_decode_gluon is None or get_recommended_splits is None:
+        raise RuntimeError(
+            "AITER pa_decode_gluon is unavailable for vectorized-5D TARGET_VERIFY"
+        )
+
+    query_length = int(backend.forward_metadata.max_q_len)
+    batch_size = int(forward_batch.batch_size)
+    num_q_heads = int(layer.tp_q_head_num)
+    num_kv_heads = int(layer.tp_k_head_num)
+
+    if not 1 <= query_length <= 4:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY requires 1 <= query_length <= 4; "
+            f"got {query_length}"
+        )
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY requires Q heads to be divisible by "
+            f"KV heads; got {num_q_heads} Q heads and {num_kv_heads} KV heads"
+        )
+
+    query_group_size = num_q_heads // num_kv_heads
+    equivalent_group_size = query_length * query_group_size
+    if equivalent_group_size > 64:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY exceeds pa_decode_gluon's equivalent "
+            f"query-group limit: {query_length} * {query_group_size} = "
+            f"{equivalent_group_size} > 64"
+        )
+    if layer.qk_head_dim != layer.v_head_dim:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY requires equal padded QK and V head "
+            f"dimensions; got {layer.qk_head_dim} and {layer.v_head_dim}"
+        )
+    if backend.page_size not in (16, 64, 1024):
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY requires page size 16, 64, or 1024; "
+            f"got {backend.page_size}"
+        )
+    if float(layer.logit_cap or 0.0) != 0.0:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY does not support attention logit "
+            f"soft-capping; got logit_cap={layer.logit_cap}"
+        )
+    if k_cache.ndim != 5 or v_cache.ndim != 5:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY requires 5D K and V caches; got "
+            f"K ndim={k_cache.ndim}, V ndim={v_cache.ndim}"
+        )
+    if k_cache.shape[1] != num_kv_heads or v_cache.shape[1] != num_kv_heads:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY cache/head mismatch: "
+            f"layer has {num_kv_heads} KV heads, K/V caches have "
+            f"{k_cache.shape[1]}/{v_cache.shape[1]}"
+        )
+    if k_cache.shape[-2] != backend.page_size:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY cache/page mismatch: "
+            f"backend page size is {backend.page_size}, K cache page axis is "
+            f"{k_cache.shape[-2]}"
+        )
+    if q.shape[0] != batch_size * query_length:
+        raise ValueError(
+            "vectorized-5D TARGET_VERIFY requires a uniform query length; "
+            f"got q.shape[0]={q.shape[0]}, batch_size={batch_size}, and "
+            f"query_length={query_length}"
+        )
+
+    is_swa_layer = (
+        layer.sliding_window_size is not None and layer.sliding_window_size > -1
+    )
+    if is_swa_layer:
+        block_tables = (
+            backend.forward_metadata.swa_page_table
+            if backend.forward_metadata.swa_page_table is not None
+            else backend.forward_metadata.kv_indices
+        )
+        max_part_num = 1
+        sliding_window = int(layer.sliding_window_size)
+    else:
+        block_tables = backend.forward_metadata.kv_indices
+        max_part_num = int(get_recommended_splits(batch_size, num_kv_heads))
+        sliding_window = 0
+
+    q_view = q.view(-1, num_q_heads, layer.qk_head_dim)
+    output_view = output.view(-1, num_q_heads, layer.v_head_dim)
+    workspace_shape = (
+        batch_size,
+        num_kv_heads,
+        max_part_num,
+        equivalent_group_size,
+    )
+    exp_sums = torch.empty(workspace_shape, dtype=torch.float32, device=q_view.device)
+    max_logits = torch.empty_like(exp_sums)
+    temporary_output = torch.empty(
+        (*workspace_shape, layer.qk_head_dim),
+        dtype=q_view.dtype,
+        device=q_view.device,
+    )
+
+    key_scale = None
+    value_scale = None
+    if backend.kv_cache_dtype == fp8_dtype:
+        key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+
+    pa_decode_gluon(
+        output=output_view,
+        query=q_view,
+        key_cache=k_cache,
+        value_cache=v_cache,
+        context_lengths=forward_batch.seq_lens + query_length,
+        block_tables=block_tables,
+        softmax_scale=layer.scaling,
+        query_length=query_length,
+        max_context_partition_num=max_part_num,
+        context_partition_size=256,
+        compute_type=backend.input_dtype,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        ps=True,
+    )

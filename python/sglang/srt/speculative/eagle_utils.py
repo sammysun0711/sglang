@@ -504,18 +504,6 @@ def eagle_sample(
             deterministic=True,
         )
 
-        # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
-        # sampled tokens. Broadcast from rank 0 to ensure consistency.
-        tp_group = (
-            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
-
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
@@ -528,6 +516,20 @@ def eagle_sample(
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
+
+    # Keep the final verification result identical across TP ranks for both
+    # stochastic sampling and the greedy path (which is forced on HIP/NPU).
+    # Even a one-token rank-local difference changes accept_lens/new_seq_lens
+    # and can make schedulers select different requests, eventually deadlocking
+    # a model collective. Run this after simulated acceptance as well so only
+    # rank 0's final state can reach scheduler bookkeeping.
+    tp_group = (
+        get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+    )
+    if tp_group.world_size > 1:
+        tp_group.broadcast(predict, src=0)
+        tp_group.broadcast(accept_index, src=0)
+        tp_group.broadcast(num_correct_drafts, src=0)
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the

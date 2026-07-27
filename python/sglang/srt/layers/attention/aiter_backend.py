@@ -681,9 +681,19 @@ class AiterAttnBackend(AttentionBackend):
         self,
         extend_seq_lens: Optional[torch.Tensor] = None,
         extend_seq_lens_cpu: Optional[list[int]] = None,
+        spec_info: Optional[SpecInput] = None,
     ) -> int:
         """Resolve fixed per-request extend length for DRAFT_EXTEND_V2."""
-        num_draft_tokens = self.num_draft_tokens
+        spec_num_tokens = (
+            getattr(spec_info, "num_tokens_per_req", -1)
+            if spec_info is not None
+            else -1
+        )
+        num_draft_tokens = (
+            spec_num_tokens
+            if spec_num_tokens is not None and spec_num_tokens > 0
+            else self.num_draft_tokens
+        )
         if num_draft_tokens is None:
             if extend_seq_lens is not None and extend_seq_lens.numel() > 0:
                 # Avoid list scans in hot path when tensor lengths are already available.
@@ -1036,7 +1046,9 @@ class AiterAttnBackend(AttentionBackend):
             self._ensure_spec_v2_topk_supported()
             if self.use_mla:
                 device = forward_batch.seq_lens.device
-                num_draft_tokens = self._resolve_v2_num_draft_tokens()
+                num_draft_tokens = self._resolve_v2_num_draft_tokens(
+                    spec_info=spec_info
+                )
                 qo_indptr = self._set_uniform_qo_indptr(bs, num_draft_tokens, device)
 
                 kv_indptr = self.kv_indptr[: bs + 1]
@@ -1809,7 +1821,7 @@ class AiterAttnBackend(AttentionBackend):
             # EAGLE V2: Fixed num_draft_tokens per batch
             self._ensure_spec_v2_topk_supported()
             seq_lens = seq_lens[:bs]
-            num_tokens_per_bs = self._resolve_v2_num_draft_tokens()
+            num_tokens_per_bs = self._resolve_v2_num_draft_tokens(spec_info=spec_info)
 
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -2396,6 +2408,23 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_draft_extend_v2()
                 and self.use_triton_unified_attention
             ):
+                if self.kv_cache_is_vectorized_5d:
+                    raise RuntimeError(
+                        "AITER DRAFT_EXTEND_V2 unified attention requires an NHD "
+                        "draft KV cache; SHUFFLE 5D is reserved for the target "
+                        "worker."
+                    )
+
+                max_q_len = self.forward_metadata.max_q_len
+                expected_num_queries = forward_batch.batch_size * max_q_len
+                if q.shape[0] != expected_num_queries:
+                    raise RuntimeError(
+                        "AITER DRAFT_EXTEND_V2 metadata/query mismatch: "
+                        f"q.shape[0]={q.shape[0]}, batch_size="
+                        f"{forward_batch.batch_size}, max_q_len={max_q_len}, "
+                        f"expected {expected_num_queries} queries."
+                    )
+
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -2403,9 +2432,7 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
-                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
-                    layer.layer_id
-                )
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 page_table = self.forward_metadata.kv_indices
                 max_kv_len = page_table.shape[1] * self.page_size
 

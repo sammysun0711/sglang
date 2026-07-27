@@ -362,6 +362,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            num_tokens_per_req=self.num_tokens_per_bs,
+            num_tokens_for_logprob_per_req=1,
         )
         spec_info.positions = None
 

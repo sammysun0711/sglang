@@ -96,6 +96,7 @@ class EagleDraftWorkerBase(ABC):
         num_draft_tokens: int,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        require_cuda_graph: bool = False,
     ):
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -155,6 +156,13 @@ class EagleDraftWorkerBase(ABC):
             # backend max() reads from list without a per-iter D2H sync.
             forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        if require_cuda_graph and not can_cuda_graph:
+            raise RuntimeError(
+                "AITER multi-layer EAGLE draft extend requires CUDA graph replay; "
+                "the eager path does not preserve per-step variable query lengths "
+                "safely. Enable CUDA graphs and ensure the batch size is covered by "
+                "the capture buckets."
+            )
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
             # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer

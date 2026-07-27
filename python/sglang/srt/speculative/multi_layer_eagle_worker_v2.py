@@ -517,12 +517,22 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
+            # accept_lens includes the bonus token; correct drafts exclude it.
+            # The graph runner copies these into its stable per-step buffers.
+            num_correct_drafts=batch_result.accept_lens - 1,
+            num_accept_tokens=batch_result.accept_lens,
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=1,
         )
 
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
+        require_cuda_graph = any(
+            backend.__class__.__module__ == "sglang.srt.layers.attention.aiter_backend"
+            and backend.__class__.__name__ == "AiterAttnBackend"
+            for backend in self.draft_extend_attn_backend_list
+            if backend is not None
+        )
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
                 draft_extend_input,
@@ -531,6 +541,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_draft_tokens,
                 self.draft_runner_list[0],
                 self.cuda_graph_runner_for_draft_extend,
+                require_cuda_graph=require_cuda_graph,
             )
             forward_batch.return_hidden_states_before_norm = True
 
@@ -839,13 +850,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
-        # NOTE: metadata init is skipped here unconditionally, although
-        # eagle_prepare_for_verify only plans when cuda-graph replay_prepare ran.
-        # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
-        # worker has not adopted that fix, so preserve its behavior verbatim.
-        # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
-        # in forward_extend (post-pad); only mark ready for the cuda-graph path.
-        if not _is_npu or can_run_cuda_graph:
+        # replay_prepare is the only out-of-forward planning action here. If a
+        # batch misses the graph, leave it unmarked so forward_extend builds
+        # fresh target-verification metadata instead of inheriting the final
+        # draft step's metadata.
+        if can_run_cuda_graph:
             verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(

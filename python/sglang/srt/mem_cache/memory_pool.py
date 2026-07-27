@@ -961,6 +961,7 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        kv_cache_layout: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -987,32 +988,47 @@ class MHATokenToKVPool(KVCache):
         #   V shape: (num_blocks, H, page // X, D_v, X)   where X = 16 / dtype_bytes
         # aiter `mha_batch_prefill_func` consumes these 5D shapes natively and
         # aiter `pa_decode_gluon` reads SHUFFLE blocks directly during decode.
-        # An explicit `kv_cache_layout=` argument always wins (e.g. SWAKVPool
-        # passes "nhd" to keep its SWA sub-pool on the legacy layout); on
-        # non-AITER platforms the env var is ignored and NHD is forced since
-        # no consumer kernel exists for SHUFFLE 5D outside the AITER backend.
-        self.kv_cache_layout = "nhd"
-        if _use_aiter:
-            layout = envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower()
-            if layout not in ("nhd", "vectorized_5d"):
-                raise ValueError(
-                    f"Unsupported SGLANG_AITER_KV_CACHE_LAYOUT={layout!r}; "
-                    "expected 'nhd' or 'vectorized_5d'."
-                )
-            self.kv_cache_layout = layout
-            if layout == "vectorized_5d":
-                # X is the inner vectorization width in the SHUFFLE layout,
-                # determined by the STORAGE dtype (not the compute dtype) since
-                # it controls how many elements fit in 16 bytes of the on-pool
-                # tensor. For fp8 storage X=16, for bf16/fp16 X=8.
-                self._kv_vector_x = 16 // self.store_dtype.itemsize
-                assert (self.size + self.page_size) % self.page_size == 0
-                assert self.page_size % self._kv_vector_x == 0, (
-                    f"page_size={self.page_size} must be divisible by "
-                    f"X={self._kv_vector_x} for vectorized_5d layout"
-                )
-                assert self.head_dim % self._kv_vector_x == 0
-                assert self.v_head_dim % self._kv_vector_x == 0
+        # An explicit `kv_cache_layout=` argument always wins. This lets the
+        # target model keep SHUFFLE 5D while a speculative draft pool selects
+        # NHD for kernels that only understand ordinary token-major storage.
+        # On non-AITER platforms the environment variable is ignored and NHD
+        # remains the default because SHUFFLE 5D has no consumer there.
+        if kv_cache_layout is None:
+            layout = (
+                envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() if _use_aiter else "nhd"
+            )
+        else:
+            layout = kv_cache_layout.lower()
+
+        if layout not in ("nhd", "vectorized_5d"):
+            source = (
+                "kv_cache_layout"
+                if kv_cache_layout is not None
+                else "SGLANG_AITER_KV_CACHE_LAYOUT"
+            )
+            raise ValueError(
+                f"Unsupported {source}={layout!r}; expected 'nhd' or "
+                "'vectorized_5d'."
+            )
+        if layout == "vectorized_5d" and not _use_aiter:
+            raise ValueError(
+                "kv_cache_layout='vectorized_5d' requires the ROCm AITER backend."
+            )
+
+        self.kv_cache_layout = layout
+        if layout == "vectorized_5d":
+            # X is the inner vectorization width in the SHUFFLE layout,
+            # determined by the STORAGE dtype (not the compute dtype) since
+            # it controls how many elements fit in 16 bytes of the on-pool
+            # tensor. For fp8 storage X=16, for bf16/fp16 X=8.
+            self._kv_vector_x = 16 // self.store_dtype.itemsize
+            assert (self.size + self.page_size) % self.page_size == 0
+            assert self.page_size % self._kv_vector_x == 0, (
+                f"page_size={self.page_size} must be divisible by "
+                f"X={self._kv_vector_x} for vectorized_5d layout"
+            )
+            assert self.head_dim % self._kv_vector_x == 0
+            assert self.v_head_dim % self._kv_vector_x == 0
 
         self._create_buffers()
 

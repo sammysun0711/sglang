@@ -312,9 +312,33 @@ class ModelRunnerKVCacheMixin:
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
 
+    def _get_mha_kv_cache_layout_override(self: ModelRunner):
+        """Keep AITER multi-layer draft caches on their supported NHD layout."""
+        if not (
+            self.is_draft_worker
+            and _is_hip
+            and envs.SGLANG_USE_AITER.get()
+            and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        ):
+            return None
+
+        logger.info_once(
+            "Using NHD KV cache layout for the speculative draft worker; "
+            "the target worker remains on AITER SHUFFLE 5D."
+        )
+        return "nhd"
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+
+        # SHUFFLE 5D is consumed by the target model's AITER prefill/decode and
+        # Gluon verification kernels. Multi-layer EAGLE draft extend still
+        # consumes its cache as ordinary NHD, so sharing the global layout
+        # choice with the draft worker corrupts attention. Keep the override
+        # local to draft MHA pools; the target pool continues to follow the
+        # environment setting.
+        mha_kv_cache_layout = self._get_mha_kv_cache_layout_override()
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -523,7 +547,9 @@ class ModelRunnerKVCacheMixin:
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
                     if self.server_args.attention_backend == "aiter":
-                        kwargs["swa_v_head_dim"] = self.model_config.hf_text_config.swa_head_dim
+                        kwargs["swa_v_head_dim"] = (
+                            self.model_config.hf_text_config.swa_head_dim
+                        )
                         kwargs["v_head_dim"] = self.model_config.head_dim
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -651,7 +677,9 @@ class ModelRunnerKVCacheMixin:
                     # Aiter paged kernels require K/V to have matching head dims.
                     # The model zero-pads V from v_head_dim to head_dim before caching.
                     if self.server_args.attention_backend == "aiter":
-                        kwargs["swa_v_head_dim"] = self.model_config.hf_text_config.swa_head_dim
+                        kwargs["swa_v_head_dim"] = (
+                            self.model_config.hf_text_config.swa_head_dim
+                        )
                         kwargs["v_head_dim"] = self.model_config.head_dim
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -669,6 +697,7 @@ class ModelRunnerKVCacheMixin:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    kv_cache_layout=mha_kv_cache_layout,
                     **kwargs,
                 )
             elif config := self.mambaish_config:
@@ -752,6 +781,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        kv_cache_layout=mha_kv_cache_layout,
                     )
 
         # Initialize token_to_kv_pool_allocator

@@ -62,14 +62,15 @@ except ImportError:
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
+    FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS,
     FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE,
     FLYDSL_MIMO_HEAD_DIM,
     FLYDSL_MIMO_KV_HEADS,
-    FLYDSL_MIMO_NUM_PARTITIONS,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
     forward_target_verify_flydsl_5d,
     forward_target_verify_vectorized_5d,
+    get_flydsl_mimo_num_partitions,
     load_flydsl_pa_decode_kernels,
 )
 from sglang.srt.layers.attention.utils import (
@@ -299,6 +300,7 @@ class AiterAttnBackend(AttentionBackend):
         self._flydsl_pa_decode_pout = None
         self._flydsl_pa_decode_context_lengths = None
         self._flydsl_pa_decode_workspace_max_bs = 0
+        self._flydsl_pa_decode_num_partitions = FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS
         self._flydsl_pa_decode_compiled = False
         self._configure_flydsl_pa_decode(max_bs)
 
@@ -370,6 +372,8 @@ class AiterAttnBackend(AttentionBackend):
         if not self._use_flydsl_pa_decode:
             return
 
+        self._flydsl_pa_decode_num_partitions = get_flydsl_mimo_num_partitions()
+
         incompatibilities = []
         if self.use_mla:
             incompatibilities.append("MLA is unsupported")
@@ -412,10 +416,11 @@ class AiterAttnBackend(AttentionBackend):
             "Enabled MiMo FlyDSL PA decode on target worker: full "
             "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=AITER, "
             "ordinary decode=AITER; runtime=%s (%s), kernel=%s, "
-            "workspace_max_bs=%d",
+            "partitions=%d, workspace_max_bs=%d",
             kernels.version,
             kernels.runtime_path,
             kernels.kernel_path,
+            self._flydsl_pa_decode_num_partitions,
             self._flydsl_pa_decode_workspace_max_bs,
         )
 
@@ -432,7 +437,7 @@ class AiterAttnBackend(AttentionBackend):
         scalar_numel = (
             max_bs
             * FLYDSL_MIMO_KV_HEADS
-            * FLYDSL_MIMO_NUM_PARTITIONS
+            * self._flydsl_pa_decode_num_partitions
             * FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE
         )
         self._flydsl_pa_decode_pmax = torch.empty(
@@ -461,7 +466,7 @@ class AiterAttnBackend(AttentionBackend):
             head_dim=192,
             query_group_size=16,
             block_size=64,
-            num_partitions=8,
+            num_partitions=self._flydsl_pa_decode_num_partitions,
             softmax_scale=192**-0.5,
             query_dtype="bf16",
             per_token_kv=False,
@@ -469,7 +474,7 @@ class AiterAttnBackend(AttentionBackend):
             trans_v=True,
         )
         self._flydsl_compile_pa_decode_reduce(
-            max_context_partition_num=8,
+            max_context_partition_num=self._flydsl_pa_decode_num_partitions,
             query_seq_len=4,
             query_group_size=16,
             head_size=192,

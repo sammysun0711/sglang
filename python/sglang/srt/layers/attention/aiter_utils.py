@@ -15,6 +15,7 @@ needing to be a method on the class.
 from __future__ import annotations
 
 import importlib
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable
@@ -50,8 +51,30 @@ FLYDSL_MIMO_QUERY_HEADS = 16
 FLYDSL_MIMO_KV_HEADS = 1
 FLYDSL_MIMO_HEAD_DIM = 192
 FLYDSL_MIMO_PAGE_SIZE = 64
-FLYDSL_MIMO_NUM_PARTITIONS = 8
+FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS = 8
+FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS = (8, 16, 24, 32)
+FLYDSL_MIMO_NUM_PARTITIONS_ENV = "SGLANG_FLYDSL_PA_NUM_PARTITIONS"
 FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE = 64
+
+
+def get_flydsl_mimo_num_partitions() -> int:
+    raw_value = os.getenv(
+        FLYDSL_MIMO_NUM_PARTITIONS_ENV,
+        str(FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS),
+    )
+    try:
+        num_partitions = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{FLYDSL_MIMO_NUM_PARTITIONS_ENV} must be one of "
+            f"{FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS}; got {raw_value!r}"
+        ) from exc
+    if num_partitions not in FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS:
+        raise ValueError(
+            f"{FLYDSL_MIMO_NUM_PARTITIONS_ENV} must be one of "
+            f"{FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS}; got {num_partitions}"
+        )
+    return num_partitions
 
 
 @dataclass(frozen=True)
@@ -379,10 +402,11 @@ def _get_flydsl_workspace_views(
     backend: AiterAttnBackend,
     batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_partitions = backend._flydsl_pa_decode_num_partitions
     scalar_numel = (
         batch_size
         * FLYDSL_MIMO_KV_HEADS
-        * FLYDSL_MIMO_NUM_PARTITIONS
+        * num_partitions
         * FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE
     )
     output_numel = scalar_numel * FLYDSL_MIMO_HEAD_DIM
@@ -403,7 +427,7 @@ def _get_flydsl_workspace_views(
     scalar_shape = (
         batch_size,
         FLYDSL_MIMO_KV_HEADS,
-        FLYDSL_MIMO_NUM_PARTITIONS,
+        num_partitions,
         FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE,
     )
     pmax = backend._flydsl_pa_decode_pmax[:scalar_numel].view(scalar_shape)
@@ -623,7 +647,7 @@ def forward_target_verify_flydsl_5d(
         key_scale=key_scale,
         value_scale=value_scale,
         softmax_scale=layer.scaling,
-        num_partitions=FLYDSL_MIMO_NUM_PARTITIONS,
+        num_partitions=backend._flydsl_pa_decode_num_partitions,
         pmax=pmax,
         psum=psum,
         pout=pout,

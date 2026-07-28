@@ -3344,6 +3344,35 @@ class ServerArgs:
                 self.page_size = 64
 
     def _handle_amd_specifics(self):
+        pa_decode_impl = envs.SGLANG_AITER_PA_DECODE_IMPL.get().strip().lower()
+        if pa_decode_impl not in ("gluon", "flydsl"):
+            raise ValueError(
+                "SGLANG_AITER_PA_DECODE_IMPL must be 'gluon' or 'flydsl'; "
+                f"got {pa_decode_impl!r}"
+            )
+        if pa_decode_impl == "flydsl":
+            if not is_hip():
+                raise ValueError(
+                    "SGLANG_AITER_PA_DECODE_IMPL=flydsl currently requires ROCm"
+                )
+            if self.attention_backend != "aiter":
+                raise ValueError(
+                    "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires "
+                    "--attention-backend aiter"
+                )
+            if (
+                envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().strip().lower()
+                != "vectorized_5d"
+            ):
+                raise ValueError(
+                    "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires "
+                    "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d"
+                )
+            if self.page_size != 64:
+                raise ValueError(
+                    "SGLANG_AITER_PA_DECODE_IMPL=flydsl phase 1 requires "
+                    f"--page-size 64; got {self.page_size}"
+                )
         if is_hip():
             self.triton_attention_num_kv_splits = 16
 

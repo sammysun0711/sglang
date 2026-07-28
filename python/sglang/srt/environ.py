@@ -468,6 +468,11 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Select the vectorized-5D paged-decode implementation. "gluon" preserves
+    # the existing AITER path. "flydsl" is an opt-in MiMo phase-1 path for
+    # sink-free full-attention target verification; SWA/sink layers remain on
+    # AITER Gluon.
+    SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

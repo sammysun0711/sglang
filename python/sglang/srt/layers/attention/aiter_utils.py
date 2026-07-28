@@ -14,7 +14,10 @@ needing to be a method on the class.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import importlib
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -40,6 +43,69 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+FLYDSL_MIMO_QUERY_LENGTH = 4
+FLYDSL_MIMO_QUERY_HEADS = 16
+FLYDSL_MIMO_KV_HEADS = 1
+FLYDSL_MIMO_HEAD_DIM = 192
+FLYDSL_MIMO_PAGE_SIZE = 64
+FLYDSL_MIMO_NUM_PARTITIONS = 8
+FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE = 64
+
+
+@dataclass(frozen=True)
+class FlyDSLPADecodeKernels:
+    pa_decode_tile: Callable
+    compile_pa_decode_tile: Callable
+    compile_pa_decode_reduce: Callable
+    version: str
+    runtime_path: str
+    kernel_path: str
+
+
+@lru_cache(maxsize=1)
+def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
+    """Load the optional local FlyDSL page-64 tile implementation.
+
+    FlyDSL is intentionally not imported at module scope: the normal AITER
+    Gluon configuration must continue to work without FlyDSL installed.  The
+    phase-1 local integration was validated with the 0.2.4 native runtime and
+    the fixed repository-root ``kernels`` source at commit ``c99d5cd``.
+    """
+
+    try:
+        flydsl = importlib.import_module("flydsl")
+        tile_module = importlib.import_module("kernels.attention.pa_decode_tile")
+        reduce_module = importlib.import_module("kernels.attention.pa_decode_swa")
+        # pa_decode_tile imports graph-capture and dtype helpers from this
+        # module inside its host wrapper. Load it now so capture never performs
+        # the first import.
+        importlib.import_module("kernels.attention.pa_decode_fp8")
+    except Exception as exc:
+        raise RuntimeError(
+            "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires a compatible FlyDSL "
+            "native runtime and the local FlyDSL repository-root `kernels` "
+            "package on PYTHONPATH. The MiMo phase-1 setup expects the FlyDSL "
+            "0.2.4 runtime plus source commit c99d5cd."
+        ) from exc
+
+    version = str(getattr(flydsl, "__version__", "unknown"))
+    if version != "0.2.4":
+        raise RuntimeError(
+            "MiMo phase-1 FlyDSL integration requires the validated 0.2.4 "
+            f"native runtime; imported version {version!r} from "
+            f"{getattr(flydsl, '__file__', 'unknown')}"
+        )
+
+    return FlyDSLPADecodeKernels(
+        pa_decode_tile=tile_module.pa_decode_tile,
+        compile_pa_decode_tile=tile_module.compile_pa_decode_tile,
+        compile_pa_decode_reduce=reduce_module.compile_pa_decode_sw_reduce,
+        version=version,
+        runtime_path=str(getattr(flydsl, "__file__", "unknown")),
+        kernel_path=str(getattr(tile_module, "__file__", "unknown")),
+    )
 
 
 def forward_extend_vectorized_5d(
@@ -306,6 +372,261 @@ def forward_decode_vectorized_5d(
         sinks=sinks,
         sliding_window=sliding_window_arg,
         ps=True,
+    )
+
+
+def _get_flydsl_workspace_views(
+    backend: AiterAttnBackend,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    scalar_numel = (
+        batch_size
+        * FLYDSL_MIMO_KV_HEADS
+        * FLYDSL_MIMO_NUM_PARTITIONS
+        * FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE
+    )
+    output_numel = scalar_numel * FLYDSL_MIMO_HEAD_DIM
+    buffers = (
+        ("pmax", backend._flydsl_pa_decode_pmax, scalar_numel),
+        ("psum", backend._flydsl_pa_decode_psum, scalar_numel),
+        ("pout", backend._flydsl_pa_decode_pout, output_numel),
+        ("context lengths", backend._flydsl_pa_decode_context_lengths, batch_size),
+    )
+    for name, buffer, required_numel in buffers:
+        if buffer is None or buffer.numel() < required_numel:
+            available = 0 if buffer is None else buffer.numel()
+            raise RuntimeError(
+                "FlyDSL PA decode workspace is not initialized for this batch: "
+                f"{name} requires {required_numel} elements, has {available}"
+            )
+
+    scalar_shape = (
+        batch_size,
+        FLYDSL_MIMO_KV_HEADS,
+        FLYDSL_MIMO_NUM_PARTITIONS,
+        FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE,
+    )
+    pmax = backend._flydsl_pa_decode_pmax[:scalar_numel].view(scalar_shape)
+    psum = backend._flydsl_pa_decode_psum[:scalar_numel].view(scalar_shape)
+    pout = backend._flydsl_pa_decode_pout[:output_numel].view(
+        *scalar_shape, FLYDSL_MIMO_HEAD_DIM
+    )
+    context_lengths = backend._flydsl_pa_decode_context_lengths[:batch_size]
+    return pmax, psum, pout, context_lengths
+
+
+def forward_target_verify_flydsl_5d(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    output: torch.Tensor,
+    sinks,
+) -> None:
+    """Run the exact MiMo phase-1 full TARGET_VERIFY shape with FlyDSL."""
+
+    if getattr(backend, "_flydsl_pa_decode_tile", None) is None:
+        raise RuntimeError("FlyDSL PA decode was selected but is not initialized")
+
+    query_length = int(backend.forward_metadata.max_q_len)
+    batch_size = int(forward_batch.batch_size)
+    num_q_heads = int(layer.tp_q_head_num)
+    num_kv_heads = int(layer.tp_k_head_num)
+    head_dim = int(layer.qk_head_dim)
+    v_head_dim = int(layer.v_head_dim)
+
+    if query_length != FLYDSL_MIMO_QUERY_LENGTH:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires query_length=4; " f"got {query_length}"
+        )
+    if (num_q_heads, num_kv_heads) != (
+        FLYDSL_MIMO_QUERY_HEADS,
+        FLYDSL_MIMO_KV_HEADS,
+    ):
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires 16 Q heads and 1 KV head; "
+            f"got {num_q_heads}/{num_kv_heads}"
+        )
+    if head_dim != FLYDSL_MIMO_HEAD_DIM or v_head_dim != FLYDSL_MIMO_HEAD_DIM:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires equal padded QK/V head "
+            f"dimensions of 192; got {head_dim}/{v_head_dim}"
+        )
+    if backend.page_size != FLYDSL_MIMO_PAGE_SIZE:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires page_size=64; "
+            f"got {backend.page_size}"
+        )
+    if layer.sliding_window_size is not None and int(layer.sliding_window_size) > -1:
+        raise ValueError("FlyDSL MiMo phase 1 does not support sliding-window layers")
+    if sinks is not None:
+        raise ValueError("FlyDSL MiMo phase 1 does not support attention sinks")
+    if float(layer.logit_cap or 0.0) != 0.0:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY does not support attention logit "
+            f"soft-capping; got logit_cap={layer.logit_cap}"
+        )
+    if backend.kv_cache_dtype != fp8_dtype:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires the configured FP8 E4M3 KV "
+            f"cache dtype; got {backend.kv_cache_dtype}"
+        )
+    if q.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires BF16 query and output; "
+            f"got {q.dtype}/{output.dtype}"
+        )
+    if q.shape != (batch_size * query_length, num_q_heads * head_dim):
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY query shape mismatch: expected "
+            f"{(batch_size * query_length, num_q_heads * head_dim)}, got "
+            f"{tuple(q.shape)}"
+        )
+    if output.shape != (batch_size * query_length, num_q_heads * v_head_dim):
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY output shape mismatch: expected "
+            f"{(batch_size * query_length, num_q_heads * v_head_dim)}, got "
+            f"{tuple(output.shape)}"
+        )
+
+    expected_k_tail = (
+        num_kv_heads,
+        head_dim // 16,
+        FLYDSL_MIMO_PAGE_SIZE,
+        16,
+    )
+    expected_v_tail = (
+        num_kv_heads,
+        FLYDSL_MIMO_PAGE_SIZE // 16,
+        v_head_dim,
+        16,
+    )
+    if k_cache.ndim != 5 or tuple(k_cache.shape[1:]) != expected_k_tail:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY K-cache layout mismatch: expected "
+            f"[blocks, {', '.join(map(str, expected_k_tail))}], got "
+            f"{tuple(k_cache.shape)}"
+        )
+    if v_cache.ndim != 5 or tuple(v_cache.shape[1:]) != expected_v_tail:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY V-cache layout mismatch: expected "
+            f"[blocks, {', '.join(map(str, expected_v_tail))}], got "
+            f"{tuple(v_cache.shape)}"
+        )
+    if k_cache.shape[0] != v_cache.shape[0]:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires K/V caches with the same "
+            f"block count; got {k_cache.shape[0]}/{v_cache.shape[0]}"
+        )
+    if (
+        k_cache.dtype != backend.kv_cache_dtype
+        or v_cache.dtype != backend.kv_cache_dtype
+        or k_cache.element_size() != 1
+        or v_cache.element_size() != 1
+    ):
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires one-byte configured FP8 K/V "
+            f"storage; got {k_cache.dtype}/{v_cache.dtype}"
+        )
+
+    block_tables = backend.forward_metadata.kv_indices
+    if block_tables.ndim != 2 or block_tables.dtype != torch.int32:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires a two-dimensional int32 "
+            f"block table; got shape={tuple(block_tables.shape)}, "
+            f"dtype={block_tables.dtype}"
+        )
+    if block_tables.shape[0] != batch_size:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY block-table batch mismatch: "
+            f"expected {batch_size}, got {block_tables.shape[0]}"
+        )
+    if forward_batch.seq_lens.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires integral sequence lengths; "
+            f"got {forward_batch.seq_lens.dtype}"
+        )
+    if forward_batch.seq_lens.shape != (batch_size,):
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY sequence-length shape mismatch: "
+            f"expected {(batch_size,)}, got {tuple(forward_batch.seq_lens.shape)}"
+        )
+
+    q_view = q.view(-1, num_q_heads, head_dim)
+    output_view = output.view(-1, num_q_heads, v_head_dim)
+    if q_view.stride(-1) != 1:
+        raise ValueError(
+            "FlyDSL MiMo TARGET_VERIFY requires a contiguous query head axis"
+        )
+
+    key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+    value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+    scales = []
+    for name, scale in (("key_scale", key_scale), ("value_scale", value_scale)):
+        if not isinstance(scale, torch.Tensor):
+            raise ValueError(f"FlyDSL MiMo {name} must be a persistent tensor")
+        if scale.dtype != torch.float32 or scale.numel() != 1 or scale.ndim > 1:
+            raise ValueError(
+                f"FlyDSL MiMo {name} must be a scalar/length-1 float32 "
+                f"per-tensor scale; got shape={tuple(scale.shape)}, "
+                f"dtype={scale.dtype}"
+            )
+        # SGLang's KV-cache quant method owns 0-D Parameter scales. FlyDSL's
+        # tensor JIT requires at least one stride-1 axis, so expose a zero-copy
+        # [1] view while retaining the Parameter's stable device allocation.
+        scales.append(scale.view(1) if scale.ndim == 0 else scale)
+    key_scale, value_scale = scales
+
+    device = q.device
+    tensors = (
+        ("output", output),
+        ("K cache", k_cache),
+        ("V cache", v_cache),
+        ("block table", block_tables),
+        ("sequence lengths", forward_batch.seq_lens),
+        ("key scale", key_scale),
+        ("value scale", value_scale),
+    )
+    for name, tensor in tensors:
+        if tensor.device != device:
+            raise ValueError(
+                f"FlyDSL MiMo {name} must be on {device}; got {tensor.device}"
+            )
+
+    pmax, psum, pout, context_lengths = _get_flydsl_workspace_views(backend, batch_size)
+    for name, workspace, dtype in (
+        ("pmax", pmax, torch.float32),
+        ("psum", psum, torch.float32),
+        ("pout", pout, torch.bfloat16),
+        ("context lengths", context_lengths, torch.int32),
+    ):
+        if workspace.device != device or workspace.dtype != dtype:
+            raise ValueError(
+                f"FlyDSL MiMo {name} workspace must be {dtype} on {device}; "
+                f"got {workspace.dtype} on {workspace.device}"
+            )
+    # SGLang uses int64 sequence lengths on ROCm.  Write the adjusted lengths
+    # directly into the persistent int32 FlyDSL buffer: torch.add's `out=`
+    # conversion is capture-safe and avoids a per-layer temporary allocation.
+    # The phase-1 context limit (1,048,576) is well within int32 range.
+    torch.add(forward_batch.seq_lens, query_length, out=context_lengths)
+
+    backend._flydsl_pa_decode_tile(
+        output=output_view,
+        query=q_view,
+        key_cache=k_cache,
+        value_cache=v_cache,
+        block_tables=block_tables,
+        context_lengths=context_lengths,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        softmax_scale=layer.scaling,
+        num_partitions=FLYDSL_MIMO_NUM_PARTITIONS,
+        pmax=pmax,
+        psum=psum,
+        pout=pout,
     )
 
 

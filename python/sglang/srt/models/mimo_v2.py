@@ -493,7 +493,9 @@ class MiMoV2Attention(nn.Module):
             and server_args is not None
             and server_args.attention_backend == "aiter"
         )
-        self.v_head_dim = self.head_dim if self.needs_v_pad else self.original_v_head_dim
+        self.v_head_dim = (
+            self.head_dim if self.needs_v_pad else self.original_v_head_dim
+        )
 
         self.q_size = self.num_heads * self.head_dim
         self.k_size = self.num_kv_heads * self.head_dim
@@ -1013,8 +1015,27 @@ class MiMoV2Model(nn.Module):
             if not isinstance(self.layers[layer_idx], nn.Identity):
                 layer_self_attn = self.layers[layer_idx].self_attn
             if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
+                # Preserve the device-tensor identity created by the KV-cache
+                # quant method. FlyDSL consumes these scales during CUDA graph
+                # capture, where replacing them with Python floats would cause
+                # an illegal host-to-device tensor allocation in the kernel
+                # wrapper and leave the graph without a stable scale pointer.
+                for scale_name in ("k_scale", "v_scale"):
+                    scale = getattr(layer_self_attn.attn, scale_name)
+                    if isinstance(scale, torch.Tensor):
+                        with torch.no_grad():
+                            scale.fill_(float(scaling_factor))
+                    else:
+                        device = next(layer_self_attn.parameters()).device
+                        setattr(
+                            layer_self_attn.attn,
+                            scale_name,
+                            torch.tensor(
+                                float(scaling_factor),
+                                dtype=torch.float32,
+                                device=device,
+                            ),
+                        )
             else:
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"

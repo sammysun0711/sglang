@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
@@ -33,7 +34,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -61,9 +62,15 @@ except ImportError:
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
+    FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE,
+    FLYDSL_MIMO_HEAD_DIM,
+    FLYDSL_MIMO_KV_HEADS,
+    FLYDSL_MIMO_NUM_PARTITIONS,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
+    forward_target_verify_flydsl_5d,
     forward_target_verify_vectorized_5d,
+    load_flydsl_pa_decode_kernels,
 )
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -284,6 +291,17 @@ class AiterAttnBackend(AttentionBackend):
             self.device
         )
 
+        self._flydsl_pa_decode_tile = None
+        self._flydsl_compile_pa_decode_tile = None
+        self._flydsl_compile_pa_decode_reduce = None
+        self._flydsl_pa_decode_pmax = None
+        self._flydsl_pa_decode_psum = None
+        self._flydsl_pa_decode_pout = None
+        self._flydsl_pa_decode_context_lengths = None
+        self._flydsl_pa_decode_workspace_max_bs = 0
+        self._flydsl_pa_decode_compiled = False
+        self._configure_flydsl_pa_decode(max_bs)
+
         self.logits_soft_cap = 0.0
 
         self.forward_metadata: ForwardMetadata = None
@@ -333,6 +351,132 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+    def _configure_flydsl_pa_decode(self, max_bs: int) -> None:
+        requested_impl = envs.SGLANG_AITER_PA_DECODE_IMPL.get().strip().lower()
+        if requested_impl not in ("gluon", "flydsl"):
+            raise ValueError(
+                "SGLANG_AITER_PA_DECODE_IMPL must be 'gluon' or 'flydsl'; "
+                f"got {requested_impl!r}"
+            )
+
+        # Multi-layer EAGLE draft workers deliberately override the global
+        # target layout with NHD. They must keep their existing unified-attn
+        # path even when the target worker explicitly selects FlyDSL.
+        self._pa_decode_impl = requested_impl
+        self._use_flydsl_pa_decode = (
+            requested_impl == "flydsl" and self.kv_cache_is_vectorized_5d
+        )
+        if not self._use_flydsl_pa_decode:
+            return
+
+        incompatibilities = []
+        if self.use_mla:
+            incompatibilities.append("MLA is unsupported")
+        if self.topk != 1:
+            incompatibilities.append(f"top-k must be 1, got {self.topk}")
+        if self.page_size != 64:
+            incompatibilities.append(f"page size must be 64, got {self.page_size}")
+        if self.max_context_len > 1_048_576:
+            incompatibilities.append(
+                "maximum context must not exceed 1,048,576 tokens, got "
+                f"{self.max_context_len}"
+            )
+        if (self.num_head, self.num_kv_head, self.head_dim) != (16, 1, 192):
+            incompatibilities.append(
+                "TP-local shape must be 16Q/1KV/head-192, got "
+                f"{self.num_head}Q/{self.num_kv_head}KV/head-{self.head_dim}"
+            )
+        if self.input_dtype != torch.bfloat16:
+            incompatibilities.append(
+                f"model dtype must be BF16, got {self.input_dtype}"
+            )
+        if self.kv_cache_dtype != fp8_dtype:
+            incompatibilities.append(
+                f"KV cache dtype must be FP8 E4M3, got {self.kv_cache_dtype}"
+            )
+        if not is_gfx942_supported():
+            incompatibilities.append("phase 1 is validated only on gfx942")
+        if incompatibilities:
+            raise RuntimeError(
+                "SGLANG_AITER_PA_DECODE_IMPL=flydsl is incompatible with this "
+                "target backend: " + "; ".join(incompatibilities)
+            )
+
+        kernels = load_flydsl_pa_decode_kernels()
+        self._flydsl_pa_decode_tile = kernels.pa_decode_tile
+        self._flydsl_compile_pa_decode_tile = kernels.compile_pa_decode_tile
+        self._flydsl_compile_pa_decode_reduce = kernels.compile_pa_decode_reduce
+        self._ensure_flydsl_pa_decode_workspace(max_bs)
+        logger.info(
+            "Enabled MiMo FlyDSL PA decode on target worker: full "
+            "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=AITER, "
+            "ordinary decode=AITER; runtime=%s (%s), kernel=%s, "
+            "workspace_max_bs=%d",
+            kernels.version,
+            kernels.runtime_path,
+            kernels.kernel_path,
+            self._flydsl_pa_decode_workspace_max_bs,
+        )
+
+    def _ensure_flydsl_pa_decode_workspace(self, max_bs: int) -> None:
+        if not self._use_flydsl_pa_decode:
+            return
+        if max_bs <= self._flydsl_pa_decode_workspace_max_bs:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlyDSL PA decode workspace cannot grow during CUDA graph capture"
+            )
+
+        scalar_numel = (
+            max_bs
+            * FLYDSL_MIMO_KV_HEADS
+            * FLYDSL_MIMO_NUM_PARTITIONS
+            * FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE
+        )
+        self._flydsl_pa_decode_pmax = torch.empty(
+            scalar_numel, dtype=torch.float32, device=self.device
+        )
+        self._flydsl_pa_decode_psum = torch.empty_like(self._flydsl_pa_decode_pmax)
+        self._flydsl_pa_decode_pout = torch.empty(
+            scalar_numel * FLYDSL_MIMO_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._flydsl_pa_decode_context_lengths = torch.empty(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        self._flydsl_pa_decode_workspace_max_bs = max_bs
+
+    def _compile_flydsl_pa_decode(self) -> None:
+        if not self._use_flydsl_pa_decode or self._flydsl_pa_decode_compiled:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlyDSL PA decode must be compiled before CUDA graph capture"
+            )
+
+        self._flydsl_compile_pa_decode_tile(
+            head_dim=192,
+            query_group_size=16,
+            block_size=64,
+            num_partitions=8,
+            softmax_scale=192**-0.5,
+            query_dtype="bf16",
+            per_token_kv=False,
+            query_length=4,
+            trans_v=True,
+        )
+        self._flydsl_compile_pa_decode_reduce(
+            max_context_partition_num=8,
+            query_seq_len=4,
+            query_group_size=16,
+            head_size=192,
+            output_dtype_str="bf16",
+            logits_dtype_str="bf16",
+        )
+        self._flydsl_pa_decode_compiled = True
 
     def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
         """``kv_cache_dtype`` string for ``paged_attention_ragged`` (aiter ``pa/pa_ragged.py``).
@@ -1400,6 +1544,13 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        if self._use_flydsl_pa_decode:
+            self._ensure_flydsl_pa_decode_workspace(max_bs)
+            # Compile both the tile and split reducer before capture. The
+            # Python wrapper's cache then makes every captured layer call a
+            # launch-only operation with caller-owned workspaces.
+            self._compile_flydsl_pa_decode()
+
         # PR #20978 pads max_bs beyond pool_size for higher cuda-graph
         # coverage. Reallocate indptr buffers so they fit the padded max_bs.
         # See: https://github.com/sgl-project/sglang/pull/20978
@@ -2310,7 +2461,21 @@ class AiterAttnBackend(AttentionBackend):
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
-                    forward_target_verify_vectorized_5d(
+                    is_swa_layer = (
+                        layer.sliding_window_size is not None
+                        and layer.sliding_window_size > -1
+                    )
+                    use_flydsl = (
+                        getattr(self, "_use_flydsl_pa_decode", False)
+                        and not is_swa_layer
+                        and sinks is None
+                    )
+                    target_verify_fn = (
+                        forward_target_verify_flydsl_5d
+                        if use_flydsl
+                        else forward_target_verify_vectorized_5d
+                    )
+                    target_verify_fn(
                         self,
                         q,
                         layer,

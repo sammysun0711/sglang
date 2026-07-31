@@ -46,6 +46,42 @@ def scatter_ragged_to_page_table_kernel(
 
 
 @triton.jit
+def scatter_ragged_to_paged_kv_kernel(
+    token_indices_ptr,
+    token_indptr_ptr,
+    page_indptr_ptr,
+    page_indices_ptr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Convert flat ragged token slots to flat ragged physical page ids."""
+    pid = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    token_start = tl.load(token_indptr_ptr + pid).to(tl.int64)
+    page_start = tl.load(page_indptr_ptr + pid).to(tl.int64)
+    num_pages = (
+        tl.load(page_indptr_ptr + pid + 1).to(tl.int64) - page_start
+    )
+
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if block_id * BLOCK_SIZE >= num_pages:
+        return
+    mask = offsets < num_pages
+    token_offsets = offsets.to(tl.int64) * PAGE_SIZE
+    token_slots = tl.load(
+        token_indices_ptr + token_start + token_offsets,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        page_indices_ptr + page_start + offsets,
+        token_slots // PAGE_SIZE,
+        mask=mask,
+    )
+
+
+@triton.jit
 def scatter_req_to_token_to_page_table_kernel(
     req_to_token_ptr,
     req_pool_indices_ptr,

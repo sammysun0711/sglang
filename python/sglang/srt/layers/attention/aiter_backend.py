@@ -15,6 +15,7 @@ import triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
+    scatter_ragged_to_paged_kv_kernel,
     scatter_ragged_to_page_table_kernel,
     scatter_req_to_token_to_page_table_kernel,
 )
@@ -127,6 +128,9 @@ class ForwardMetadata:
     max_extend_len: Optional[int] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     swa_page_table: Optional[torch.Tensor] = None
+    paged_kv_indptr: Optional[torch.Tensor] = None
+    paged_kv_indices: Optional[torch.Tensor] = None
+    paged_kv_last_page_len: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
 
@@ -1540,6 +1544,11 @@ class AiterAttnBackend(AttentionBackend):
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
+                    paged_kv_indptr=self.indices_updater_prefill.paged_kv_indptr,
+                    paged_kv_indices=self.indices_updater_prefill.paged_kv_indices,
+                    paged_kv_last_page_len=(
+                        self.indices_updater_prefill.paged_kv_last_page_len
+                    ),
                     swa_out_cache_loc=swa_out_cache_loc,
                 )
 
@@ -2946,6 +2955,9 @@ class AiterIndicesUpdaterPrefill:
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
+        self.paged_kv_indptr = None
+        self.paged_kv_indices = None
+        self.paged_kv_last_page_len = None
         self.max_q_len = 0
         self.max_kv_len = 0
 
@@ -2976,6 +2988,10 @@ class AiterIndicesUpdaterPrefill:
         qo_indptr = self.qo_indptr
         paged_kernel_lens = seq_lens
         paged_kernel_lens_sum = seq_lens_sum
+
+        self.paged_kv_indptr = None
+        self.paged_kv_indices = None
+        self.paged_kv_last_page_len = None
 
         bs = len(req_pool_indices)
         if spec_info is None:
@@ -3012,6 +3028,64 @@ class AiterIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
+
+            if (
+                self.attn_backend.kv_cache_is_vectorized_5d
+                and self.attn_backend.page_size == 64
+                and self.data_type == fp8_dtype
+                and self.q_data_type == torch.bfloat16
+                and self.num_qo_heads == 16
+                and self.num_kv_heads == 1
+                and self.head_dim == 192
+            ):
+                page_size = self.attn_backend.page_size
+                page_lens = torch.div(
+                    seq_lens + page_size - 1,
+                    page_size,
+                    rounding_mode="floor",
+                ).to(torch.int32)
+                paged_kv_indptr = torch.empty(
+                    bs + 1, dtype=torch.int32, device=req_pool_indices.device
+                )
+                paged_kv_indptr[0] = 0
+                torch.cumsum(page_lens, dim=0, out=paged_kv_indptr[1:])
+
+                # sum(ceil(seq_i / page_size)) is bounded by
+                # ceil(sum(seq_i) / page_size) + batch_size - 1.  Keep 256
+                # zero page ids after the valid region because CK may issue a
+                # speculative page-table vector load before applying bounds.
+                max_page_entries = (
+                    (paged_kernel_lens_sum + page_size - 1) // page_size
+                    + max(bs - 1, 0)
+                )
+                paged_kv_indices = torch.zeros(
+                    max_page_entries + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                block_size = 256
+                max_pages_per_seq = (
+                    self.attn_backend.max_context_len + page_size - 1
+                ) // page_size
+                grid = (
+                    bs,
+                    triton.cdiv(max(max_pages_per_seq, 1), block_size),
+                )
+                scatter_ragged_to_paged_kv_kernel[grid](
+                    kv_indices,
+                    kv_indptr,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    PAGE_SIZE=page_size,
+                    BLOCK_SIZE=block_size,
+                )
+                paged_kv_last_page_len = (
+                    torch.remainder(seq_lens - 1, page_size) + 1
+                ).to(torch.int32)
+
+                self.paged_kv_indptr = paged_kv_indptr
+                self.paged_kv_indices = paged_kv_indices
+                self.paged_kv_last_page_len = paged_kv_last_page_len
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(

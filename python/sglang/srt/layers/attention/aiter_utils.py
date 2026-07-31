@@ -56,6 +56,11 @@ FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS = (8, 16, 24, 32)
 FLYDSL_MIMO_NUM_PARTITIONS_ENV = "SGLANG_FLYDSL_PA_NUM_PARTITIONS"
 FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE = 64
 
+CK_MIMO_PREFILL_QUERY_HEADS = 16
+CK_MIMO_PREFILL_KV_HEADS = 1
+CK_MIMO_PREFILL_HEAD_DIM = 192
+CK_MIMO_PREFILL_PAGE_SIZE = 64
+
 
 def get_flydsl_mimo_num_partitions() -> int:
     raw_value = os.getenv(
@@ -144,8 +149,7 @@ def forward_extend_vectorized_5d(
 ) -> torch.Tensor:
     """``forward_extend`` specialization for the SHUFFLE 5D KV pool.
 
-    Two sub-paths, both routing through aiter's 3D LINEAR-mode
-    ``mha_batch_prefill_func`` (page_size=1):
+    Three sub-paths route through ``mha_batch_prefill_func``:
 
     1. Fresh-prompt shortcut: when every request in the batch has zero
        ``extend_prefix_lens`` (first chunk of a fresh prompt, or any
@@ -154,7 +158,11 @@ def forward_extend_vectorized_5d(
        ``(k, v)`` directly. No descales needed since no data is read
        from the (possibly fp8) cache.
 
-    2. Gather-and-linearize: otherwise gather the per-token K/V from the
+    2. Direct paged FP8: cached full-attention MiMo chunks with the proven
+       ``16Q/1KV, Dq=Dv=192, page=64`` contract pass the SHUFFLE 5D cache and
+       flat ragged page table directly to the tuned CK kernel.
+
+    3. Gather-and-linearize: every unsupported case gathers per-token K/V from the
        SHUFFLE 5D pool via ``launch_gather_shuffle_5d_to_linear``
        (triton inverse of the SHUFFLE writer) into a contiguous
        ``(T, H, D)`` buffer in the cache's ``store_dtype``, then run the
@@ -162,10 +170,8 @@ def forward_extend_vectorized_5d(
        raw fp8 with the per-tensor descales — aiter's LINEAR-mode kernel
        supports fp8 K/V/Q natively, so no host-side dequant is needed.
 
-    The fallback exists because aiter's paged ``mha_batch_prefill_func``
-    lacks a compiled kernel for our
-    ``(page_size=64, bf16/fp8, SHUFFLE 5D)`` configuration; calling it
-    from the 5D pool aborts with ``"no matching kernel found"``.
+    The direct path is deliberately narrow. SWA/sink, non-FP8, other head
+    shapes, and missing page metadata retain the established linear fallback.
 
     Returns the ``(T, H_q * D_v)`` attention output, ready to be
     returned from ``AiterAttnBackend.forward_extend``.
@@ -175,7 +181,12 @@ def forward_extend_vectorized_5d(
         forward_batch.extend_prefix_lens_cpu
     )
     if extend_no_prefix:
-        k_lin = k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        # Q and K are head-aligned views whose last dimension is contiguous.
+        # AITER's LINEAR prefill kernel accepts their token stride directly, so
+        # avoid materializing full-token copies for the fresh-prompt chunk.
+        k_lin = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        # MiMo V is different: F.pad materializes its 128 -> 192 expansion, so
+        # keeping contiguous() here is both harmless and explicit.
         v_lin = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
         total_tokens = k_lin.shape[0]
         kv_indices_lin = torch.arange(
@@ -184,7 +195,7 @@ def forward_extend_vectorized_5d(
         kv_indptr_lin = backend.qo_indptr[:bs0]
         max_q = int(backend.forward_metadata.max_q_len)
         o = mha_batch_prefill_func(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
             k_lin,
             v_lin,
             backend.qo_indptr[:bs0],
@@ -204,28 +215,13 @@ def forward_extend_vectorized_5d(
             o = o.to(backend.input_dtype)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    # Path 2: gather-and-linearize.
-    # SWA layers gather from the SWA sub-pool via swa_page_table;
-    # full-attn layers gather from the full sub-pool via kv_indices.
-    # Both are per-TOKEN slot id lists populated by
-    # ``create_flashinfer_kv_indices_triton`` from ``req_to_token`` (one
-    # slot id per logical token), so the first ``seq_lens_sum`` entries
-    # of either tensor are exactly the per-token absolute pool slot ids
-    # in request-major order — no per-token gather metadata to build on
-    # host.
+    # Resolve the raw 5D K/V buffer for this layer (going through the
+    # SWA->sub-pool mapping when applicable).
     is_swa_layer = (
         layer.sliding_window_size is not None
         and layer.sliding_window_size > -1
         and backend.forward_metadata.swa_page_table is not None
     )
-    total_kv = int(forward_batch.seq_lens_sum)
-    if is_swa_layer:
-        slot_ids = backend.forward_metadata.swa_page_table[:total_kv]
-    else:
-        slot_ids = backend.forward_metadata.kv_indices[:total_kv]
-
-    # Resolve the raw 5D K/V buffer for this layer (going through the
-    # SWA→sub-pool mapping when applicable).
     pool = backend.token_to_kv_pool
     if hasattr(pool, "layers_mapping"):
         sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
@@ -235,6 +231,115 @@ def forward_extend_vectorized_5d(
         sub_layer_id = layer.layer_id
     k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
     v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
+
+    metadata = backend.forward_metadata
+    has_paged_metadata = all(
+        getattr(metadata, name, None) is not None
+        for name in (
+            "paged_kv_indptr",
+            "paged_kv_indices",
+            "paged_kv_last_page_len",
+        )
+    )
+    expected_k_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_HEAD_DIM // 16,
+        CK_MIMO_PREFILL_PAGE_SIZE,
+        16,
+    )
+    expected_v_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_PAGE_SIZE // 16,
+        CK_MIMO_PREFILL_HEAD_DIM,
+        16,
+    )
+    use_direct_paged = (
+        mha_batch_prefill_func is not None
+        and not is_swa_layer
+        and sinks is None
+        and tuple(window_size) == (-1, -1)
+        and backend.input_dtype == torch.bfloat16
+        and backend.kv_cache_dtype == fp8_dtype
+        and sub_pool.dtype == fp8_dtype
+        and backend.page_size == CK_MIMO_PREFILL_PAGE_SIZE
+        and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
+        and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and float(backend.logits_soft_cap) == 0.0
+        and has_paged_metadata
+        and k_buf.ndim == 5
+        and v_buf.ndim == 5
+        and tuple(k_buf.shape[1:]) == expected_k_tail
+        and tuple(v_buf.shape[1:]) == expected_v_tail
+        and k_buf.shape[0] == v_buf.shape[0]
+        and k_buf.element_size() == 1
+        and v_buf.element_size() == 1
+    )
+
+    if use_direct_paged:
+        # FP8 pools may expose uint8 storage because some PyTorch indexing
+        # operations do not implement float8. Reinterpret the identical bytes
+        # without copying before handing the physical 5D cache to AITER.
+        k_paged = (
+            k_buf.view(sub_pool.dtype)
+            if sub_pool.store_dtype != sub_pool.dtype
+            else k_buf
+        )
+        v_paged = (
+            v_buf.view(sub_pool.dtype)
+            if sub_pool.store_dtype != sub_pool.dtype
+            else v_buf
+        )
+        q_local = q.to(fp8_dtype)
+        q_descale_local = (
+            layer.k_scale if layer.k_scale is not None else backend.k_scale
+        )
+        k_descale_local = (
+            layer.k_scale if layer.k_scale is not None else backend.k_scale
+        )
+        v_descale_local = (
+            layer.v_scale if layer.v_scale is not None else backend.v_scale
+        )
+        max_kv = int(metadata.max_kv_len)
+        max_q = int(metadata.max_q_len)
+        o = mha_batch_prefill_func(
+            q_local.contiguous().view(
+                -1, layer.tp_q_head_num, layer.qk_head_dim
+            ),
+            k_paged,
+            v_paged,
+            backend.qo_indptr[:bs0],
+            metadata.paged_kv_indptr[:bs0],
+            metadata.paged_kv_indices,
+            max_q,
+            max_kv,
+            causal=True,
+            logits_soft_cap=0.0,
+            alibi_slopes=None,
+            return_lse=False,
+            return_attn_probs=False,
+            window_size=(-1, -1),
+            sink_ptr=None,
+            q_descale=q_descale_local,
+            k_descale=k_descale_local,
+            v_descale=v_descale_local,
+            kv_last_page_lens=metadata.paged_kv_last_page_len,
+        )
+        if o.dtype != backend.input_dtype:
+            o = o.to(backend.input_dtype)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    # Path 3: gather-and-linearize. SWA layers gather from the SWA sub-pool;
+    # full-attention layers gather from the full pool. Both metadata tensors
+    # contain per-token absolute slots in request-major order.
+    total_kv = int(forward_batch.seq_lens_sum)
+    if is_swa_layer:
+        slot_ids = metadata.swa_page_table[:total_kv]
+    else:
+        slot_ids = metadata.kv_indices[:total_kv]
 
     k_lin, v_lin = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
     # k_lin / v_lin come out in ``store_dtype`` (uint8 for fp8 pools

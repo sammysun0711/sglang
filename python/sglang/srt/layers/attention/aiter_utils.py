@@ -15,6 +15,7 @@ needing to be a method on the class.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -38,7 +39,10 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     get_recommended_splits = None
 
 from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
+from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -55,11 +59,101 @@ FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS = 8
 FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS = (8, 16, 24, 32)
 FLYDSL_MIMO_NUM_PARTITIONS_ENV = "SGLANG_FLYDSL_PA_NUM_PARTITIONS"
 FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE = 64
+FLYDSL_MIMO_PREFILL_ENV = "SGLANG_FLYDSL_MIMO_PREFILL"
+FLYDSL_MIMO_PREFILL_MIN_Q = 4096
+FLYDSL_MIMO_PREFILL_MIN_KV = 8192
 
 CK_MIMO_PREFILL_QUERY_HEADS = 16
 CK_MIMO_PREFILL_KV_HEADS = 1
 CK_MIMO_PREFILL_HEAD_DIM = 192
 CK_MIMO_PREFILL_PAGE_SIZE = 64
+
+
+@lru_cache(maxsize=1)
+def is_gfx950() -> bool:
+    if not torch.version.hip or not torch.cuda.is_available():
+        return False
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    return arch == "gfx950"
+
+
+def quantize_query_per_tensor_fp8(
+    q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a BF16/FP16 query and return its independent FP8 descale.
+
+    A raw ``q.to(fp8_dtype)`` has an implicit descale of one.  Reusing the KV
+    cache's K descale for that tensor changes Q by an unrelated factor and is
+    only hidden when every cache scale happens to be 1.0.  The batch-prefill
+    FP8 ABI expects ``dequantized_q = q_fp8 * q_descale``, so use SGLang's
+    dynamic per-tensor quantizer and forward the scale it actually produced.
+
+    Prefill queries arrive as a two-dimensional token-major view whose outer
+    stride may still reference the fused QKV allocation.  The quantization
+    kernels consume a dense matrix, and the old dtype conversion also
+    materialized one, so make that requirement explicit here.
+    """
+    if q.ndim != 2:
+        raise ValueError(
+            "AITER FP8 batch-prefill query quantization requires a 2D "
+            f"[tokens, heads * head_dim] tensor; got shape {tuple(q.shape)}"
+        )
+    if not q.is_floating_point() or q.dtype == fp8_dtype:
+        raise ValueError(
+            "AITER FP8 batch-prefill query quantization requires a non-FP8 "
+            f"floating-point query; got {q.dtype}"
+        )
+
+    q_fp8, q_descale = scaled_fp8_quant(
+        q.contiguous(),
+        scale=None,
+        use_per_token_if_dynamic=False,
+    )
+    if q_descale.numel() != 1 or q_descale.dtype != torch.float32:
+        raise RuntimeError(
+            "AITER FP8 batch-prefill requires one FP32 Q descale; got "
+            f"shape={tuple(q_descale.shape)}, dtype={q_descale.dtype}"
+        )
+    return q_fp8, q_descale
+
+
+@dataclass(frozen=True)
+class FlyDSLMiMoPrefillKernel:
+    run: Callable
+    version: str
+    runtime_path: str
+    kernel_path: str
+
+
+@lru_cache(maxsize=1)
+def load_flydsl_mimo_prefill_kernel() -> FlyDSLMiMoPrefillKernel:
+    """Lazily load the optional gfx950 MiMo D192/V128 paged kernel."""
+
+    try:
+        flydsl = importlib.import_module("flydsl")
+        module = importlib.import_module(
+            "kernels.attention.flash_attn_fp8_mimo_paged_gfx950"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"{FLYDSL_MIMO_PREFILL_ENV}=1 requires the compatible FlyDSL "
+            "runtime and the local FlyDSL repository-root `kernels` package "
+            "on PYTHONPATH"
+        ) from exc
+
+    kernel = FlyDSLMiMoPrefillKernel(
+        run=module.mimo_paged_flash_attn_fp8,
+        version=str(getattr(flydsl, "__version__", "unknown")),
+        runtime_path=str(getattr(flydsl, "__file__", "unknown")),
+        kernel_path=str(getattr(module, "__file__", "unknown")),
+    )
+    logger.info(
+        "Loaded FlyDSL MiMo cached-prefill kernel: runtime=%s version=%s kernel=%s",
+        kernel.runtime_path,
+        kernel.version,
+        kernel.kernel_path,
+    )
+    return kernel
 
 
 def get_flydsl_mimo_num_partitions() -> int:
@@ -293,10 +387,7 @@ def forward_extend_vectorized_5d(
             if sub_pool.store_dtype != sub_pool.dtype
             else v_buf
         )
-        q_local = q.to(fp8_dtype)
-        q_descale_local = (
-            layer.k_scale if layer.k_scale is not None else backend.k_scale
-        )
+        q_local, q_descale_local = quantize_query_per_tensor_fp8(q)
         k_descale_local = (
             layer.k_scale if layer.k_scale is not None else backend.k_scale
         )
@@ -305,29 +396,70 @@ def forward_extend_vectorized_5d(
         )
         max_kv = int(metadata.max_kv_len)
         max_q = int(metadata.max_q_len)
-        o = mha_batch_prefill_func(
-            q_local.contiguous().view(
-                -1, layer.tp_q_head_num, layer.qk_head_dim
-            ),
-            k_paged,
-            v_paged,
-            backend.qo_indptr[:bs0],
-            metadata.paged_kv_indptr[:bs0],
-            metadata.paged_kv_indices,
-            max_q,
-            max_kv,
-            causal=True,
-            logits_soft_cap=0.0,
-            alibi_slopes=None,
-            return_lse=False,
-            return_attn_probs=False,
-            window_size=(-1, -1),
-            sink_ptr=None,
-            q_descale=q_descale_local,
-            k_descale=k_descale_local,
-            v_descale=v_descale_local,
-            kv_last_page_lens=metadata.paged_kv_last_page_len,
+        scalar_descales = all(
+            isinstance(scale, torch.Tensor)
+            and scale.dtype == torch.float32
+            and scale.numel() == 1
+            and scale.device == q.device
+            for scale in (q_descale_local, k_descale_local, v_descale_local)
         )
+        use_flydsl_prefill = (
+            get_bool_env_var(FLYDSL_MIMO_PREFILL_ENV, "false")
+            and is_gfx950()
+            and getattr(layer, "mimo_original_v_head_dim", None) == 128
+            and max_q >= FLYDSL_MIMO_PREFILL_MIN_Q
+            and max_kv >= FLYDSL_MIMO_PREFILL_MIN_KV
+            and scalar_descales
+            and metadata.kv_indptr is not None
+            and metadata.kv_indptr.dtype == torch.int32
+            and metadata.paged_kv_indptr.dtype == torch.int32
+            and metadata.paged_kv_indices.dtype == torch.int32
+        )
+        q_paged = q_local.contiguous().view(
+            -1, layer.tp_q_head_num, layer.qk_head_dim
+        )
+        if use_flydsl_prefill:
+            o = load_flydsl_mimo_prefill_kernel().run(
+                q_paged,
+                k_paged,
+                v_paged,
+                backend.qo_indptr[:bs0],
+                metadata.kv_indptr[:bs0],
+                metadata.paged_kv_indptr[:bs0],
+                metadata.paged_kv_indices,
+                max_seqlen_q=max_q,
+                max_seqlen_kv=max_kv,
+                q_descale=q_descale_local,
+                k_descale=k_descale_local,
+                v_descale=v_descale_local,
+                stream=(
+                    torch.cuda.current_stream(q.device)
+                    if q.device.type == "cuda"
+                    else None
+                ),
+            )
+        else:
+            o = mha_batch_prefill_func(
+                q_paged,
+                k_paged,
+                v_paged,
+                backend.qo_indptr[:bs0],
+                metadata.paged_kv_indptr[:bs0],
+                metadata.paged_kv_indices,
+                max_q,
+                max_kv,
+                causal=True,
+                logits_soft_cap=0.0,
+                alibi_slopes=None,
+                return_lse=False,
+                return_attn_probs=False,
+                window_size=(-1, -1),
+                sink_ptr=None,
+                q_descale=q_descale_local,
+                k_descale=k_descale_local,
+                v_descale=v_descale_local,
+                kv_last_page_lens=metadata.paged_kv_last_page_len,
+            )
         if o.dtype != backend.input_dtype:
             o = o.to(backend.input_dtype)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -354,10 +486,7 @@ def forward_extend_vectorized_5d(
     # For fp8 K/V we hand the raw fp8 tensors and the layer's per-tensor
     # descales straight to aiter.
     if sub_pool.dtype == fp8_dtype:
-        q_local = q.to(fp8_dtype)
-        q_descale_local = (
-            layer.k_scale if layer.k_scale is not None else backend.k_scale
-        )
+        q_local, q_descale_local = quantize_query_per_tensor_fp8(q)
         k_descale_local = (
             layer.k_scale if layer.k_scale is not None else backend.k_scale
         )

@@ -550,6 +550,10 @@ class MiMoV2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        # Preserve the unpadded projected-V width for attention backends.  The
+        # AITER ABI sees padded D192, while the MiMo-specific FlyDSL kernel may
+        # safely compute only this guaranteed-zero-tail D128 prefix.
+        self.attn.mimo_original_v_head_dim = self.original_v_head_dim
 
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)

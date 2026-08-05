@@ -403,8 +403,10 @@ class AiterAttnBackend(AttentionBackend):
             incompatibilities.append(
                 f"KV cache dtype must be FP8 E4M3, got {self.kv_cache_dtype}"
             )
-        if not is_gfx942_supported():
-            incompatibilities.append("phase 1 is validated only on gfx942")
+        if not (is_gfx942_supported() or is_gfx95_supported()):
+            incompatibilities.append(
+                "FlyDSL PA decode is validated only on gfx942 or gfx950"
+            )
         if incompatibilities:
             raise RuntimeError(
                 "SGLANG_AITER_PA_DECODE_IMPL=flydsl is incompatible with this "

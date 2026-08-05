@@ -28,12 +28,20 @@ try:
     # `aiter/__init__.py` (`from .ops.mha import *`). Note: a bare
     # `from aiter.mha import ...` does NOT work — that module path only
     # exists as `aiter.ops.mha`.
-    from aiter import mha_batch_prefill_func
+    from aiter import (
+        flash_attn_varlen_func,
+        fmha_v3_fwd,
+        fmha_v3_varlen_fwd,
+        mha_batch_prefill_func,
+    )
     from aiter.ops.triton.gluon.pa_decode_gluon import (
         get_recommended_splits,
         pa_decode_gluon,
     )
 except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backend
+    flash_attn_varlen_func = None
+    fmha_v3_fwd = None
+    fmha_v3_varlen_fwd = None
     mha_batch_prefill_func = None
     pa_decode_gluon = None
     get_recommended_splits = None
@@ -68,6 +76,19 @@ CK_MIMO_PREFILL_KV_HEADS = 1
 CK_MIMO_PREFILL_HEAD_DIM = 192
 CK_MIMO_PREFILL_PAGE_SIZE = 64
 
+MIMO_FRESH_BF16_ASM_ENV = "SGLANG_AITER_MIMO_FRESH_BF16_ASM"
+MIMO_FRESH_BF16_ASM_ENABLED = get_bool_env_var(MIMO_FRESH_BF16_ASM_ENV, "false")
+MIMO_FRESH_BF16_ASM_VARLEN_ENV = "SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN"
+MIMO_FRESH_BF16_ASM_VARLEN_ENABLED = get_bool_env_var(
+    MIMO_FRESH_BF16_ASM_VARLEN_ENV, "false"
+)
+MIMO_FRESH_BF16_ASM_V_HEAD_DIM = 128
+MIMO_FRESH_BF16_SWA_VARLEN_ENV = "SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN"
+MIMO_FRESH_BF16_SWA_VARLEN_ENABLED = get_bool_env_var(
+    MIMO_FRESH_BF16_SWA_VARLEN_ENV, "false"
+)
+MIMO_FRESH_BF16_SWA_WINDOW_SIZE = 128
+
 
 @lru_cache(maxsize=1)
 def is_gfx950() -> bool:
@@ -75,6 +96,345 @@ def is_gfx950() -> bool:
         return False
     arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
     return arch == "gfx950"
+
+
+def can_use_mimo_fresh_bf16_asm(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    window_size,
+    sinks,
+) -> bool:
+    """Return whether this extend is the qualified gfx950 MiMo ASM contract."""
+    lengths = forward_batch.extend_seq_lens_cpu
+    uniform_length = (
+        lengths is not None
+        and len(lengths) > 0
+        and lengths[0] > 128
+        and all(length == lengths[0] for length in lengths)
+    )
+    total_tokens = 0 if not uniform_length else len(lengths) * lengths[0]
+    return (
+        MIMO_FRESH_BF16_ASM_ENABLED
+        and fmha_v3_fwd is not None
+        and is_gfx950()
+        and uniform_length
+        and q.shape[0] == total_tokens
+        and k.shape[0] == total_tokens
+        and v.shape[0] == total_tokens
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and backend.input_dtype == torch.bfloat16
+        and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
+        and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
+        and k.shape[-2:] == (layer.tp_k_head_num, layer.qk_head_dim)
+        and v.shape[-2:] == (layer.tp_v_head_num, layer.v_head_dim)
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and (layer.sliding_window_size is None or layer.sliding_window_size < 0)
+        and tuple(window_size) == (-1, -1)
+        and sinks is None
+        and float(backend.logits_soft_cap) == 0.0
+    )
+
+
+def mimo_fresh_bf16_asm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """Run gfx950 D192/V128 ASM while preserving MiMo's padded-V ABI."""
+    lengths = forward_batch.extend_seq_lens_cpu
+    batch_size = len(lengths)
+    sequence_length = lengths[0]
+    q_4d = q.view(
+        batch_size,
+        sequence_length,
+        layer.tp_q_head_num,
+        layer.qk_head_dim,
+    )
+    k_4d = k.view(
+        batch_size,
+        sequence_length,
+        layer.tp_k_head_num,
+        layer.qk_head_dim,
+    )
+    # MiMo pads its 128 projected V lanes to 192 before the cache writer.  The
+    # tail is identically zero, so give ASM the meaningful 128-lane view.
+    v_4d = v.view(
+        batch_size,
+        sequence_length,
+        layer.tp_v_head_num,
+        layer.v_head_dim,
+    )[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+
+    # Keep the model ABI at Hq*192. ASM writes the strided first-128 view
+    # directly; the zero allocation makes every padded lane deterministic.
+    output = q.new_zeros(
+        (
+            batch_size,
+            sequence_length,
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+        )
+    )
+    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+    result = fmha_v3_fwd(
+        q_4d,
+        k_4d,
+        v_4d,
+        0.0,
+        layer.scaling,
+        True,
+        -1,
+        -1,
+        False,
+        False,
+        0,
+        output_v,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    if result[0].data_ptr() != output_v.data_ptr():
+        raise RuntimeError("gfx950 MiMo fresh BF16 ASM ignored its output buffer")
+    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+def can_use_mimo_fresh_bf16_varlen_asm(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    window_size,
+    sinks,
+) -> bool:
+    """Return whether this fresh ragged extend matches MiMo varlen ASM."""
+    lengths = forward_batch.extend_seq_lens_cpu
+    valid_lengths = (
+        lengths is not None
+        and len(lengths) > 0
+        and min(lengths) > 128
+    )
+    total_tokens = 0 if not valid_lengths else sum(lengths)
+    return (
+        MIMO_FRESH_BF16_ASM_ENABLED
+        and MIMO_FRESH_BF16_ASM_VARLEN_ENABLED
+        and fmha_v3_varlen_fwd is not None
+        and is_gfx950()
+        and valid_lengths
+        and q.shape[0] == total_tokens
+        and k.shape[0] == total_tokens
+        and v.shape[0] == total_tokens
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and backend.input_dtype == torch.bfloat16
+        and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
+        and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
+        and k.shape[-2:] == (layer.tp_k_head_num, layer.qk_head_dim)
+        and v.shape[-2:] == (layer.tp_v_head_num, layer.v_head_dim)
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and (layer.sliding_window_size is None or layer.sliding_window_size < 0)
+        and tuple(window_size) == (-1, -1)
+        and sinks is None
+        and float(backend.logits_soft_cap) == 0.0
+    )
+
+
+def mimo_fresh_bf16_varlen_asm(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """Run gfx950's grouped D192/V128 ASM on a fresh ragged MiMo batch."""
+    lengths = forward_batch.extend_seq_lens_cpu
+    batch_size = len(lengths)
+    max_length = max(lengths)
+    min_length = min(lengths)
+    q_varlen = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+    k_varlen = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+    v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)[
+        ..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM
+    ]
+
+    output = q.new_zeros(
+        (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+    )
+    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+    cu_seqlens = backend.qo_indptr[: batch_size + 1]
+    result = fmha_v3_varlen_fwd(
+        q_varlen,
+        k_varlen,
+        v_varlen,
+        cu_seqlens,
+        cu_seqlens,
+        max_length,
+        max_length,
+        min_length,
+        0.0,
+        layer.scaling,
+        0.0,
+        False,
+        True,
+        -1,
+        -1,
+        False,
+        False,
+        0,
+        output_v,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    if result[0].data_ptr() != output_v.data_ptr():
+        raise RuntimeError(
+            "gfx950 MiMo fresh BF16 varlen ASM ignored its output buffer"
+        )
+    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+def can_use_mimo_fresh_bf16_swa_varlen(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    window_size,
+    sinks,
+) -> bool:
+    """Return whether this fresh extend matches MiMo's gfx950 SWA contract."""
+    lengths = forward_batch.extend_seq_lens_cpu
+    valid_lengths = (
+        lengths is not None
+        and len(lengths) > 0
+        and min(lengths) > MIMO_FRESH_BF16_SWA_WINDOW_SIZE
+    )
+    total_tokens = 0 if not valid_lengths else sum(lengths)
+    valid_sinks = (
+        isinstance(sinks, torch.Tensor)
+        and sinks.device == q.device
+        and sinks.shape == (CK_MIMO_PREFILL_QUERY_HEADS,)
+        and sinks.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and sinks.stride(-1) == 1
+    )
+    return (
+        MIMO_FRESH_BF16_SWA_VARLEN_ENABLED
+        and flash_attn_varlen_func is not None
+        and is_gfx950()
+        and valid_lengths
+        and q.shape[0] == total_tokens
+        and k.shape[0] == total_tokens
+        and v.shape[0] == total_tokens
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and backend.input_dtype == torch.bfloat16
+        and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
+        and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and getattr(layer, "mimo_original_v_head_dim", None)
+        == MIMO_FRESH_BF16_ASM_V_HEAD_DIM
+        and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
+        and k.shape[-2:] == (layer.tp_k_head_num, layer.qk_head_dim)
+        and v.shape[-2:] == (layer.tp_v_head_num, layer.v_head_dim)
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and layer.sliding_window_size == MIMO_FRESH_BF16_SWA_WINDOW_SIZE
+        and tuple(window_size)
+        == (MIMO_FRESH_BF16_SWA_WINDOW_SIZE, -1)
+        and valid_sinks
+        and float(backend.logits_soft_cap) == 0.0
+    )
+
+
+def mimo_fresh_bf16_swa_varlen(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    window_size,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """Run native-D128 CK varlen SWA while preserving MiMo's padded-V ABI."""
+    lengths = forward_batch.extend_seq_lens_cpu
+    batch_size = len(lengths)
+    q_varlen = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+    k_varlen = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+    # MiMo materializes a zero-padded D192 V tensor before attention.  CK
+    # accepts its strided meaningful D128 prefix directly, avoiding both the
+    # extra V math and a materialization.
+    v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)[
+        ..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM
+    ]
+
+    # The model immediately slices attention output back to D128 before
+    # o_proj.  Leave the dead padded tail unwritten and direct CK into the
+    # strided prefix of the model ABI allocation.
+    output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+    cu_seqlens = backend.qo_indptr[: batch_size + 1]
+    sink_ptr = sinks if sinks.dtype == torch.float32 else sinks.float()
+    result = flash_attn_varlen_func(
+        q_varlen,
+        k_varlen,
+        v_varlen,
+        cu_seqlens,
+        cu_seqlens,
+        max(lengths),
+        max(lengths),
+        # This is a cascade-attention exclusion threshold, not the shortest
+        # sequence length.  Zero is required to execute every request.
+        min_seqlen_q=0,
+        softmax_scale=layer.scaling,
+        causal=True,
+        window_size=(int(window_size[0]), 0, 0),
+        sink_ptr=sink_ptr,
+        out=output_v,
+    )
+    if result.data_ptr() != output_v.data_ptr():
+        raise RuntimeError("gfx950 MiMo fresh SWA varlen ignored its output buffer")
+    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 def quantize_query_per_tensor_fp8(
@@ -275,6 +635,53 @@ def forward_extend_vectorized_5d(
         forward_batch.extend_prefix_lens_cpu
     )
     if extend_no_prefix:
+        if can_use_mimo_fresh_bf16_asm(
+            backend,
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            window_size,
+            sinks,
+        ):
+            return mimo_fresh_bf16_asm(q, k, v, layer, forward_batch)
+
+        if can_use_mimo_fresh_bf16_varlen_asm(
+            backend,
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            window_size,
+            sinks,
+        ):
+            return mimo_fresh_bf16_varlen_asm(
+                backend, q, k, v, layer, forward_batch
+            )
+
+        if can_use_mimo_fresh_bf16_swa_varlen(
+            backend,
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            window_size,
+            sinks,
+        ):
+            return mimo_fresh_bf16_swa_varlen(
+                backend,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                window_size,
+                sinks,
+            )
+
         # Q and K are head-aligned views whose last dimension is contiguous.
         # AITER's LINEAR prefill kernel accepts their token stride directly, so
         # avoid materializing full-token copies for the fresh-prompt chunk.

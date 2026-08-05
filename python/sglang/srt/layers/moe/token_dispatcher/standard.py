@@ -162,6 +162,12 @@ class StandardDispatcher(BaseDispatcher):
                 topk_ids=topk_ids,
                 router_logits=topk_output.router_logits,  # never tested
             )
+        elif isinstance(hidden_states, tuple):
+            if len(hidden_states) != 2:
+                raise ValueError(
+                    "standard prequantized MoE input must be (activation, scale)"
+                )
+            hidden_states, hidden_states_scale = hidden_states
         else:
             hidden_states = hidden_states
             hidden_states_scale = None

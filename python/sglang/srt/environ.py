@@ -617,6 +617,10 @@ class Envs:
     # quantization consumed by its block-scaled QKV GEMM on gfx950.  Keep the
     # route default-off until its model-specific serving gates are complete.
     SGLANG_MIMO_FUSED_RMS_QKV_QUANT = EnvBool(False)
+    # Fuse MiMo-V2's post-attention RMSNorm with the per-1x128 FP8 activation
+    # quantization consumed by its AITER block-scaled FMoE on gfx950. The
+    # normalized BF16 output remains available to the FP32 router path.
+    SGLANG_MIMO_FUSED_RMS_MOE_QUANT = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)

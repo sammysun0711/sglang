@@ -101,6 +101,14 @@ def _mimo_hidden_num_tokens(hidden_states) -> int:
     return states.shape[0]
 
 
+def _mimo_moe_inputs(hidden_states):
+    """Split fused MiMo MLP input into router BF16 and FMoE activation."""
+    if isinstance(hidden_states, tuple) and len(hidden_states) == 3:
+        normalized, quantized, scale = hidden_states
+        return normalized, (quantized, scale)
+    return hidden_states, hidden_states
+
+
 def load_mimo_v2_qkv_proj_weight(
     name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
 ):
@@ -346,14 +354,15 @@ class MiMoV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
-        if hidden_states.shape[0] > 0:
+        router_hidden_states, expert_hidden_states = _mimo_moe_inputs(hidden_states)
+        if router_hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            router_logits = self.gate(router_hidden_states)
+            topk_output = self.topk(router_hidden_states, router_logits)
         else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk.empty_topk_output(router_hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self.experts(expert_hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -388,17 +397,17 @@ class MiMoV2MoE(nn.Module):
         return final_hidden_states
 
     def op_gate(self, state):
+        router_hidden_states, _ = _mimo_moe_inputs(state.hidden_states_mlp_input)
         if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            state.forward_batch.forward_mode, router_hidden_states
         ):
-            # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
+            state.router_logits = self.gate(router_hidden_states)
         else:
             state.router_logits = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
+        hidden_states, _ = _mimo_moe_inputs(state.hidden_states_mlp_input)
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -754,6 +763,7 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
         self._gfx95_qkv_quant_format = self._detect_gfx95_qkv_quant_format()
+        self._gfx95_moe_quant_format = self._detect_gfx95_moe_quant_format()
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -784,6 +794,37 @@ class MiMoV2DecoderLayer(nn.Module):
             return "fp8"
         return ""
 
+    def _detect_gfx95_moe_quant_format(self) -> str:
+        """Select fused post-attention RMSNorm + FMoE input quantization."""
+        moe_backend = get_moe_runner_backend()
+        if (
+            not envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.get()
+            or not is_gfx95_supported()
+            or not (moe_backend.is_aiter() or moe_backend.is_auto())
+            or get_moe_expert_parallel_world_size() != 1
+            or getattr(self.mlp, "_enable_a2a_moe", False)
+        ):
+            return ""
+        weight = getattr(getattr(self.mlp, "experts", None), "w13_weight", None)
+        fp8_dtypes = {
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        }
+        return "fp8_moe" if weight is not None and weight.dtype in fp8_dtypes else ""
+
+    def _prefill_moe_quant_format(self, forward_batch: ForwardBatch) -> str:
+        return (
+            self._gfx95_moe_quant_format
+            if forward_batch.forward_mode.is_context_parallel_extend(
+                include_draft_extend_v2=True
+            )
+            else ""
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -807,7 +848,10 @@ class MiMoV2DecoderLayer(nn.Module):
             )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format=self._prefill_moe_quant_format(forward_batch),
         )
 
         should_allreduce_fusion = (
@@ -876,6 +920,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 state.pop("hidden_states_after_attn"),
                 state.pop("residual_after_input_ln"),
                 state.forward_batch,
+                quant_format=self._prefill_moe_quant_format(state.forward_batch),
             )
         )
 

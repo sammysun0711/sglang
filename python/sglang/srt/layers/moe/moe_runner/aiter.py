@@ -73,6 +73,9 @@ class AiterRunnerInput(RunnerInput):
     # Per-token activation scale produced by an EP dispatcher (mori). Falls
     # back to quant_info.a13_scale when None.
     a1_scale: Optional[torch.Tensor] = None
+    # True only when the producer already emitted AITER's column-major
+    # per-1x128 scale layout and fused_moe must skip partial_transpose.
+    a1_scale_is_transposed: bool = False
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
@@ -119,6 +122,13 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_transposed_a1_scale() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "a1_scale_is_transposed" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -162,6 +172,13 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        if runner_input.a1_scale_is_transposed:
+            if not _aiter_fused_moe_supports_transposed_a1_scale():
+                raise NotImplementedError(
+                    "pretransposed AITER MoE activation scales require a "
+                    "fused_moe build with a1_scale_is_transposed support"
+                )
+            extra["a1_scale_is_transposed"] = True
         if quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
@@ -223,10 +240,16 @@ def pre_permute_standard_to_aiter(
     running_state: dict,
 ) -> AiterRunnerInput:
     hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(torch.float32)
 
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
+        if hidden_states_scale is not None:
+            raise NotImplementedError(
+                "prequantized AITER MoE input does not support Python-side "
+                "router-weight application"
+            )
         # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
         assert (
             topk_weights.dim() == 2 and topk_weights.shape[-1] == 1
@@ -239,6 +262,14 @@ def pre_permute_standard_to_aiter(
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        a1_scale=hidden_states_scale,
+        a1_scale_is_transposed=bool(
+            getattr(hidden_states_scale, "_aiter_moe_scale_is_transposed", False)
+        ),
+        # Prequantized FP8 activations must not make fused_moe inherit FP8 as
+        # its output dtype.  MiMo's residual stream remains BF16; the scale is
+        # the unambiguous signal that dispatch supplied a quantized input.
+        output_dtype=torch.bfloat16 if hidden_states_scale is not None else None,
     )
 
 

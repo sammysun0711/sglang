@@ -1085,6 +1085,10 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        # A prequantized standard-dispatch input is an eager-only contract;
+        # decode graph routes continue to receive ordinary tensors.
+        if isinstance(hidden_states, tuple):
+            return self.forward_impl(hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1112,7 +1116,10 @@ class FusedMoE(torch.nn.Module):
             return self.forward_impl(hidden_states, topk_output)
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        origin_hidden_states_dim = hidden_states.shape[-1]
+        origin_hidden_states = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+        origin_hidden_states_dim = origin_hidden_states.shape[-1]
         assert self.quant_method is not None
 
         dispatch_output = self.dispatcher.dispatch(

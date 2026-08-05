@@ -101,6 +101,12 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
+    from aiter.ops.rmsnorm import (
+        mimo_add_rmsnorm_fp8_group_quant as _aiter_mimo_add_rmsnorm_fp8_group_quant,
+    )
+    from aiter.ops.rmsnorm import (
+        mimo_rmsnorm_fp8_group_quant as _aiter_mimo_rmsnorm_fp8_group_quant,
+    )
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
@@ -159,6 +165,57 @@ def _fused_rmsnorm_fp8_per_token_quant(
             0,  # group_size=0 → per-token
         )
         return (out_fp8, scale.unsqueeze(1))
+
+
+class _FusedRMSNormFP8GroupQuantForMoe:
+    """LayerNorm-compatible adapter returning BF16 plus FP8 FMoE input.
+
+    AITER FMoE accepts an already quantized activation and its per-1x128 scale,
+    but MiMo's router still needs the normalized BF16 values.  Keep both views
+    from one gfx950 fused RMSNorm/group-quant launch.  Produce AITER's
+    preshuffled column-major scale layout directly so FMoE does not need a
+    separate partial-transpose launch.
+    """
+
+    def __init__(self, layernorm: torch.nn.Module):
+        self.layernorm = layernorm
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        m, n = hidden_states.shape
+        normalized = torch.empty_like(hidden_states)
+        quantized = torch.empty_like(hidden_states, dtype=_aiter_fp8_dtype)
+        scale = torch.empty(
+            (m, n // 128), dtype=torch.float32, device=hidden_states.device
+        )
+        if residual is None:
+            residual_out = None
+            _aiter_mimo_rmsnorm_fp8_group_quant(
+                quantized,
+                normalized,
+                scale,
+                hidden_states,
+                self.layernorm.weight,
+                self.layernorm.variance_epsilon,
+            )
+        else:
+            residual_out = torch.empty_like(hidden_states)
+            _aiter_mimo_add_rmsnorm_fp8_group_quant(
+                quantized,
+                normalized,
+                scale,
+                hidden_states,
+                residual,
+                residual_out,
+                self.layernorm.weight,
+                self.layernorm.variance_epsilon,
+            )
+        scale._aiter_moe_scale_is_transposed = True
+        output = (normalized, quantized, scale)
+        return output if residual is None else (output, residual_out)
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
@@ -691,15 +748,30 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        quant_format: str = "",
     ):
         if cache is not None:
             self._context.cache = cache
+
+        layernorm = self.post_attention_layernorm
+        if (
+            quant_format == "fp8_moe"
+            and _use_aiter
+            and _is_gfx95_supported
+            and self._context.attn_dp_size == 1
+            and get_moe_cp_size() == 1
+        ):
+            # This adapter intentionally has no forward_with_allreduce_fusion
+            # attribute.  The existing communication function therefore
+            # performs the qualified TP all-reduce first, then runs one fused
+            # RMSNorm/group-quant kernel on its completed result.
+            layernorm = _FusedRMSNormFP8GroupQuantForMoe(layernorm)
 
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
+            layernorm=layernorm,
             context=self._context,
         )
 

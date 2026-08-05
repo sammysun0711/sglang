@@ -24,6 +24,12 @@ export PAGE_SIZE=64
 export MEM_FRACTION_STATIC=0.90
 export SWA_FULL_TOKENS_RATIO=0.01
 
+export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=1
+export SGLANG_MIMO_FUSED_RMS_QKV_QUANT=1
+export SGLANG_AITER_MIMO_FRESH_BF16_ASM=1
+export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=1
+export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=1
+
 # Real MTP acceptance for accuracy validation.
 unset SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
 
@@ -56,7 +62,7 @@ python3 -u -m sglang.launch_server \
   --mem-fraction-static 0.90 \
   --swa-full-tokens-ratio 0.01 \
   --context-length 1048576 \
-  --chunked-prefill-size 65536 \
+  --chunked-prefill-size 32768 \
   --max-prefill-tokens 1048576 \
   --attention-backend aiter \
   --kv-cache-dtype fp8_e4m3 \
@@ -66,5 +72,6 @@ python3 -u -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --enable-multi-layer-eagle \
+  --disable-radix-cache \
   "${cuda_graph_args[@]}" \
   2>&1 | tee "${LOG_DIR}/${LOG_FILE}"

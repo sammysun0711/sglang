@@ -6,7 +6,7 @@ input_tokens="${INPUT_TOKENS:-65536}"
 output_tokens="${OUTPUT_TOKENS:-1}"
 num_prompts="${NUM_PROMPTS:-4}"
 warmup_requests="${WARMUP_REQUESTS:-4}"
-max_concurrency="${MAX_CONCURRENCY:-4}"
+max_concurrency="${MAX_CONCURRENCY:-1}"
 model_path="${MODEL_PATH:-/models/MiMo-V2.5-Pro/}"
 port="${PORT:-30001}"
 dataset_path="${DATASET_PATH:-${script_dir}/ShareGPT_V3_unfiltered_cleaned_split.json}"
@@ -17,7 +17,7 @@ export SGLANG_TORCH_PROFILER_DIR="${profile_output_dir}"
 
 echo "Profiling input=${input_tokens}, output=${output_tokens}, concurrency=${max_concurrency}, prompts=${num_prompts}, warmups=${warmup_requests}"
 echo "Profile output: ${profile_output_dir}"
-
+#--profile-activities GPU \
 python3 -m sglang.bench_serving \
     --backend sglang \
     --model "${model_path}" \
@@ -34,6 +34,5 @@ python3 -m sglang.bench_serving \
     --warmup-requests "${warmup_requests}" \
     --max-concurrency "${max_concurrency}" \
     --profile \
-    --profile-activities GPU \
     --profile-output-dir "${profile_output_dir}" \
     --profile-prefix "${profile_prefix}"

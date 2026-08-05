@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -84,6 +85,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    is_gfx95_supported,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -91,6 +93,12 @@ from sglang.srt.utils import (
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+
+def _mimo_hidden_num_tokens(hidden_states) -> int:
+    """Return M for either a tensor or fused (quantized, scale, ...) input."""
+    states = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+    return states.shape[0]
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -579,7 +587,7 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if hidden_states.shape[0] == 0:
+        if _mimo_hidden_num_tokens(hidden_states) == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
@@ -745,6 +753,7 @@ class MiMoV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
         )
+        self._gfx95_qkv_quant_format = self._detect_gfx95_qkv_quant_format()
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -761,6 +770,20 @@ class MiMoV2DecoderLayer(nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
+    def _detect_gfx95_qkv_quant_format(self) -> str:
+        """Select the fused RMSNorm + group-quant contract for MiMo QKV."""
+        if (
+            not envs.SGLANG_MIMO_FUSED_RMS_QKV_QUANT.get()
+            or not is_gfx95_supported()
+        ):
+            return ""
+        weight = getattr(getattr(self.self_attn, "qkv_proj", None), "weight", None)
+        if weight is not None and weight.dtype == getattr(
+            torch, "float8_e4m3fn", None
+        ):
+            return "fp8"
+        return ""
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -770,10 +793,13 @@ class MiMoV2DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            self._gfx95_qkv_quant_format,
         )
 
-        if hidden_states.shape[0] != 0:
+        if _mimo_hidden_num_tokens(hidden_states) != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -829,7 +855,12 @@ class MiMoV2DecoderLayer(nn.Module):
         tbo_subbatch_index: Optional[int] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+            self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                self._gfx95_qkv_quant_format,
+            )
         )
         state.update(
             dict(

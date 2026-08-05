@@ -613,6 +613,10 @@ class Envs:
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
+    # Fuse MiMo-V2's input RMSNorm with the per-1x128 FP8 activation
+    # quantization consumed by its block-scaled QKV GEMM on gfx950.  Keep the
+    # route default-off until its model-specific serving gates are complete.
+    SGLANG_MIMO_FUSED_RMS_QKV_QUANT = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)

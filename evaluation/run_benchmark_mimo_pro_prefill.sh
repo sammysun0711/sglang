@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # 1P1D prefill benchmark
-TOKEN_LIST=(8192 65536 262144)
+read -r -a TOKEN_LIST <<< "${TOKEN_LIST_OVERRIDE:-8192 65536 262144 524284 1047548}"
 output_tokens=1
-concurrency_list=(4)
+read -r -a concurrency_list <<< "${CONCURRENCY_LIST_OVERRIDE:-4}"
 LOG_DIR="${LOG_DIR:-./logs/benchmark_tp8_prefill}"
 mkdir -p "$LOG_DIR"
 
@@ -33,12 +33,9 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --num-prompts 32 \
         --warmup-requests 4 \
         --max-concurrency ${concurrency} \
-        --pd-separated \
         2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"
-
     echo -e "============================================================\n"
   done
 done
 
 echo "All lengths and concurrency tests completed!"
-

@@ -10,15 +10,18 @@ export MC_TE_METRIC=1
 export SGLANG_SPEC_NAN_DETECTION=1
 export SGLANG_SPEC_OOB_DETECTION=1
 export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
+export ROCM_QUICK_REDUCE_QUANTIZATION="${ROCM_QUICK_REDUCE_QUANTIZATION:-INT8}"
 
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
 export SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d
-export SGLANG_FLYDSL_MIMO_PREFILL=1
-export SGLANG_AITER_PA_DECODE_IMPL=flydsl
-export FLYDSL_PA_NUM_PARTITIONS=16
+export SGLANG_FLYDSL_MIMO_PREFILL="${SGLANG_FLYDSL_MIMO_PREFILL:-1}"
+export SGLANG_AITER_PA_DECODE_IMPL="${SGLANG_AITER_PA_DECODE_IMPL:-flydsl}"
+export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
+export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
+export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export MAX_RUNNING_REQUESTS=128
 export PAGE_SIZE=64
-export MEM_FRACTION_STATIC=0.95
+export MEM_FRACTION_STATIC=0.90
 export SWA_FULL_TOKENS_RATIO=0.01
 
 # Real MTP acceptance for accuracy validation.
@@ -28,12 +31,18 @@ export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 export LOG_DIR="${LOG_DIR:-./logs/accuracy_${RUN_ID}}"
 export LOG_FILE="${LOG_FILE:-server_tp8_flydsl_accuracy.log}"
 
-echo "FlyDSL hybrid: full target-verify=FlyDSL, SWA/sink and decode=AITER"
-echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, partitions=${FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, overlap=enabled"
+echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
+echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, overlap=enabled"
 echo "MTP acceptance: real"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 
 mkdir -p ${LOG_DIR}
+
+cuda_graph_args=(--cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}")
+if [[ -n "${CUDA_GRAPH_BS_DECODE}" ]]; then
+  read -r -a cuda_graph_bs <<< "${CUDA_GRAPH_BS_DECODE}"
+  cuda_graph_args+=(--cuda-graph-bs-decode "${cuda_graph_bs[@]}")
+fi
 
 python3 -u -m sglang.launch_server \
   --model-path /models/MiMo-V2.5-Pro/ \
@@ -57,5 +66,5 @@ python3 -u -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --enable-multi-layer-eagle \
+  "${cuda_graph_args[@]}" \
   2>&1 | tee "${LOG_DIR}/${LOG_FILE}"
-

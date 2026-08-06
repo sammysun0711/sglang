@@ -11,6 +11,7 @@ export SGLANG_SPEC_NAN_DETECTION=1
 export SGLANG_SPEC_OOB_DETECTION=1
 export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
 export ROCM_QUICK_REDUCE_QUANTIZATION="${ROCM_QUICK_REDUCE_QUANTIZATION:-INT8}"
+export SGLANG_MIMO_MIXED_ROUTER="${SGLANG_MIMO_MIXED_ROUTER:-1}"
 
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
 export SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d
@@ -19,10 +20,10 @@ export SGLANG_AITER_PA_DECODE_IMPL="${SGLANG_AITER_PA_DECODE_IMPL:-flydsl}"
 export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
 export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
-export MAX_RUNNING_REQUESTS=128
-export PAGE_SIZE=64
-export MEM_FRACTION_STATIC=0.90
-export SWA_FULL_TOKENS_RATIO=0.01
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
+export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-65536}"
 
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=1
 export SGLANG_MIMO_FUSED_RMS_QKV_QUANT=1
@@ -38,9 +39,9 @@ export LOG_DIR="${LOG_DIR:-./logs/accuracy_${RUN_ID}}"
 export LOG_FILE="${LOG_FILE:-server_tp8_flydsl_accuracy.log}"
 
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
-echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, overlap=enabled"
-echo "MTP acceptance: real"
+echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, mtp=1, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
+echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
 
 mkdir -p ${LOG_DIR}
 
@@ -53,16 +54,16 @@ fi
 python3 -u -m sglang.launch_server \
   --model-path /models/MiMo-V2.5-Pro/ \
   --tp-size 8 \
-  --max-running-requests 96 \
+  --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --host 0.0.0.0 \
   --port 30001 \
   --trust-remote-code \
   --reasoning-parser mimo \
   --tool-call-parser mimo \
-  --mem-fraction-static 0.90 \
-  --swa-full-tokens-ratio 0.01 \
+  --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+  --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO}" \
   --context-length 1048576 \
-  --chunked-prefill-size 32768 \
+  --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
   --max-prefill-tokens 1048576 \
   --attention-backend aiter \
   --kv-cache-dtype fp8_e4m3 \

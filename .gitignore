@@ -180,6 +180,9 @@ benchmark/llava_bench/mme_pack
 tmp*.txt
 /tmp/
 
+# Evaluation datasets downloaded by local benchmark scripts
+evaluation/ShareGPT_V3_unfiltered_cleaned_split.json
+
 # Torch Compile logs
 tl_out/
 

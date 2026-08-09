@@ -652,6 +652,10 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # On HIP, use a torch/Python implementation of CUDA's target-only
+    # stochastic EAGLE verifier for non-greedy topk=1 trees instead of forcing
+    # greedy verification. Default keeps existing behavior unchanged.
+    SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

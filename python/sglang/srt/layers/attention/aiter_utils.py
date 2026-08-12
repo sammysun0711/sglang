@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from .flydsl_pa import PagedAttention as flypa
+
 try:
     # `mha_batch_prefill_func` is re-exported at the aiter top level via
     # `aiter/__init__.py` (`from .ops.mha import *`). Note: a bare
@@ -589,7 +591,6 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
         kernel_path=str(getattr(tile_module, "__file__", "unknown")),
     )
 
-
 def forward_extend_vectorized_5d(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -634,6 +635,11 @@ def forward_extend_vectorized_5d(
     extend_no_prefix = forward_batch.extend_prefix_lens_cpu is not None and not any(
         forward_batch.extend_prefix_lens_cpu
     )
+    if get_bool_env_var("SGLANG_FLYPA_MIMO_PREFILL", "false"):
+        # FLYPA kernel is faster than aiter's CK kernel on gfx942
+        # but not tested on gfx950
+        extend_no_prefix = False
+
     if extend_no_prefix:
         if can_use_mimo_fresh_bf16_asm(
             backend,
@@ -825,7 +831,37 @@ def forward_extend_vectorized_5d(
         q_paged = q_local.contiguous().view(
             -1, layer.tp_q_head_num, layer.qk_head_dim
         )
-        if use_flydsl_prefill:
+
+        use_flypa_prefill = (
+            get_bool_env_var("SGLANG_FLYPA_MIMO_PREFILL", "false")
+            and scalar_descales
+            and metadata.paged_kv_indptr.dtype == torch.int32
+            and metadata.paged_kv_indices.dtype == torch.int32
+        )
+        if use_flypa_prefill:
+            # print(">>>>>>>>>>>>>>>>> use_flypa_prefill <<<<<<<<<<<<<<<<<")
+            o = flypa(
+                num_qo_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim_qk=layer.qk_head_dim,
+                head_dim_v=layer.v_head_dim,
+                page_size=backend.page_size,
+                is_causal=True,
+                quant_query_mode="per-tensor",
+            )(q_paged,
+              k_paged,
+              v_paged,
+              backend.qo_indptr[:bs0],
+              metadata.paged_kv_indptr[:bs0],
+              metadata.paged_kv_indices,
+              max_q,
+              max_kv,
+              True,
+              q_descale_local,
+              k_descale_local,
+              v_descale_local,
+              metadata.paged_kv_last_page_len)
+        elif use_flydsl_prefill:
             o = load_flydsl_mimo_prefill_kernel().run(
                 q_paged,
                 k_paged,

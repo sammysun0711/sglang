@@ -86,6 +86,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    is_gfx942_supported,
     is_gfx95_supported,
     is_non_idle_and_non_empty,
     make_layers,
@@ -94,6 +95,23 @@ from sglang.srt.utils import (
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+
+"""FP8 element types a checkpoint can present after loading.
+
+CUDA keeps OCP e4m3 (``float8_e4m3fn``); ROCm gfx942 rewrites the weights to
+``float8_e4m3fnuz`` in ``process_weights_after_loading_block_quant``.  The fused
+RMSNorm+quant kernels derive their clamp bound from ``torch.finfo(dtype).max``,
+so either type is fine as long as the detector does not reject it.
+"""
+_FP8_DTYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dtype is not None
+}
 
 
 def _mimo_hidden_num_tokens(hidden_states) -> int:
@@ -796,39 +814,34 @@ class MiMoV2DecoderLayer(nn.Module):
 
     def _detect_gfx95_qkv_quant_format(self) -> str:
         """Select the fused RMSNorm + group-quant contract for MiMo QKV."""
-        if (
-            not envs.SGLANG_MIMO_FUSED_RMS_QKV_QUANT.get()
-            or not is_gfx95_supported()
+        if not envs.SGLANG_MIMO_FUSED_RMS_QKV_QUANT.get() or not (
+            is_gfx95_supported() or is_gfx942_supported()
         ):
             return ""
         weight = getattr(getattr(self.self_attn, "qkv_proj", None), "weight", None)
-        if weight is not None and weight.dtype == getattr(
-            torch, "float8_e4m3fn", None
-        ):
-            return "fp8"
-        return ""
+        # gfx942 rewrites FP8 weights to e4m3fnuz at load time
+        # (Fp8LinearMethod.process_weights_after_loading_block_quant), so both
+        # FP8 element types have to be accepted here.  The fused kernel takes
+        # its clamp bound from torch.finfo(dtype).max, which is arch-correct.
+        return "fp8" if weight is not None and weight.dtype in _FP8_DTYPES else ""
 
     def _detect_gfx95_moe_quant_format(self) -> str:
         """Select fused post-attention RMSNorm + FMoE input quantization."""
         moe_backend = get_moe_runner_backend()
+        # This path uses aiter's hand-written mimo_{add_,}rmsnorm_fp8_group_quant
+        # CUDA kernel -- a different implementation from the Triton kernel the QKV
+        # detector above selects.  Both were cross-checked separately on gfx942;
+        # see _is_fused_rms_{moe,qkv}_quant_supported in layers/communicator.py.
         if (
             not envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.get()
-            or not is_gfx95_supported()
+            or not (is_gfx95_supported() or is_gfx942_supported())
             or not (moe_backend.is_aiter() or moe_backend.is_auto())
             or get_moe_expert_parallel_world_size() != 1
             or getattr(self.mlp, "_enable_a2a_moe", False)
         ):
             return ""
         weight = getattr(getattr(self.mlp, "experts", None), "w13_weight", None)
-        fp8_dtypes = {
-            dtype
-            for dtype in (
-                getattr(torch, "float8_e4m3fn", None),
-                getattr(torch, "float8_e4m3fnuz", None),
-            )
-            if dtype is not None
-        }
-        return "fp8_moe" if weight is not None and weight.dtype in fp8_dtypes else ""
+        return "fp8_moe" if weight is not None and weight.dtype in _FP8_DTYPES else ""
 
     def _prefill_moe_quant_format(self, forward_batch: ForwardBatch) -> str:
         return (

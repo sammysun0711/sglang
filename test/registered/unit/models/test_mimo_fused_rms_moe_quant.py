@@ -97,6 +97,18 @@ def test_mimo_noaux_topk_reweights_from_logsigmoid_without_underflow():
     assert torch.allclose(actual, expected)
 
 
+def test_mimo_noaux_stable_reweighting_is_opt_in():
+    topk = moe_topk.TopK(
+        top_k=2,
+        use_grouped_topk=True,
+        num_expert_group=2,
+        topk_group=1,
+        correction_bias=torch.zeros(4),
+    )
+
+    assert topk.topk_config.stable_noaux_sigmoid_weights is False
+
+
 @pytest.mark.parametrize(
     ("forward_mode", "expected"),
     [

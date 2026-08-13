@@ -213,6 +213,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    stable_noaux_sigmoid_weights: bool = False
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -377,6 +378,7 @@ class TopK(MultiPlatformOp):
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
+        stable_noaux_sigmoid_weights: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -417,6 +419,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            stable_noaux_sigmoid_weights=stable_noaux_sigmoid_weights,
         )
 
     def _apply_deepep_waterfill(
@@ -1727,7 +1730,10 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
-            if num_fused_shared_experts == 0:
+            if (
+                topk_config.stable_noaux_sigmoid_weights
+                and num_fused_shared_experts == 0
+            ):
                 topk_weights = _stable_noaux_sigmoid_topk_weights(
                     router_logits,
                     topk_ids,

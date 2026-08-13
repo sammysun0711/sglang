@@ -17,22 +17,24 @@ def _decoder_stub(weight_dtype: torch.dtype):
 
 
 @pytest.mark.parametrize(
-    ("enabled", "gfx95", "weight_dtype", "expected"),
+    ("enabled", "gfx95", "gfx942", "weight_dtype", "expected"),
     [
-        (False, True, torch.float8_e4m3fn, ""),
-        (True, False, torch.float8_e4m3fn, ""),
-        (True, True, torch.bfloat16, ""),
-        (True, True, torch.float8_e4m3fn, "fp8"),
+        (False, True, False, torch.float8_e4m3fn, ""),
+        (True, False, False, torch.float8_e4m3fn, ""),
+        (True, False, True, torch.float8_e4m3fn, "fp8"),
+        (True, True, False, torch.bfloat16, ""),
+        (True, True, False, torch.float8_e4m3fn, "fp8"),
     ],
 )
 def test_mimo_fused_rms_qkv_quant_selector(
-    monkeypatch, enabled, gfx95, weight_dtype, expected
+    monkeypatch, enabled, gfx95, gfx942, weight_dtype, expected
 ):
     monkeypatch.setattr(mimo_v2, "is_gfx95_supported", lambda: gfx95)
+    monkeypatch.setattr(mimo_v2, "is_gfx942_supported", lambda: gfx942)
     layer = _decoder_stub(weight_dtype)
 
     with mimo_v2.envs.SGLANG_MIMO_FUSED_RMS_QKV_QUANT.override(enabled):
-        assert layer._detect_gfx95_qkv_quant_format() == expected
+        assert layer._detect_fused_rms_qkv_quant_format() == expected
 
 
 def test_mimo_prepare_attn_forwards_selected_qkv_quant_format():
@@ -43,7 +45,7 @@ def test_mimo_prepare_attn_forwards_selected_qkv_quant_format():
             self.__dict__.update(values)
 
     layer = _decoder_stub(torch.float8_e4m3fn)
-    layer._gfx95_qkv_quant_format = "fp8"
+    layer._fused_rms_qkv_quant_format = "fp8"
     layer.layer_communicator = SimpleNamespace(
         prepare_attn=lambda *args: (calls.append(args) or ("hidden", "residual"))
     )

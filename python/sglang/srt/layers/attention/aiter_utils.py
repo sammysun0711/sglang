@@ -77,6 +77,7 @@ CK_MIMO_PREFILL_QUERY_HEADS = 16
 CK_MIMO_PREFILL_KV_HEADS = 1
 CK_MIMO_PREFILL_HEAD_DIM = 192
 CK_MIMO_PREFILL_PAGE_SIZE = 64
+MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS = 8
 
 MIMO_FRESH_BF16_ASM_ENV = "SGLANG_AITER_MIMO_FRESH_BF16_ASM"
 MIMO_FRESH_BF16_ASM_ENABLED = get_bool_env_var(MIMO_FRESH_BF16_ASM_ENV, "false")
@@ -325,6 +326,172 @@ def mimo_fresh_bf16_varlen_asm(
     if result[0].data_ptr() != output_v.data_ptr():
         raise RuntimeError(
             "gfx950 MiMo fresh BF16 varlen ASM ignored its output buffer"
+        )
+    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+def can_use_mimo_chunk_bf16_varlen_asm(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    window_size,
+    sinks,
+    is_swa_layer: bool,
+    sub_pool,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> bool:
+    """Return whether a cached chunk-prefill can reuse MiMo BF16 varlen ASM."""
+    extend_lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    prefix_lengths = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    valid_single_chunk = (
+        extend_lengths is not None
+        and prefix_lengths is not None
+        and seq_lens_cpu is not None
+        and len(extend_lengths) == 1
+        and len(prefix_lengths) == 1
+        and len(seq_lens_cpu) == 1
+    )
+    if not valid_single_chunk:
+        return False
+
+    extend_len = int(extend_lengths[0])
+    prefix_len = int(prefix_lengths[0])
+    seq_len = int(seq_lens_cpu[0])
+    total_kv = int(forward_batch.seq_lens_sum)
+    expected_k_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_HEAD_DIM // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+        CK_MIMO_PREFILL_PAGE_SIZE,
+        MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+    )
+    expected_v_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_PAGE_SIZE // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+        CK_MIMO_PREFILL_HEAD_DIM,
+        MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+    )
+    return (
+        MIMO_FRESH_BF16_ASM_ENABLED
+        and MIMO_FRESH_BF16_ASM_VARLEN_ENABLED
+        and fmha_v3_varlen_fwd is not None
+        and is_gfx950()
+        and not is_swa_layer
+        and sinks is None
+        and tuple(window_size) == (-1, -1)
+        and prefix_len > 0
+        and extend_len > 128
+        and seq_len == prefix_len + extend_len
+        and total_kv == seq_len
+        and q.shape[0] == extend_len
+        and k.shape[0] == extend_len
+        and v.shape[0] == extend_len
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and backend.input_dtype == torch.bfloat16
+        and backend.kv_cache_dtype != fp8_dtype
+        and sub_pool.dtype == torch.bfloat16
+        and sub_pool.store_dtype == torch.bfloat16
+        and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
+        and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and getattr(layer, "mimo_original_v_head_dim", None)
+        == MIMO_FRESH_BF16_ASM_V_HEAD_DIM
+        and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
+        and k.shape[-2:] == (layer.tp_k_head_num, layer.qk_head_dim)
+        and v.shape[-2:] == (layer.tp_v_head_num, layer.v_head_dim)
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and float(backend.logits_soft_cap) == 0.0
+        and metadata.kv_indices is not None
+        and metadata.kv_indptr is not None
+        and metadata.max_kv_len is not None
+        and metadata.kv_indices.dtype == torch.int32
+        and metadata.kv_indptr.dtype == torch.int32
+        and backend.qo_indptr.dtype == torch.int32
+        and metadata.kv_indices.device == q.device
+        and metadata.kv_indptr.device == q.device
+        and backend.qo_indptr.device == q.device
+        and metadata.kv_indices.numel() >= seq_len
+        and metadata.kv_indptr.numel() >= 2
+        and backend.qo_indptr.numel() >= 2
+        and int(metadata.max_q_len) == extend_len
+        and int(metadata.max_kv_len) == seq_len
+        and k_buf.ndim == 5
+        and v_buf.ndim == 5
+        and tuple(k_buf.shape[1:]) == expected_k_tail
+        and tuple(v_buf.shape[1:]) == expected_v_tail
+        and k_buf.shape[0] == v_buf.shape[0]
+        and k_buf.element_size() == 2
+        and v_buf.element_size() == 2
+    )
+
+
+def mimo_chunk_bf16_varlen_asm(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> torch.Tensor:
+    """Run gfx950 D192/V128 ASM for one cached MiMo chunk-prefill."""
+    extend_len = int(forward_batch.extend_seq_lens_cpu[0])
+    seq_len = int(forward_batch.seq_lens_cpu[0])
+    slot_ids = metadata.kv_indices[:seq_len]
+    k_full, v_full = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
+    q_varlen = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+    k_varlen = k_full.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+    v_varlen = v_full.view(-1, layer.tp_v_head_num, layer.v_head_dim)[
+        ..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM
+    ]
+
+    output = q.new_zeros((extend_len, layer.tp_q_head_num, layer.v_head_dim))
+    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+    result = fmha_v3_varlen_fwd(
+        q_varlen,
+        k_varlen,
+        v_varlen,
+        backend.qo_indptr[:2],
+        metadata.kv_indptr[:2],
+        extend_len,
+        seq_len,
+        extend_len,
+        0.0,
+        layer.scaling,
+        0.0,
+        False,
+        True,
+        -1,
+        -1,
+        False,
+        False,
+        0,
+        output_v,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    if result[0].data_ptr() != output_v.data_ptr():
+        raise RuntimeError(
+            "gfx950 MiMo chunk BF16 varlen ASM ignored its output buffer"
         )
     return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -604,7 +771,7 @@ def forward_extend_vectorized_5d(
 ) -> torch.Tensor:
     """``forward_extend`` specialization for the SHUFFLE 5D KV pool.
 
-    Three sub-paths route through ``mha_batch_prefill_func``:
+    Four sub-paths handle vectorized-5D extend:
 
     1. Fresh-prompt shortcut: when every request in the batch has zero
        ``extend_prefix_lens`` (first chunk of a fresh prompt, or any
@@ -617,7 +784,11 @@ def forward_extend_vectorized_5d(
        ``16Q/1KV, Dq=Dv=192, page=64`` contract pass the SHUFFLE 5D cache and
        flat ragged page table directly to the tuned CK kernel.
 
-    3. Gather-and-linearize: every unsupported case gathers per-token K/V from the
+    3. Cached BF16 MiMo chunk ASM: for the accuracy baseline's full-attention
+       BF16 KV-cache later chunks, gather the full prefix+chunk KV stream and
+       run the same gfx950 D192/V128 varlen ASM used by fresh prefill.
+
+    4. Gather-and-linearize: every unsupported case gathers per-token K/V from the
        SHUFFLE 5D pool via ``launch_gather_shuffle_5d_to_linear``
        (triton inverse of the SHUFFLE writer) into a contiguous
        ``(T, H, D)`` buffer in the cache's ``store_dtype``, then run the
@@ -625,8 +796,8 @@ def forward_extend_vectorized_5d(
        raw fp8 with the per-tensor descales — aiter's LINEAR-mode kernel
        supports fp8 K/V/Q natively, so no host-side dequant is needed.
 
-    The direct path is deliberately narrow. SWA/sink, non-FP8, other head
-    shapes, and missing page metadata retain the established linear fallback.
+    The optimized paths are deliberately narrow. SWA/sink, unsupported dtypes,
+    other head shapes, and missing metadata retain the established fallback.
 
     Returns the ``(T, H_q * D_v)`` attention output, ready to be
     returned from ``AiterAttnBackend.forward_extend``.
@@ -907,7 +1078,32 @@ def forward_extend_vectorized_5d(
             o = o.to(backend.input_dtype)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    # Path 3: gather-and-linearize. SWA layers gather from the SWA sub-pool;
+    if can_use_mimo_chunk_bf16_varlen_asm(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        window_size,
+        sinks,
+        is_swa_layer,
+        sub_pool,
+        k_buf,
+        v_buf,
+        metadata,
+    ):
+        return mimo_chunk_bf16_varlen_asm(
+            backend,
+            q,
+            layer,
+            forward_batch,
+            k_buf,
+            v_buf,
+            metadata,
+        )
+
+    # Path 4: gather-and-linearize. SWA layers gather from the SWA sub-pool;
     # full-attention layers gather from the full pool. Both metadata tensors
     # contain per-token absolute slots in request-major order.
     total_kv = int(forward_batch.seq_lens_sum)

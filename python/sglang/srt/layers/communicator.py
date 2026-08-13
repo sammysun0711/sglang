@@ -66,7 +66,10 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
+from sglang.srt.layers.quantization.fp8_utils import (
+    _use_aiter_bpreshuffle_gfx95,
+    _use_aiter_ck_blockscale_bpreshuffle_gfx942,
+)
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
@@ -83,6 +86,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
+    is_gfx942_supported,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -96,6 +100,18 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+# The MiMo fused post-attention RMSNorm + FP8 group quant kernel
+_is_fused_rms_moe_quant_supported = _is_gfx95_supported or is_gfx942_supported()
+# The QKV-side fused RMSNorm + FP8 group quant kernel
+_is_fused_rms_qkv_quant_supported = _is_gfx95_supported or is_gfx942_supported()
+# Whether the downstream a8w8 blockscale GEMM wants the activation scale in the
+# transposed (column-major) layout. aiter_w8a8_block_fp8_linear derives this as
+# `not use_triton and (bpreshuffle_gfx95 or ck_blockscale_bpreshuffle_gfx942)`;
+# on gfx942 the CK-bpreshuffle env forces use_triton=False, so the env flag alone
+# decides.
+_fused_rms_quant_transpose_scale = _use_aiter_bpreshuffle_gfx95 or (
+    is_gfx942_supported() and _use_aiter_ck_blockscale_bpreshuffle_gfx942
+)
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
@@ -111,9 +127,11 @@ if _use_aiter:
 
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
-    if _is_gfx95_supported:
+    if _is_fused_rms_qkv_quant_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
+    if _is_gfx95_supported:
+        # MXFP4 has no gfx942 story; keep it on gfx95 only.
         from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
             fused_rms_mxfp4_quant,
         )
@@ -172,7 +190,8 @@ class _FusedRMSNormFP8GroupQuantForMoe:
 
     AITER FMoE accepts an already quantized activation and its per-1x128 scale,
     but MiMo's router still needs the normalized BF16 values.  Keep both views
-    from one gfx950 fused RMSNorm/group-quant launch.  Produce AITER's
+    from one fused RMSNorm/group-quant launch (gfx950 and gfx942; the FP8
+    element type follows _aiter_fp8_dtype, so gfx942 gets e4m3fnuz).  Produce AITER's
     preshuffled column-major scale layout directly so FMoE does not need a
     separate partial-transpose launch.
     """
@@ -623,8 +642,12 @@ class LayerCommunicator:
                             None,
                             None,
                         )
-                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
-                        # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
+                    elif (
+                        _use_aiter
+                        and _is_fused_rms_qkv_quant_supported
+                        and (quant_format == "fp8")
+                    ):
+                        # aiter (ROCm gfx95/gfx942) fused RMSNorm + FP8 group quant.
                         # When DSA is active, also preserve the unquantized bf16
                         # output as a 3-tuple (fp8, scale, bf16) so the DSA
                         # indexer can skip redundant FP8 dequantization.
@@ -637,10 +660,10 @@ class LayerCommunicator:
                             inp2_weight=None,
                             inp2_epsilon=None,
                             group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
+                            dtype_quant=_aiter_fp8_dtype,
                             res1=None,
                             output_unquantized_inp1=_dsa_needs_bf16,
-                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                            transpose_scale=_fused_rms_quant_transpose_scale,
                         )
                         if _dsa_needs_bf16:
                             hidden_states = (
@@ -669,8 +692,12 @@ class LayerCommunicator:
                             None,
                             residual,
                         )
-                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
-                        # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
+                    elif (
+                        _use_aiter
+                        and _is_fused_rms_qkv_quant_supported
+                        and (quant_format == "fp8")
+                    ):
+                        # aiter (ROCm gfx95/gfx942) fused RMSNorm + FP8 group quant
                         # with residual addition. When DSA is active, pack
                         # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
                         _dsa_needs_bf16 = get_attn_tp_context().is_dsa
@@ -683,10 +710,10 @@ class LayerCommunicator:
                                 inp2_weight=None,
                                 inp2_epsilon=None,
                                 group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
+                                dtype_quant=_aiter_fp8_dtype,
                                 res1=residual,
                                 output_unquantized_inp1=_dsa_needs_bf16,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=_fused_rms_quant_transpose_scale,
                             )
                         )
                         if _dsa_needs_bf16:
@@ -757,7 +784,7 @@ class LayerCommunicator:
         if (
             quant_format == "fp8_moe"
             and _use_aiter
-            and _is_gfx95_supported
+            and _is_fused_rms_moe_quant_supported
             and self._context.attn_dp_size == 1
             and get_moe_cp_size() == 1
         ):

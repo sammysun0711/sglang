@@ -794,8 +794,8 @@ class MiMoV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
         )
-        self._gfx95_qkv_quant_format = self._detect_gfx95_qkv_quant_format()
-        self._gfx95_moe_quant_format = self._detect_gfx95_moe_quant_format()
+        self._fused_rms_qkv_quant_format = self._detect_fused_rms_qkv_quant_format()
+        self._fused_rms_moe_quant_format = self._detect_fused_rms_moe_quant_format()
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -812,7 +812,7 @@ class MiMoV2DecoderLayer(nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
-    def _detect_gfx95_qkv_quant_format(self) -> str:
+    def _detect_fused_rms_qkv_quant_format(self) -> str:
         """Select the fused RMSNorm + group-quant contract for MiMo QKV."""
         if not envs.SGLANG_MIMO_FUSED_RMS_QKV_QUANT.get() or not (
             is_gfx95_supported() or is_gfx942_supported()
@@ -825,7 +825,7 @@ class MiMoV2DecoderLayer(nn.Module):
         # its clamp bound from torch.finfo(dtype).max, which is arch-correct.
         return "fp8" if weight is not None and weight.dtype in _FP8_DTYPES else ""
 
-    def _detect_gfx95_moe_quant_format(self) -> str:
+    def _detect_fused_rms_moe_quant_format(self) -> str:
         """Select fused post-attention RMSNorm + FMoE input quantization."""
         moe_backend = get_moe_runner_backend()
         # This path uses aiter's hand-written mimo_{add_,}rmsnorm_fp8_group_quant
@@ -845,7 +845,7 @@ class MiMoV2DecoderLayer(nn.Module):
 
     def _prefill_moe_quant_format(self, forward_batch: ForwardBatch) -> str:
         return (
-            self._gfx95_moe_quant_format
+            self._fused_rms_moe_quant_format
             if forward_batch.forward_mode.is_context_parallel_extend(
                 include_draft_extend_v2=True
             )
@@ -864,7 +864,7 @@ class MiMoV2DecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            self._gfx95_qkv_quant_format,
+            self._fused_rms_qkv_quant_format,
         )
 
         if _mimo_hidden_num_tokens(hidden_states) != 0:
@@ -930,7 +930,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 hidden_states,
                 residual,
                 forward_batch,
-                self._gfx95_qkv_quant_format,
+                self._fused_rms_qkv_quant_format,
             )
         )
         state.update(

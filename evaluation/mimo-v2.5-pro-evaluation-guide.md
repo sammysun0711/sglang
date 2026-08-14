@@ -43,7 +43,7 @@ cd FlyDSL/wheels && python3 -m pip install --no-deps --force-reinstall flydsl-0.
 cd ../..
 ```
 
-## 3. Run single node prefill benchmark
+## 3. Run optimized single node prefill benchmark
 ### Launch server
 ```bash
 cd /root/workspace/sglang/evaluation
@@ -54,7 +54,7 @@ cd /root/workspace/sglang/evaluation
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-## 4. Run single node decode benchmark with fake prefill
+## 4. Run optimized single node decode benchmark with fake prefill
 ### Launch server
 ```bash
 cd /root/workspace/sglang/evaluation
@@ -71,21 +71,52 @@ cd /root/workspace/sglang/evaluation
 python3 analyze_server_output_throughput.py <path-to-server-log>
 ```
 
-## 5. Profiling & Analysis
+## 5. Run baseline single node prefill benchmark
+Baseline prefill keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache 
+
+### Launch server
+```bash
+cd /root/workspace/sglang/evaluation
+./launch_tp8_noep_aiter_mtp_accuracy_baseline.sh
+```
+### Run prefill benchmark
+```bash
+./run_benchmark_mimo_pro_prefill.sh
+```
+## 6. Run baseline single node decode benchmark with fake prefill
+Baseline fake-prefill decode keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache
+
+### Launch server
+```bash
+cd /root/workspace/sglang/evaluation
+./launch_tp8_noep_aiter_mtp_decode_fake_prefill_baseline.sh
+```
+
+### Run decode benchmark
+```bash
+./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh
+```
+
+### Run decode throughput analysis
+```python
+python3 analyze_server_output_throughput.py <path-to-server-log>
+```
+
+## 7. Profiling & Analysis
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sglang_profile.sh
 ```
 
 
-## 6. Run real-MTP ShareGPT dataset accuracy gate
+## 8. Run real-MTP ShareGPT dataset accuracy gate
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sharegpt_mtp_accuracy_test.sh
 ```
 
-## 7. Run swe-bench & accuracy benchmark test
+## 9. Run swe-bench & accuracy benchmark test
 Follow up customer's swe-bench accuracy verification guide.
 
-## 8. H200 performance evaluation
+## 10. H200 performance evaluation
 Follow up customer's shared performance data

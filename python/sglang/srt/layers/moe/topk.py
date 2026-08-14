@@ -213,6 +213,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    stable_noaux_sigmoid_weights: bool = False
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -377,6 +378,7 @@ class TopK(MultiPlatformOp):
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
+        stable_noaux_sigmoid_weights: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -417,6 +419,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            stable_noaux_sigmoid_weights=stable_noaux_sigmoid_weights,
         )
 
     def _apply_deepep_waterfill(
@@ -1636,6 +1639,29 @@ def _post_process_topk_ids(
     return topk_ids, topk_weights, recorder_topk_ids
 
 
+def _stable_noaux_sigmoid_topk_weights(
+    router_logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    renormalize: bool,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: bool = False,
+) -> torch.Tensor:
+    """Recompute noaux routed weights from selected ids without sigmoid underflow."""
+    if topk_ids.numel() == 0:
+        return torch.empty_like(topk_ids, dtype=torch.float32)
+
+    selected_logits = router_logits.float().gather(1, topk_ids.long())
+    selected_log_probs = F.logsigmoid(selected_logits)
+    if renormalize:
+        topk_weights = torch.softmax(selected_log_probs, dim=-1)
+        if apply_routed_scaling_factor_on_output:
+            topk_weights *= routed_scaling_factor
+    else:
+        topk_weights = selected_log_probs.exp()
+    return topk_weights.to(torch.float32)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -1704,6 +1730,17 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
+            if (
+                topk_config.stable_noaux_sigmoid_weights
+                and num_fused_shared_experts == 0
+            ):
+                topk_weights = _stable_noaux_sigmoid_topk_weights(
+                    router_logits,
+                    topk_ids,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
     elif torch_native and custom_routing_function is None:
         assert (
             num_token_non_padded is None

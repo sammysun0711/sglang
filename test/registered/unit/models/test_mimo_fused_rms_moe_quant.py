@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers import communicator
+from sglang.srt.layers.moe import topk as moe_topk
 from sglang.srt.layers.moe.moe_runner import aiter as aiter_runner
 from sglang.srt.layers.moe.token_dispatcher import standard
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -22,21 +23,31 @@ def _decoder_stub(weight_dtype: torch.dtype):
 
 
 @pytest.mark.parametrize(
-    ("enabled", "gfx95", "backend", "ep_size", "weight_dtype", "expected"),
+    (
+        "enabled",
+        "gfx95",
+        "gfx942",
+        "backend",
+        "ep_size",
+        "weight_dtype",
+        "expected",
+    ),
     [
-        (False, True, "aiter", 1, torch.float8_e4m3fn, ""),
-        (True, False, "aiter", 1, torch.float8_e4m3fn, ""),
-        (True, True, "triton", 1, torch.float8_e4m3fn, ""),
-        (True, True, "aiter", 2, torch.float8_e4m3fn, ""),
-        (True, True, "aiter", 1, torch.bfloat16, ""),
-        (True, True, "auto", 1, torch.float8_e4m3fn, "fp8_moe"),
-        (True, True, "aiter", 1, torch.float8_e4m3fn, "fp8_moe"),
+        (False, True, False, "aiter", 1, torch.float8_e4m3fn, ""),
+        (True, False, False, "aiter", 1, torch.float8_e4m3fn, ""),
+        (True, False, True, "aiter", 1, torch.float8_e4m3fn, "fp8_moe"),
+        (True, True, False, "triton", 1, torch.float8_e4m3fn, ""),
+        (True, True, False, "aiter", 2, torch.float8_e4m3fn, ""),
+        (True, True, False, "aiter", 1, torch.bfloat16, ""),
+        (True, True, False, "auto", 1, torch.float8_e4m3fn, "fp8_moe"),
+        (True, True, False, "aiter", 1, torch.float8_e4m3fn, "fp8_moe"),
     ],
 )
 def test_mimo_fused_rms_moe_quant_selector(
-    monkeypatch, enabled, gfx95, backend, ep_size, weight_dtype, expected
+    monkeypatch, enabled, gfx95, gfx942, backend, ep_size, weight_dtype, expected
 ):
     monkeypatch.setattr(mimo_v2, "is_gfx95_supported", lambda: gfx95)
+    monkeypatch.setattr(mimo_v2, "is_gfx942_supported", lambda: gfx942)
     monkeypatch.setattr(
         mimo_v2,
         "get_moe_runner_backend",
@@ -51,7 +62,7 @@ def test_mimo_fused_rms_moe_quant_selector(
     layer = _decoder_stub(weight_dtype)
 
     with mimo_v2.envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.override(enabled):
-        assert layer._detect_gfx95_moe_quant_format() == expected
+        assert layer._detect_fused_rms_moe_quant_format() == expected
 
 
 def test_mimo_moe_inputs_preserve_router_bf16_and_prequantized_expert_input():
@@ -67,6 +78,37 @@ def test_mimo_moe_inputs_preserve_router_bf16_and_prequantized_expert_input():
     assert expert_input == (quantized, scale)
 
 
+def test_mimo_noaux_topk_reweights_from_logsigmoid_without_underflow():
+    router_logits = torch.tensor([[-1000.0, -1001.0, -1002.0, -1003.0]])
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+
+    actual = moe_topk._stable_noaux_sigmoid_topk_weights(
+        router_logits,
+        topk_ids,
+        renormalize=True,
+    )
+    expected = torch.softmax(
+        torch.nn.functional.logsigmoid(router_logits.gather(1, topk_ids.long())),
+        dim=-1,
+    )
+
+    assert torch.isfinite(actual).all()
+    assert torch.allclose(actual.sum(dim=-1), torch.ones(1))
+    assert torch.allclose(actual, expected)
+
+
+def test_mimo_noaux_stable_reweighting_is_opt_in():
+    topk = moe_topk.TopK(
+        top_k=2,
+        use_grouped_topk=True,
+        num_expert_group=2,
+        topk_group=1,
+        correction_bias=torch.zeros(4),
+    )
+
+    assert topk.topk_config.stable_noaux_sigmoid_weights is False
+
+
 @pytest.mark.parametrize(
     ("forward_mode", "expected"),
     [
@@ -79,7 +121,7 @@ def test_mimo_moe_inputs_preserve_router_bf16_and_prequantized_expert_input():
 )
 def test_mimo_moe_quant_is_context_prefill_only(forward_mode, expected):
     layer = _decoder_stub(torch.float8_e4m3fn)
-    layer._gfx95_moe_quant_format = "fp8_moe"
+    layer._fused_rms_moe_quant_format = "fp8_moe"
     forward_batch = SimpleNamespace(forward_mode=forward_mode)
     assert layer._prefill_moe_quant_format(forward_batch) == expected
 

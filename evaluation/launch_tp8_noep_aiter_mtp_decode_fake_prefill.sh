@@ -61,7 +61,7 @@ python3 -u -m sglang.launch_server \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
   --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO}" \
   --context-length 1048576 \
-  --chunked-prefill-size 65536 \
+  --chunked-prefill-size 16384 \
   --max-prefill-tokens 1048576 \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend fake \

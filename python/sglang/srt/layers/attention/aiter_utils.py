@@ -15,6 +15,7 @@ needing to be a method on the class.
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -720,9 +721,9 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
     """Load the optional local FlyDSL page-64 tile implementation.
 
     FlyDSL is intentionally not imported at module scope: the normal AITER
-    Gluon configuration must continue to work without FlyDSL installed.  The
-    phase-1 local integration was validated with the 0.2.4 native runtime and
-    the fixed repository-root ``kernels`` source at commit ``c99d5cd``.
+    Gluon configuration must continue to work without FlyDSL installed. The
+    BF16 integration requires the 0.2.4 native runtime and the
+    ``mimo_flydsl_kernels`` 0.1.2 compile API.
     """
 
     try:
@@ -737,8 +738,8 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
         raise RuntimeError(
             "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires a compatible FlyDSL "
             "native runtime and the local FlyDSL repository-root `kernels` "
-            "package on PYTHONPATH. The MiMo phase-1 setup expects the FlyDSL "
-            "0.2.4 runtime plus source commit c99d5cd."
+            "package on PYTHONPATH. The MiMo setup expects the FlyDSL 0.2.4 "
+            "runtime plus mimo_flydsl_kernels 0.1.2 or newer."
         ) from exc
 
     version = str(getattr(flydsl, "__version__", "unknown"))
@@ -749,9 +750,24 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
             f"{getattr(flydsl, '__file__', 'unknown')}"
         )
 
+    compile_tile = getattr(tile_module, "compile_pa_decode_tile", None)
+    try:
+        supports_bf16_kv = compile_tile is not None and (
+            "bf16_kv" in inspect.signature(compile_tile).parameters
+        )
+    except (TypeError, ValueError):
+        supports_bf16_kv = False
+    if not supports_bf16_kv:
+        raise RuntimeError(
+            "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires "
+            "mimo_flydsl_kernels>=0.1.2 or a compatible FlyDSL source "
+            "whose compile_pa_decode_tile accepts `bf16_kv`; imported "
+            f"incompatible kernel from {getattr(tile_module, '__file__', 'unknown')}"
+        )
+
     return FlyDSLPADecodeKernels(
         pa_decode_tile=tile_module.pa_decode_tile,
-        compile_pa_decode_tile=tile_module.compile_pa_decode_tile,
+        compile_pa_decode_tile=compile_tile,
         compile_pa_decode_reduce=reduce_module.compile_pa_decode_sw_reduce,
         version=version,
         runtime_path=str(getattr(flydsl, "__file__", "unknown")),

@@ -803,13 +803,19 @@ def _make_flydsl_bf16_backend():
     backend.input_dtype = torch.bfloat16
     backend.kv_cache_dtype = torch.bfloat16
     backend._flydsl_pa_decode_workspace_max_bs = 0
+    backend._flydsl_pa_decode_compiled = False
     return backend
 
 
 def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
+    captured = {}
+
+    def fake_compile_pa_decode_tile(**kwargs):
+        captured["tile"] = kwargs
+
     kernels = SimpleNamespace(
         pa_decode_tile=lambda **kwargs: None,
-        compile_pa_decode_tile=lambda **kwargs: None,
+        compile_pa_decode_tile=fake_compile_pa_decode_tile,
         compile_pa_decode_reduce=lambda **kwargs: None,
         version="test",
         runtime_path="test-runtime",
@@ -831,6 +837,7 @@ def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
         "_ensure_flydsl_pa_decode_workspace",
         lambda self, max_bs: None,
     )
+    return captured
 
 
 @pytest.mark.parametrize(
@@ -841,16 +848,59 @@ def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
 def test_flydsl_bf16_decode_configuration_accepts_supported_arches(
     monkeypatch, gfx942, gfx950
 ):
-    _patch_flydsl_backend_dependencies(
+    captured = _patch_flydsl_backend_dependencies(
         monkeypatch, gfx942=gfx942, gfx950=gfx950
     )
     backend = _make_flydsl_bf16_backend()
 
     backend._configure_flydsl_pa_decode(max_bs=1)
+    backend._compile_flydsl_pa_decode()
 
     assert backend._use_flydsl_pa_decode
     assert backend._flydsl_pa_decode_num_partitions == 8
     assert backend._flydsl_pa_decode_tile is not None
+    assert captured["tile"]["bf16_kv"] is True
+
+
+def test_flydsl_fp8_decode_compile_disables_bf16_kv(monkeypatch):
+    captured = _patch_flydsl_backend_dependencies(
+        monkeypatch, gfx942=False, gfx950=True
+    )
+    backend = _make_flydsl_bf16_backend()
+    backend.kv_cache_dtype = fp8_dtype
+
+    backend._configure_flydsl_pa_decode(max_bs=1)
+    backend._compile_flydsl_pa_decode()
+
+    assert captured["tile"]["bf16_kv"] is False
+
+
+def test_flydsl_pa_decode_loader_rejects_legacy_compile_api(monkeypatch):
+    def legacy_compile_pa_decode_tile(*, head_dim):
+        pass
+
+    modules = {
+        "flydsl": SimpleNamespace(__version__="0.2.4", __file__="test-runtime"),
+        "kernels.attention.pa_decode_tile": SimpleNamespace(
+            __file__="legacy-pa-decode-tile",
+            pa_decode_tile=lambda **kwargs: None,
+            compile_pa_decode_tile=legacy_compile_pa_decode_tile,
+        ),
+        "kernels.attention.pa_decode_swa": SimpleNamespace(
+            compile_pa_decode_sw_reduce=lambda **kwargs: None
+        ),
+        "kernels.attention.pa_decode_fp8": SimpleNamespace(),
+    }
+    monkeypatch.setattr(
+        aiter_utils.importlib, "import_module", lambda name: modules[name]
+    )
+    aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
+
+    try:
+        with pytest.raises(RuntimeError, match=r"mimo_flydsl_kernels>=0\.1\.2"):
+            aiter_utils.load_flydsl_pa_decode_kernels()
+    finally:
+        aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
 
 
 def test_flydsl_bf16_decode_configuration_rejects_unsupported_arch(monkeypatch):

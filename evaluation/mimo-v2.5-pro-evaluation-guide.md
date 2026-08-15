@@ -13,7 +13,7 @@ docker run -it --name mimo-sgl-opt-gfx950 --ipc=host --network=host --privileged
 
 ### Clean up pre-installed environment
 ```bash
-pip uninstall sglang sglang-kernel sgl-kernel amd-aiter flydsl -y
+pip uninstall sglang sglang-kernel sgl-kernel amd-aiter flydsl mimo-flydsl-kernels -y
 rm -rf /sgl-workspace/sglang /sgl-workspace/aiter
 ```
 
@@ -39,7 +39,7 @@ cd ..
 FlyDSL installation should be after AITER installation, since it will update FlyDSL 0.2.4 runtime and FlyDSL FA & PA decode kernels.
 ```bash
 git clone https://github.com/sammysun0711/FlyDSL -b mimo-opt
-cd FlyDSL/wheels && python3 -m pip install --no-deps --force-reinstall flydsl-0.2.4-*.whl mimo_flydsl_kernels-*.whl
+cd FlyDSL/wheels && python3 -m pip install --no-deps --force-reinstall flydsl-0.2.4-*.whl mimo_flydsl_kernels-0.1.2-*.whl
 cd ../..
 ```
 

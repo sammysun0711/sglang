@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.attention import aiter_utils
+from sglang.srt.layers.attention import aiter_backend, aiter_utils
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 
@@ -715,3 +715,149 @@ def test_query_fp8_quantization_rejects_prequantized_input():
     q = torch.zeros((1, 16 * 192), dtype=fp8_dtype)
     with pytest.raises(ValueError, match="non-FP8"):
         aiter_utils.quantize_query_per_tensor_fp8(q)
+
+
+def test_flydsl_target_verify_accepts_bf16_vectorized_5d():
+    batch_size = 2
+    query_length = 4
+    partitions = 8
+    equivalent_group = query_length * 16
+    scalar_numel = batch_size * partitions * equivalent_group
+    captured = {}
+
+    def fake_pa_decode_tile(**kwargs):
+        captured.update(kwargs)
+        kwargs["output"].fill_(3.0)
+
+    block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    backend = SimpleNamespace(
+        _flydsl_pa_decode_tile=fake_pa_decode_tile,
+        _flydsl_pa_decode_num_partitions=partitions,
+        _flydsl_pa_decode_pmax=torch.empty(scalar_numel, dtype=torch.float32),
+        _flydsl_pa_decode_psum=torch.empty(scalar_numel, dtype=torch.float32),
+        _flydsl_pa_decode_pout=torch.empty(
+            scalar_numel * 192, dtype=torch.bfloat16
+        ),
+        _flydsl_pa_decode_context_lengths=torch.empty(
+            batch_size, dtype=torch.int32
+        ),
+        _flydsl_pa_decode_workspace_max_bs=batch_size,
+        forward_metadata=SimpleNamespace(
+            max_q_len=query_length,
+            kv_indices=block_tables,
+        ),
+        kv_cache_dtype=torch.bfloat16,
+        page_size=64,
+    )
+    layer = SimpleNamespace(
+        sliding_window_size=-1,
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=192,
+        scaling=192**-0.5,
+        logit_cap=0.0,
+    )
+    forward_batch = SimpleNamespace(
+        batch_size=batch_size,
+        seq_lens=torch.tensor([100, 120], dtype=torch.int64),
+    )
+    q = torch.zeros(
+        (batch_size * query_length, 16 * 192), dtype=torch.bfloat16
+    )
+    output = torch.empty_like(q)
+    k_cache = torch.zeros((4, 1, 24, 64, 8), dtype=torch.bfloat16)
+    v_cache = torch.zeros((4, 1, 8, 192, 8), dtype=torch.bfloat16)
+
+    aiter_utils.forward_target_verify_flydsl_5d(
+        backend,
+        q,
+        layer,
+        forward_batch,
+        k_cache,
+        v_cache,
+        output,
+        sinks=None,
+    )
+
+    assert captured["key_cache"] is k_cache
+    assert captured["value_cache"] is v_cache
+    assert captured["key_scale"] is None
+    assert captured["value_scale"] is None
+    assert captured["context_lengths"].tolist() == [104, 124]
+    assert captured["query"].shape == (batch_size * query_length, 16, 192)
+    assert captured["output"].shape == (batch_size * query_length, 16, 192)
+    assert torch.all(output == 3.0)
+
+
+def _make_flydsl_bf16_backend():
+    backend = object.__new__(aiter_backend.AiterAttnBackend)
+    backend.kv_cache_is_vectorized_5d = True
+    backend.use_mla = False
+    backend.topk = 1
+    backend.page_size = 64
+    backend.max_context_len = 1_048_576
+    backend.num_head = 16
+    backend.num_kv_head = 1
+    backend.head_dim = 192
+    backend.input_dtype = torch.bfloat16
+    backend.kv_cache_dtype = torch.bfloat16
+    backend._flydsl_pa_decode_workspace_max_bs = 0
+    return backend
+
+
+def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
+    kernels = SimpleNamespace(
+        pa_decode_tile=lambda **kwargs: None,
+        compile_pa_decode_tile=lambda **kwargs: None,
+        compile_pa_decode_reduce=lambda **kwargs: None,
+        version="test",
+        runtime_path="test-runtime",
+        kernel_path="test-kernel",
+    )
+    monkeypatch.setattr(
+        aiter_backend.envs,
+        "SGLANG_AITER_PA_DECODE_IMPL",
+        SimpleNamespace(get=lambda: "flydsl"),
+    )
+    monkeypatch.setattr(aiter_backend, "is_gfx942_supported", lambda: gfx942)
+    monkeypatch.setattr(aiter_backend, "is_gfx95_supported", lambda: gfx950)
+    monkeypatch.setattr(aiter_backend, "get_flydsl_mimo_num_partitions", lambda: 8)
+    monkeypatch.setattr(
+        aiter_backend, "load_flydsl_pa_decode_kernels", lambda: kernels
+    )
+    monkeypatch.setattr(
+        aiter_backend.AiterAttnBackend,
+        "_ensure_flydsl_pa_decode_workspace",
+        lambda self, max_bs: None,
+    )
+
+
+@pytest.mark.parametrize(
+    "gfx942,gfx950",
+    [(True, False), (False, True)],
+    ids=["gfx942", "gfx950"],
+)
+def test_flydsl_bf16_decode_configuration_accepts_supported_arches(
+    monkeypatch, gfx942, gfx950
+):
+    _patch_flydsl_backend_dependencies(
+        monkeypatch, gfx942=gfx942, gfx950=gfx950
+    )
+    backend = _make_flydsl_bf16_backend()
+
+    backend._configure_flydsl_pa_decode(max_bs=1)
+
+    assert backend._use_flydsl_pa_decode
+    assert backend._flydsl_pa_decode_num_partitions == 8
+    assert backend._flydsl_pa_decode_tile is not None
+
+
+def test_flydsl_bf16_decode_configuration_rejects_unsupported_arch(monkeypatch):
+    _patch_flydsl_backend_dependencies(
+        monkeypatch, gfx942=False, gfx950=False
+    )
+    backend = _make_flydsl_bf16_backend()
+
+    with pytest.raises(RuntimeError, match="validated only on gfx942 or gfx950"):
+        backend._configure_flydsl_pa_decode(max_bs=1)

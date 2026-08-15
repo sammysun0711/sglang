@@ -399,9 +399,10 @@ class AiterAttnBackend(AttentionBackend):
             incompatibilities.append(
                 f"model dtype must be BF16, got {self.input_dtype}"
             )
-        if self.kv_cache_dtype != fp8_dtype:
+        if self.kv_cache_dtype not in (fp8_dtype, torch.bfloat16):
             incompatibilities.append(
-                f"KV cache dtype must be FP8 E4M3, got {self.kv_cache_dtype}"
+                "KV cache dtype must be FP8 E4M3 or BF16, got "
+                f"{self.kv_cache_dtype}"
             )
         if not (is_gfx942_supported() or is_gfx95_supported()):
             incompatibilities.append(
@@ -478,6 +479,7 @@ class AiterAttnBackend(AttentionBackend):
             per_token_kv=False,
             query_length=4,
             trans_v=True,
+            bf16_kv=self.kv_cache_dtype == torch.bfloat16,
         )
         self._flydsl_compile_pa_decode_reduce(
             max_context_partition_num=self._flydsl_pa_decode_num_partitions,

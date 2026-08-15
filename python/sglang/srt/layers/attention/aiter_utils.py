@@ -15,6 +15,7 @@ needing to be a method on the class.
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -720,9 +721,9 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
     """Load the optional local FlyDSL page-64 tile implementation.
 
     FlyDSL is intentionally not imported at module scope: the normal AITER
-    Gluon configuration must continue to work without FlyDSL installed.  The
-    phase-1 local integration was validated with the 0.2.4 native runtime and
-    the fixed repository-root ``kernels`` source at commit ``c99d5cd``.
+    Gluon configuration must continue to work without FlyDSL installed. The
+    BF16 integration requires the 0.2.4 native runtime and the
+    ``mimo_flydsl_kernels`` 0.1.2 compile API.
     """
 
     try:
@@ -737,8 +738,8 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
         raise RuntimeError(
             "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires a compatible FlyDSL "
             "native runtime and the local FlyDSL repository-root `kernels` "
-            "package on PYTHONPATH. The MiMo phase-1 setup expects the FlyDSL "
-            "0.2.4 runtime plus source commit c99d5cd."
+            "package on PYTHONPATH. The MiMo setup expects the FlyDSL 0.2.4 "
+            "runtime plus mimo_flydsl_kernels 0.1.2 or newer."
         ) from exc
 
     version = str(getattr(flydsl, "__version__", "unknown"))
@@ -749,9 +750,24 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
             f"{getattr(flydsl, '__file__', 'unknown')}"
         )
 
+    compile_tile = getattr(tile_module, "compile_pa_decode_tile", None)
+    try:
+        supports_bf16_kv = compile_tile is not None and (
+            "bf16_kv" in inspect.signature(compile_tile).parameters
+        )
+    except (TypeError, ValueError):
+        supports_bf16_kv = False
+    if not supports_bf16_kv:
+        raise RuntimeError(
+            "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires "
+            "mimo_flydsl_kernels>=0.1.2 or a compatible FlyDSL source "
+            "whose compile_pa_decode_tile accepts `bf16_kv`; imported "
+            f"incompatible kernel from {getattr(tile_module, '__file__', 'unknown')}"
+        )
+
     return FlyDSLPADecodeKernels(
         pa_decode_tile=tile_module.pa_decode_tile,
-        compile_pa_decode_tile=tile_module.compile_pa_decode_tile,
+        compile_pa_decode_tile=compile_tile,
         compile_pa_decode_reduce=reduce_module.compile_pa_decode_sw_reduce,
         version=version,
         runtime_path=str(getattr(flydsl, "__file__", "unknown")),
@@ -1365,10 +1381,10 @@ def forward_target_verify_flydsl_5d(
             "FlyDSL MiMo TARGET_VERIFY does not support attention logit "
             f"soft-capping; got logit_cap={layer.logit_cap}"
         )
-    if backend.kv_cache_dtype != fp8_dtype:
+    if backend.kv_cache_dtype not in (fp8_dtype, torch.bfloat16):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires the configured FP8 E4M3 KV "
-            f"cache dtype; got {backend.kv_cache_dtype}"
+            "FlyDSL MiMo TARGET_VERIFY requires FP8 E4M3 or BF16 KV cache; "
+            f"got {backend.kv_cache_dtype}"
         )
     if q.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
         raise ValueError(
@@ -1388,17 +1404,18 @@ def forward_target_verify_flydsl_5d(
             f"{tuple(output.shape)}"
         )
 
+    kv_vector_width = 8 if backend.kv_cache_dtype == torch.bfloat16 else 16
     expected_k_tail = (
         num_kv_heads,
-        head_dim // 16,
+        head_dim // kv_vector_width,
         FLYDSL_MIMO_PAGE_SIZE,
-        16,
+        kv_vector_width,
     )
     expected_v_tail = (
         num_kv_heads,
-        FLYDSL_MIMO_PAGE_SIZE // 16,
+        FLYDSL_MIMO_PAGE_SIZE // kv_vector_width,
         v_head_dim,
-        16,
+        kv_vector_width,
     )
     if k_cache.ndim != 5 or tuple(k_cache.shape[1:]) != expected_k_tail:
         raise ValueError(
@@ -1417,15 +1434,16 @@ def forward_target_verify_flydsl_5d(
             "FlyDSL MiMo TARGET_VERIFY requires K/V caches with the same "
             f"block count; got {k_cache.shape[0]}/{v_cache.shape[0]}"
         )
+    expected_element_size = 2 if backend.kv_cache_dtype == torch.bfloat16 else 1
     if (
         k_cache.dtype != backend.kv_cache_dtype
         or v_cache.dtype != backend.kv_cache_dtype
-        or k_cache.element_size() != 1
-        or v_cache.element_size() != 1
+        or k_cache.element_size() != expected_element_size
+        or v_cache.element_size() != expected_element_size
     ):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires one-byte configured FP8 K/V "
-            f"storage; got {k_cache.dtype}/{v_cache.dtype}"
+            "FlyDSL MiMo TARGET_VERIFY cache storage does not match the "
+            f"configured KV dtype; got {k_cache.dtype}/{v_cache.dtype}"
         )
 
     block_tables = backend.forward_metadata.kv_indices
@@ -1458,34 +1476,37 @@ def forward_target_verify_flydsl_5d(
             "FlyDSL MiMo TARGET_VERIFY requires a contiguous query head axis"
         )
 
-    key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
-    value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
-    scales = []
-    for name, scale in (("key_scale", key_scale), ("value_scale", value_scale)):
-        if not isinstance(scale, torch.Tensor):
-            raise ValueError(f"FlyDSL MiMo {name} must be a persistent tensor")
-        if scale.dtype != torch.float32 or scale.numel() != 1 or scale.ndim > 1:
-            raise ValueError(
-                f"FlyDSL MiMo {name} must be a scalar/length-1 float32 "
-                f"per-tensor scale; got shape={tuple(scale.shape)}, "
-                f"dtype={scale.dtype}"
-            )
-        # SGLang's KV-cache quant method owns 0-D Parameter scales. FlyDSL's
-        # tensor JIT requires at least one stride-1 axis, so expose a zero-copy
-        # [1] view while retaining the Parameter's stable device allocation.
-        scales.append(scale.view(1) if scale.ndim == 0 else scale)
-    key_scale, value_scale = scales
+    key_scale = None
+    value_scale = None
+    if backend.kv_cache_dtype == fp8_dtype:
+        key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+        scales = []
+        for name, scale in (("key_scale", key_scale), ("value_scale", value_scale)):
+            if not isinstance(scale, torch.Tensor):
+                raise ValueError(f"FlyDSL MiMo {name} must be a persistent tensor")
+            if scale.dtype != torch.float32 or scale.numel() != 1 or scale.ndim > 1:
+                raise ValueError(
+                    f"FlyDSL MiMo {name} must be a scalar/length-1 float32 "
+                    f"per-tensor scale; got shape={tuple(scale.shape)}, "
+                    f"dtype={scale.dtype}"
+                )
+            # SGLang's KV-cache quant method owns 0-D Parameter scales. FlyDSL's
+            # tensor JIT requires at least one stride-1 axis, so expose a zero-copy
+            # [1] view while retaining the Parameter's stable device allocation.
+            scales.append(scale.view(1) if scale.ndim == 0 else scale)
+        key_scale, value_scale = scales
 
     device = q.device
-    tensors = (
+    tensors = [
         ("output", output),
         ("K cache", k_cache),
         ("V cache", v_cache),
         ("block table", block_tables),
         ("sequence lengths", forward_batch.seq_lens),
-        ("key scale", key_scale),
-        ("value scale", value_scale),
-    )
+    ]
+    if key_scale is not None:
+        tensors.extend((("key scale", key_scale), ("value scale", value_scale)))
     for name, tensor in tensors:
         if tensor.device != device:
             raise ValueError(

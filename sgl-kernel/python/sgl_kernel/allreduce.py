@@ -77,13 +77,38 @@ if torch.version.hip is not None:
 
     def qr_all_reduce(
         fa: int,
-        profile: int,
         inp: torch.Tensor,
         out: torch.Tensor,
-        cast_bf162half: bool,
+        quant_level: int,
+        cast_bf2half: bool,
     ) -> None:
         torch.ops.sgl_kernel.qr_all_reduce.default(
-            fa, profile, inp, out, cast_bf162half
+            fa, inp, out, quant_level, cast_bf2half
+        )
+
+    def qr_all_reduce_mimo_rmsnorm(
+        fa: int,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        residual_out: torch.Tensor,
+        out: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        hidden_dim: int,
+        quant_level: int,
+        cast_bf2half: bool,
+    ) -> None:
+        torch.ops.sgl_kernel.qr_all_reduce_mimo_rmsnorm.default(
+            fa,
+            inp,
+            residual_inp,
+            residual_out,
+            out,
+            weight,
+            eps,
+            hidden_dim,
+            quant_level,
+            cast_bf2half,
         )
 
     def qr_destroy(fa: int) -> None:

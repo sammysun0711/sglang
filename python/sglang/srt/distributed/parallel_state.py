@@ -680,7 +680,24 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        """Attempt fused all-reduce + RMSNorm via a ROCm communicator."""
+        qr_comm = self.qr_comm
+        if (
+            qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_quick_allreduce_mimo_rmsnorm(
+                input_, residual_inp_, weight_, weight_.numel()
+            )
+        ):
+            return qr_comm.quick_all_reduce_mimo_rmsnorm(
+                input_, residual_inp_, weight_, eps
+            )
+
+        # The generic AITER custom-AR fusion is limited to 64 MiB. Quick
+        # Reduce has its own larger size range and is checked above first.
+        if input_.numel() * input_.element_size() > 8 * 1024 * 8192:
+            return None
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None

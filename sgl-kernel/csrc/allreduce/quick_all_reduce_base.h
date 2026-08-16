@@ -8,6 +8,7 @@
 
 #define __quickreduce_device_inline__ __device__ __forceinline__
 #define __quickreduce_launch_bounds_two_shot__ __launch_bounds__(256, 4)
+#define __quickreduce_launch_bounds_mimo_rmsnorm__ __launch_bounds__(384, 4)
 #define __quickreduce_launch_bounds_one_shot__ __launch_bounds__(512, 4)
 
 namespace quickreduce {
@@ -52,6 +53,19 @@ static constexpr int kWavefront = 64;
 
 // 256 thread, 4 wavefronts.
 static dim3 constexpr kBlockTwoShot = {kWavefront, kBlockSize / kWavefront, 1};
+
+// MiMo hidden size 6144 occupies 12 KiB per fp16/bf16 row. A 384-thread
+// workgroup with 8 atoms per thread owns exactly four rows and remains evenly
+// divisible across TP2/TP4/TP8 ranks. The larger tile amortizes two-shot
+// synchronization for prefill messages while reducing per-thread registers.
+static constexpr int kMimoRMSNormHiddenDim = 6144;
+static constexpr int kMimoRMSNormBlockSize = 384;
+static constexpr int kMimoRMSNormAtoms = 8;
+static constexpr int kMimoRMSNormAtomStride = kMimoRMSNormBlockSize;
+static constexpr int kMimoRMSNormTileSize =
+    kMimoRMSNormBlockSize * kMimoRMSNormAtoms * sizeof(int32x4_t);
+static constexpr int kMimoRMSNormRowsPerTile = 4;
+static dim3 constexpr kBlockMimoRMSNorm = {kMimoRMSNormBlockSize, 1, 1};
 
 // Number of threads in a group for quantization
 // It corresponds to 32 F16 elements in quantization block

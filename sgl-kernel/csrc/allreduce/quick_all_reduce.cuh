@@ -47,6 +47,37 @@ struct CodecFP : public CodecBase {
   }
 };
 
+// FP-only codec for the MiMo RMSNorm fusion tile. The regular 32 KiB Quick
+// Reduce tile splits MiMo's 12 KiB hidden rows.
+template <typename T, int world_size>
+struct CodecFPMimoRMSNorm : public CodecBase {
+  static constexpr int kWorldSize = world_size;
+  static constexpr int kRankAtoms = kMimoRMSNormAtoms / kWorldSize;
+  static_assert(kMimoRMSNormAtoms % kWorldSize == 0, "MiMo RMSNorm atoms must divide evenly across ranks.");
+
+  static constexpr int kRankTransmittedTileSize = kMimoRMSNormBlockSize * kRankAtoms * sizeof(int32x4_t);
+  static constexpr int kTransmittedTileSize = kRankTransmittedTileSize * kWorldSize;
+  static_assert(kTransmittedTileSize == kMimoRMSNormTileSize, "MiMo RMSNorm codec tile size mismatch.");
+
+  __quickreduce_device_inline__ CodecFPMimoRMSNorm(int thread, int rank) : CodecBase(thread, rank) {}
+
+  __quickreduce_device_inline__ void send(
+      int32x4_t* __restrict__ send_buffer, const int32x4_t* __restrict__ data) {
+    for (int i = 0; i < kRankAtoms; ++i) {
+      __builtin_nontemporal_store(data[i], send_buffer + thread);
+      send_buffer += kMimoRMSNormAtomStride;
+    }
+  }
+
+  __quickreduce_device_inline__ void recv(
+      int32x4_t** __restrict__ recv_buffer, int32x4_t* __restrict__ data) {
+    for (int i = 0; i < kRankAtoms; ++i) {
+      data[i] = __builtin_nontemporal_load(*recv_buffer + thread);
+      *recv_buffer += kMimoRMSNormAtomStride;
+    }
+  }
+};
+
 // Int4 symmetric quantization codec.
 // We quantize the FP16 data to block-scaled Int4 in blocks of 4 *
 // kThreadGroupSize.
@@ -627,6 +658,220 @@ struct AllReduceTwoshot {
         buffer_store_dwordx4(tA[i], dst_buffer.descriptor, dst_offset, 0, 0);
       }
       dst_offset += kAtomStride * sizeof(int32x4_t);
+    }
+  }
+};
+
+template <typename T>
+__quickreduce_device_inline__ float qr_to_float(T value);
+
+template <>
+__quickreduce_device_inline__ float qr_to_float<half>(half value) {
+  return __half2float(value);
+}
+
+template <>
+__quickreduce_device_inline__ float qr_to_float<nv_bfloat16>(nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <typename T>
+__quickreduce_device_inline__ T qr_from_float(float value);
+
+template <>
+__quickreduce_device_inline__ half qr_from_float<half>(float value) {
+  return __float2half(value);
+}
+
+template <>
+__quickreduce_device_inline__ nv_bfloat16 qr_from_float<nv_bfloat16>(float value) {
+  return __float2bfloat16(value);
+}
+
+// FP Quick Reduce followed by residual-add RMSNorm for MiMo's hidden size 6144.
+// The 48 KiB tile owns four complete rows, avoiding cross-workgroup reduction.
+template <typename T, typename CommT, class Codec, bool cast_bf2half>
+struct AllReduceTwoshotMimoRMSNorm {
+  static_assert(sizeof(T) == 2);
+  static_assert(sizeof(CommT) == 2);
+  static constexpr int kWorldSize = Codec::kWorldSize;
+  static constexpr int kElemsPerAtom = sizeof(int32x4_t) / sizeof(T);
+  static constexpr int kAtomsPerRow = kMimoRMSNormAtoms / kMimoRMSNormRowsPerTile;
+  static constexpr int kWaveCount = kMimoRMSNormBlockSize / kWavefront;
+
+  __device__ static void run(
+      T const* __restrict__ input,
+      T const* __restrict__ residual_inp,
+      T* __restrict__ residual_out,
+      T* __restrict__ output,
+      T const* __restrict__ weight,
+      float eps,
+      uint32_t const N,
+      int const block,
+      int const rank,
+      uint8_t** __restrict__ buffer_list,
+      uint32_t const data_offset,
+      uint32_t flag_color,
+      int64_t data_size_per_phase) {
+    int const thread = threadIdx.x;
+    int const block_id = blockIdx.x;
+    uint8_t* rank_buffer = buffer_list[rank];
+    Codec codec(thread, rank);
+
+    int32x4_t tA[kMimoRMSNormAtoms];
+    BufferResource src_buffer(const_cast<T*>(input), N * sizeof(T));
+    uint32_t src_offset = block * kMimoRMSNormTileSize + thread * sizeof(int32x4_t);
+    for (int i = 0; i < kMimoRMSNormAtoms; ++i) {
+      tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
+      src_offset += kMimoRMSNormAtomStride * sizeof(int32x4_t);
+      if constexpr (cast_bf2half) {
+        const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
+        half2 half_buf[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          half_buf[j] = __float22half2_rn(__bfloat1622float2(bf_buf[j]));
+        }
+        tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
+      }
+    }
+
+    uint32_t const comm_data0_offset = data_offset + block_id * Codec::kTransmittedTileSize;
+    uint32_t const comm_data1_offset = data_size_per_phase + comm_data0_offset;
+    uint32_t const comm_flags0_offset = block_id * (kWorldSize * sizeof(uint32_t));
+    uint32_t const comm_flags1_offset = (data_offset / 2) + comm_flags0_offset;
+
+    for (int r = 0; r < kWorldSize; ++r) {
+      int32x4_t* send_buffer = reinterpret_cast<int32x4_t*>(
+          buffer_list[r] + comm_data0_offset + rank * Codec::kRankTransmittedTileSize);
+      codec.send(send_buffer, &tA[r * Codec::kRankAtoms]);
+    }
+
+    __syncthreads();
+    if (thread < kWorldSize) {
+      uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(
+          buffer_list[thread] + comm_flags0_offset + rank * sizeof(uint32_t));
+      set_sync_flag(flag_ptr, flag_color);
+    }
+
+    int32x4_t tR[Codec::kRankAtoms] = {};
+    int32x4_t* recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data0_offset);
+    uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags0_offset);
+    for (int r = 0; r < kWorldSize; ++r) {
+      if (thread == 0) {
+        wait_sync_flag(&flag_ptr[r], flag_color);
+      }
+      __syncthreads();
+      codec.recv(&recv_buffer, tA);
+      for (int i = 0; i < Codec::kRankAtoms; ++i) {
+        packed_assign_add<CommT>(&tR[i], &tA[i]);
+      }
+    }
+
+    for (int r = 0; r < kWorldSize; ++r) {
+      int32x4_t* send_buffer = reinterpret_cast<int32x4_t*>(
+          buffer_list[r] + comm_data1_offset + rank * Codec::kRankTransmittedTileSize);
+      codec.send(send_buffer, tR);
+    }
+
+    __syncthreads();
+    if (thread < kWorldSize) {
+      uint32_t* phase2_flag_ptr = reinterpret_cast<uint32_t*>(
+          buffer_list[thread] + comm_flags1_offset + rank * sizeof(uint32_t));
+      set_sync_flag(phase2_flag_ptr, flag_color);
+    }
+
+    recv_buffer = reinterpret_cast<int32x4_t*>(rank_buffer + comm_data1_offset);
+    flag_ptr = reinterpret_cast<uint32_t*>(rank_buffer + comm_flags1_offset);
+    for (int r = 0; r < kWorldSize; ++r) {
+      if (thread == 0) {
+        wait_sync_flag(&flag_ptr[r], flag_color);
+      }
+      __syncthreads();
+      codec.recv(&recv_buffer, &tA[r * Codec::kRankAtoms]);
+    }
+
+    BufferResource residual_buffer(const_cast<T*>(residual_inp), N * sizeof(T));
+    BufferResource residual_out_buffer(residual_out, N * sizeof(T));
+    BufferResource output_buffer(output, N * sizeof(T));
+    BufferResource weight_buffer(const_cast<T*>(weight), kMimoRMSNormHiddenDim * sizeof(T));
+    uint32_t const num_rows = N / kMimoRMSNormHiddenDim;
+    uint32_t const tile_offset = block * kMimoRMSNormTileSize;
+    int const lane = thread % kWavefront;
+    int const wave = thread / kWavefront;
+    __shared__ float wave_sums[kWaveCount];
+
+    for (int row_in_tile = 0; row_in_tile < kMimoRMSNormRowsPerTile; ++row_in_tile) {
+      uint32_t const global_row = block * kMimoRMSNormRowsPerTile + row_in_tile;
+      bool const row_active = global_row < num_rows;
+      int const atom_begin = row_in_tile * kAtomsPerRow;
+      float square_sum = 0.0f;
+
+      if (row_active) {
+        for (int i = atom_begin; i < atom_begin + kAtomsPerRow; ++i) {
+          uint32_t const byte_offset =
+              tile_offset + (i * kMimoRMSNormAtomStride + thread) * sizeof(int32x4_t);
+          int32x4_t residual_atom = buffer_load_dwordx4(residual_buffer.descriptor, byte_offset, 0, 0);
+          CommT* ar_values = reinterpret_cast<CommT*>(&tA[i]);
+          T* residual_values = reinterpret_cast<T*>(&residual_atom);
+#pragma unroll
+          for (int j = 0; j < kElemsPerAtom; ++j) {
+            float ar_value = qr_to_float<CommT>(ar_values[j]);
+            if constexpr (!std::is_same<T, CommT>::value) {
+              ar_value = qr_to_float<T>(qr_from_float<T>(ar_value));
+            }
+            float const x = ar_value + qr_to_float<T>(residual_values[j]);
+            square_sum += x * x;
+          }
+        }
+      }
+
+      for (int offset = kWavefront / 2; offset > 0; offset >>= 1) {
+        square_sum += __shfl_down(square_sum, offset);
+      }
+      if (lane == 0) {
+        wave_sums[wave] = square_sum;
+      }
+      __syncthreads();
+      if (thread == 0) {
+        float block_sum = 0.0f;
+        for (int i = 0; i < kWaveCount; ++i) {
+          block_sum += wave_sums[i];
+        }
+        wave_sums[0] = rsqrtf(block_sum / kMimoRMSNormHiddenDim + eps);
+      }
+      __syncthreads();
+      float const inv_rms = wave_sums[0];
+
+      if (row_active) {
+        for (int i = atom_begin; i < atom_begin + kAtomsPerRow; ++i) {
+          uint32_t const byte_offset =
+              tile_offset + (i * kMimoRMSNormAtomStride + thread) * sizeof(int32x4_t);
+          uint32_t const weight_offset =
+              ((i - atom_begin) * kMimoRMSNormAtomStride + thread) * sizeof(int32x4_t);
+          int32x4_t residual_atom = buffer_load_dwordx4(residual_buffer.descriptor, byte_offset, 0, 0);
+          int32x4_t weight_atom = buffer_load_dwordx4(weight_buffer.descriptor, weight_offset, 0, 0);
+          CommT* ar_values = reinterpret_cast<CommT*>(&tA[i]);
+          T* residual_values = reinterpret_cast<T*>(&residual_atom);
+          T* weight_values = reinterpret_cast<T*>(&weight_atom);
+          int32x4_t residual_result;
+          int32x4_t output_result;
+          T* residual_result_values = reinterpret_cast<T*>(&residual_result);
+          T* output_result_values = reinterpret_cast<T*>(&output_result);
+#pragma unroll
+          for (int j = 0; j < kElemsPerAtom; ++j) {
+            float ar_value = qr_to_float<CommT>(ar_values[j]);
+            if constexpr (!std::is_same<T, CommT>::value) {
+              ar_value = qr_to_float<T>(qr_from_float<T>(ar_value));
+            }
+            float const x = ar_value + qr_to_float<T>(residual_values[j]);
+            residual_result_values[j] = qr_from_float<T>(x);
+            output_result_values[j] = qr_from_float<T>(x * inv_rms * qr_to_float<T>(weight_values[j]));
+          }
+          buffer_store_dwordx4(residual_result, residual_out_buffer.descriptor, byte_offset, 0, 0);
+          buffer_store_dwordx4(output_result, output_buffer.descriptor, byte_offset, 0, 0);
+        }
+      }
+      __syncthreads();
     }
   }
 };

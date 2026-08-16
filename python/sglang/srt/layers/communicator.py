@@ -615,7 +615,10 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_aiter_all_reduce_fusion(hidden_states)
+                    (
+                        _use_aiter
+                        and get_global_server_args().enable_aiter_allreduce_fusion
+                    )
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (

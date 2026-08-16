@@ -118,6 +118,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "cast_bf2half) -> ()");
   m.impl("qr_all_reduce", torch::kCUDA, &qr_all_reduce);
 
+  m.def(
+      "qr_all_reduce_mimo_rmsnorm(int fa, Tensor inp, Tensor residual_inp, "
+      "Tensor! residual_out, Tensor! out, Tensor weight, float eps, "
+      "int hidden_dim, int quant_level, bool cast_bf2half) -> ()");
+  m.impl("qr_all_reduce_mimo_rmsnorm", torch::kCUDA, &qr_all_reduce_mimo_rmsnorm);
+
   m.def("init_custom_qr", &init_custom_qr);
   m.def("qr_destroy", &qr_destroy);
 

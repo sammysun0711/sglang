@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     FLYDSL_MIMO_HEAD_DIM,
     FLYDSL_MIMO_KV_HEADS,
     FLYDSL_MIMO_VALUE_HEAD_DIM,
+    can_build_mimo_paged_kv_metadata,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
     forward_target_verify_flydsl_5d,
@@ -3041,14 +3042,14 @@ class AiterIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
 
-            if (
-                self.attn_backend.kv_cache_is_vectorized_5d
-                and self.attn_backend.page_size == 64
-                and self.data_type == fp8_dtype
-                and self.q_data_type == torch.bfloat16
-                and self.num_qo_heads == 16
-                and self.num_kv_heads == 1
-                and self.head_dim == 192
+            if can_build_mimo_paged_kv_metadata(
+                self.attn_backend.kv_cache_is_vectorized_5d,
+                self.attn_backend.page_size,
+                self.data_type,
+                self.q_data_type,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
             ):
                 page_size = self.attn_backend.page_size
                 page_lens = torch.div(

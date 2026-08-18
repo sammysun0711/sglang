@@ -826,7 +826,7 @@ def PagedAttention(
         V = fxh.view_as_torch_tensor(V, (num_physical_pages, num_kv_heads, num_BN_per_page, BN//k_vector_size, head_dim_v, k_vector_size))
         V = fx.select(V, (0, 2, 1, 3, 4, 5))
 
-        if fx.const_expr(quant_query_mode == "per_tensor"):
+        if fx.const_expr(quant_query_mode == "per-tensor"):
             q_descale = fx.make_view(fx.get_iter(q_descale), fx.make_layout((num_query_tokens, num_qo_heads, 1), (0, 0, 0)))
         else:
             q_descale = fxh.view_as_torch_tensor(q_descale, (num_query_tokens, num_qo_heads, 1))

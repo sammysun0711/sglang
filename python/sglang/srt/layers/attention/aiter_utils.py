@@ -74,6 +74,7 @@ FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE = 64
 FLYDSL_MIMO_PREFILL_ENV = "SGLANG_FLYDSL_MIMO_PREFILL"
 FLYDSL_MIMO_PREFILL_MIN_Q = 4096
 FLYDSL_MIMO_PREFILL_MIN_KV = 8192
+FLYPA_MIMO_PREFILL_ENV = "SGLANG_FLYPA_MIMO_PREFILL"
 
 CK_MIMO_PREFILL_QUERY_HEADS = 16
 CK_MIMO_PREFILL_KV_HEADS = 1
@@ -102,6 +103,27 @@ def is_gfx950() -> bool:
         return False
     arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
     return arch == "gfx950"
+
+
+@lru_cache(maxsize=1)
+def is_gfx942() -> bool:
+    if not torch.version.hip or not torch.cuda.is_available():
+        return False
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    return arch == "gfx942"
+
+
+def is_mimo_flypa_arch() -> bool:
+    """FlyPA prefill is the gfx942 path; gfx950 is also accepted."""
+    return is_gfx942() or is_gfx950()
+
+
+def _is_scalar_f32_scale(scale) -> bool:
+    return (
+        isinstance(scale, torch.Tensor)
+        and scale.dtype == torch.float32
+        and scale.numel() == 1
+    )
 
 
 def can_use_mimo_fresh_bf16_asm(
@@ -760,6 +782,338 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
         kernel_path=str(getattr(tile_module, "__file__", "unknown")),
     )
 
+
+def can_build_mimo_paged_kv_metadata(
+    kv_cache_is_vectorized_5d: bool,
+    page_size: int,
+    kv_cache_dtype,
+    q_dtype,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> bool:
+    """Whether to scatter ragged slot ids into page-64 tables.
+
+    FlyPA (gfx942/gfx950, BF16 or FP8 SHUFFLE-5D) and CK FP8 paged prefill
+    both consume ``paged_kv_indptr`` / ``paged_kv_indices`` /
+    ``paged_kv_last_page_len``. Without these tables ``can_use_mimo_flypa_prefill``
+    always returns False.
+    """
+    return (
+        kv_cache_is_vectorized_5d
+        and page_size == CK_MIMO_PREFILL_PAGE_SIZE
+        and kv_cache_dtype in (fp8_dtype, torch.bfloat16)
+        and q_dtype == torch.bfloat16
+        and num_qo_heads == CK_MIMO_PREFILL_QUERY_HEADS
+        and num_kv_heads == CK_MIMO_PREFILL_KV_HEADS
+        and head_dim == CK_MIMO_PREFILL_HEAD_DIM
+    )
+
+
+def can_use_mimo_flypa_prefill(
+    backend: AiterAttnBackend,
+    layer: RadixAttention,
+    window_size,
+    sinks,
+    is_swa_layer: bool,
+    sub_pool,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> bool:
+    """Return whether FlyPA can consume this cached MiMo 5D extend.
+
+    Unlike CK paged prefill, FlyPA is not FP8-only. gfx950 FP8 prefers the
+    FlyDSL paged kernel when that path qualifies; otherwise FlyPA covers
+    gfx942/gfx950 BF16 or FP8 SHUFFLE-5D full-attention extends with
+    page-64 metadata.
+    """
+    if not get_bool_env_var(FLYPA_MIMO_PREFILL_ENV, "false"):
+        return False
+    if not is_mimo_flypa_arch():
+        return False
+    if (
+        is_swa_layer
+        or sinks is not None
+        or tuple(window_size) != (-1, -1)
+        or backend.input_dtype != torch.bfloat16
+        or backend.page_size != CK_MIMO_PREFILL_PAGE_SIZE
+        or float(backend.logits_soft_cap) != 0.0
+    ):
+        return False
+    if sub_pool.dtype not in (fp8_dtype, torch.bfloat16):
+        return False
+    if (
+        layer.tp_q_head_num != CK_MIMO_PREFILL_QUERY_HEADS
+        or layer.tp_k_head_num != CK_MIMO_PREFILL_KV_HEADS
+        or layer.tp_v_head_num != CK_MIMO_PREFILL_KV_HEADS
+        or layer.qk_head_dim != CK_MIMO_PREFILL_HEAD_DIM
+        or layer.head_dim != CK_MIMO_PREFILL_HEAD_DIM
+        or layer.v_head_dim != CK_MIMO_PREFILL_VALUE_HEAD_DIM
+    ):
+        return False
+    if k_buf.ndim != 5 or v_buf.ndim != 5 or k_buf.shape[0] != v_buf.shape[0]:
+        return False
+    pack = 16 // k_buf.element_size()
+    expected_k_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_HEAD_DIM // pack,
+        CK_MIMO_PREFILL_PAGE_SIZE,
+        pack,
+    )
+    expected_v_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_PAGE_SIZE // pack,
+        CK_MIMO_PREFILL_VALUE_HEAD_DIM,
+        pack,
+    )
+    if tuple(k_buf.shape[1:]) != expected_k_tail:
+        return False
+    if tuple(v_buf.shape[1:]) != expected_v_tail:
+        return False
+    if any(
+        getattr(metadata, name, None) is None
+        for name in (
+            "paged_kv_indptr",
+            "paged_kv_indices",
+            "paged_kv_last_page_len",
+        )
+    ):
+        return False
+    if (
+        metadata.paged_kv_indptr.dtype != torch.int32
+        or metadata.paged_kv_indices.dtype != torch.int32
+    ):
+        return False
+    if sub_pool.dtype == fp8_dtype:
+        k_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        v_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+        if not _is_scalar_f32_scale(k_scale) or not _is_scalar_f32_scale(v_scale):
+            return False
+    return True
+
+
+def run_mimo_flypa_prefill(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    bs0: int,
+    sub_pool,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> torch.Tensor:
+    k_paged = (
+        k_buf.view(sub_pool.dtype)
+        if sub_pool.store_dtype != sub_pool.dtype
+        else k_buf
+    )
+    v_paged = (
+        v_buf.view(sub_pool.dtype)
+        if sub_pool.store_dtype != sub_pool.dtype
+        else v_buf
+    )
+    if sub_pool.dtype == fp8_dtype:
+        q_local, q_descale_local = quantize_query_per_tensor_fp8(q)
+        k_descale_local = (
+            layer.k_scale if layer.k_scale is not None else backend.k_scale
+        )
+        v_descale_local = (
+            layer.v_scale if layer.v_scale is not None else backend.v_scale
+        )
+        if not _is_scalar_f32_scale(q_descale_local):
+            raise RuntimeError("FlyPA FP8 prefill requires a scalar Q descale")
+    else:
+        q_local = q
+        unit = torch.ones((), dtype=torch.float32, device=q.device)
+        q_descale_local = unit
+        k_descale_local = unit
+        v_descale_local = unit
+    q_paged = q_local.contiguous().view(
+        -1, layer.tp_q_head_num, layer.qk_head_dim
+    )
+    o = flypa(
+        num_qo_heads=layer.tp_q_head_num,
+        num_kv_heads=layer.tp_k_head_num,
+        head_dim_qk=layer.qk_head_dim,
+        head_dim_v=layer.v_head_dim,
+        page_size=backend.page_size,
+        is_causal=True,
+        quant_query_mode="per-tensor",
+    )(
+        q_paged,
+        k_paged,
+        v_paged,
+        backend.qo_indptr[:bs0],
+        None,
+        metadata.paged_kv_indptr[:bs0],
+        metadata.paged_kv_indices,
+        int(metadata.max_q_len),
+        int(metadata.max_kv_len),
+        True,
+        q_descale_local,
+        k_descale_local,
+        v_descale_local,
+        metadata.paged_kv_last_page_len,
+    )
+    if o.dtype != backend.input_dtype:
+        o = o.to(backend.input_dtype)
+    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+def can_use_mimo_flydsl_fp8_prefill(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    window_size,
+    sinks,
+    is_swa_layer: bool,
+    sub_pool,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> bool:
+    """Return whether gfx950 FlyDSL paged FP8 can consume this cached extend.
+
+    Size-gated (``max_q >= 4096``, ``max_kv >= 8192``) and FP8-only. Tried
+    before FlyPA so both env flags can stay on without FlyPA stealing the
+    gfx950 dual-wave kernel.
+    """
+    if not get_bool_env_var(FLYDSL_MIMO_PREFILL_ENV, "false"):
+        return False
+    if not is_gfx950() or is_swa_layer or sinks is not None:
+        return False
+    if tuple(window_size) != (-1, -1):
+        return False
+    if (
+        backend.input_dtype != torch.bfloat16
+        or backend.kv_cache_dtype != fp8_dtype
+        or sub_pool.dtype != fp8_dtype
+        or backend.page_size != CK_MIMO_PREFILL_PAGE_SIZE
+        or float(backend.logits_soft_cap) != 0.0
+    ):
+        return False
+    if (
+        layer.tp_q_head_num != CK_MIMO_PREFILL_QUERY_HEADS
+        or layer.tp_k_head_num != CK_MIMO_PREFILL_KV_HEADS
+        or layer.tp_v_head_num != CK_MIMO_PREFILL_KV_HEADS
+        or layer.qk_head_dim != CK_MIMO_PREFILL_HEAD_DIM
+        or layer.head_dim != CK_MIMO_PREFILL_HEAD_DIM
+        or layer.v_head_dim != FLYDSL_MIMO_VALUE_HEAD_DIM
+        or getattr(layer, "mimo_original_v_head_dim", None) != 128
+    ):
+        return False
+    max_q = getattr(metadata, "max_q_len", None)
+    max_kv = getattr(metadata, "max_kv_len", None)
+    if (
+        max_q is None
+        or max_kv is None
+        or int(max_q) < FLYDSL_MIMO_PREFILL_MIN_Q
+        or int(max_kv) < FLYDSL_MIMO_PREFILL_MIN_KV
+    ):
+        return False
+    expected_k_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_HEAD_DIM // 16,
+        CK_MIMO_PREFILL_PAGE_SIZE,
+        16,
+    )
+    expected_v_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_PAGE_SIZE // 16,
+        CK_MIMO_PREFILL_VALUE_HEAD_DIM,
+        16,
+    )
+    if (
+        k_buf.ndim != 5
+        or v_buf.ndim != 5
+        or k_buf.shape[0] != v_buf.shape[0]
+        or tuple(k_buf.shape[1:]) != expected_k_tail
+        or tuple(v_buf.shape[1:]) != expected_v_tail
+        or k_buf.element_size() != 1
+        or v_buf.element_size() != 1
+    ):
+        return False
+    if any(
+        getattr(metadata, name, None) is None
+        for name in (
+            "kv_indptr",
+            "paged_kv_indptr",
+            "paged_kv_indices",
+            "paged_kv_last_page_len",
+        )
+    ):
+        return False
+    if (
+        metadata.kv_indptr.dtype != torch.int32
+        or metadata.paged_kv_indptr.dtype != torch.int32
+        or metadata.paged_kv_indices.dtype != torch.int32
+    ):
+        return False
+    k_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+    v_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+    return (
+        _is_scalar_f32_scale(k_scale)
+        and _is_scalar_f32_scale(v_scale)
+        and k_scale.device == q.device
+        and v_scale.device == q.device
+    )
+
+
+def run_mimo_flydsl_fp8_prefill(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    bs0: int,
+    sub_pool,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> torch.Tensor:
+    k_paged = (
+        k_buf.view(sub_pool.dtype)
+        if sub_pool.store_dtype != sub_pool.dtype
+        else k_buf
+    )
+    v_paged = (
+        v_buf.view(sub_pool.dtype)
+        if sub_pool.store_dtype != sub_pool.dtype
+        else v_buf
+    )
+    q_local, q_descale_local = quantize_query_per_tensor_fp8(q)
+    k_descale_local = (
+        layer.k_scale if layer.k_scale is not None else backend.k_scale
+    )
+    v_descale_local = (
+        layer.v_scale if layer.v_scale is not None else backend.v_scale
+    )
+    q_paged = q_local.contiguous().view(
+        -1, layer.tp_q_head_num, layer.qk_head_dim
+    )
+    o = load_flydsl_mimo_prefill_kernel().run(
+        q_paged,
+        k_paged,
+        v_paged,
+        backend.qo_indptr[:bs0],
+        metadata.kv_indptr[:bs0],
+        metadata.paged_kv_indptr[:bs0],
+        metadata.paged_kv_indices,
+        max_seqlen_q=int(metadata.max_q_len),
+        max_seqlen_kv=int(metadata.max_kv_len),
+        q_descale=q_descale_local,
+        k_descale=k_descale_local,
+        v_descale=v_descale_local,
+        stream=(
+            torch.cuda.current_stream(q.device)
+            if q.device.type == "cuda"
+            else None
+        ),
+    )
+    if o.dtype != backend.input_dtype:
+        o = o.to(backend.input_dtype)
+    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
 def forward_extend_vectorized_5d(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -782,13 +1136,13 @@ def forward_extend_vectorized_5d(
        ``(k, v)`` directly. No descales needed since no data is read
        from the (possibly fp8) cache.
 
-    2. Direct paged FP8: cached full-attention MiMo chunks with the proven
-       ``16Q/1KV, Dq=192, Dv=128, page=64`` contract pass the SHUFFLE 5D cache and
-       flat ragged page table directly to the tuned CK kernel.
+    2. gfx950 cached BF16 varlen ASM: gather prefix+chunk and reuse the same
+       D192/V128 ASM as fresh prefill. This stays ahead of FlyPA on gfx950.
 
-    3. Cached BF16 MiMo chunk ASM: for the accuracy baseline's full-attention
-       BF16 KV-cache later chunks, gather the full prefix+chunk KV stream and
-       run the same gfx950 D192/V128 varlen ASM used by fresh prefill.
+    3. Direct paged FlyDSL / FlyPA / CK: gfx950 FP8 SHUFFLE-5D prefers the
+       size-gated FlyDSL paged kernel over FlyPA. FlyPA is the gfx942 (and
+       gfx950 fallback) paged kernel for BF16 or FP8. Remaining FP8 pages
+       go to CK.
 
     4. Gather-and-linearize: every unsupported case gathers per-token K/V from the
        SHUFFLE 5D pool via ``launch_gather_shuffle_5d_to_linear``
@@ -808,9 +1162,15 @@ def forward_extend_vectorized_5d(
     extend_no_prefix = forward_batch.extend_prefix_lens_cpu is not None and not any(
         forward_batch.extend_prefix_lens_cpu
     )
-    if get_bool_env_var("SGLANG_FLYPA_MIMO_PREFILL", "false"):
-        # FLYPA kernel is faster than aiter's CK kernel on gfx942
-        # but not tested on gfx950
+    if (
+        get_bool_env_var(FLYPA_MIMO_PREFILL_ENV, "false")
+        and is_gfx942()
+        and not is_gfx950()
+        and (layer.sliding_window_size is None or int(layer.sliding_window_size) < 0)
+    ):
+        # gfx942 has no D192/V128 ASM. Force the paged path so FlyPA covers
+        # both the first chunk and later cached chunks. gfx950 keeps the
+        # fresh ASM/CK shortcut (and SWA never uses FlyPA).
         extend_no_prefix = False
 
     if extend_no_prefix:
@@ -931,6 +1291,79 @@ def forward_extend_vectorized_5d(
         CK_MIMO_PREFILL_VALUE_HEAD_DIM,
         16,
     )
+    # gfx950 cached BF16 full-attn prefers varlen ASM over FlyPA.
+    # gfx950 FP8 prefers FlyDSL paged over FlyPA when size gates pass.
+    # gfx942 never qualifies for either (is_gfx950() is false).
+    if can_use_mimo_chunk_bf16_varlen_asm(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        window_size,
+        sinks,
+        is_swa_layer,
+        sub_pool,
+        k_buf,
+        v_buf,
+        metadata,
+    ):
+        return mimo_chunk_bf16_varlen_asm(
+            backend,
+            q,
+            layer,
+            forward_batch,
+            k_buf,
+            v_buf,
+            metadata,
+        )
+
+    if can_use_mimo_flydsl_fp8_prefill(
+        backend,
+        q,
+        layer,
+        window_size,
+        sinks,
+        is_swa_layer,
+        sub_pool,
+        k_buf,
+        v_buf,
+        metadata,
+    ):
+        return run_mimo_flydsl_fp8_prefill(
+            backend,
+            q,
+            layer,
+            bs0,
+            sub_pool,
+            k_buf,
+            v_buf,
+            metadata,
+        )
+
+    if can_use_mimo_flypa_prefill(
+        backend,
+        layer,
+        window_size,
+        sinks,
+        is_swa_layer,
+        sub_pool,
+        k_buf,
+        v_buf,
+        metadata,
+    ):
+        return run_mimo_flypa_prefill(
+            backend,
+            q,
+            layer,
+            bs0,
+            sub_pool,
+            k_buf,
+            v_buf,
+            metadata,
+        )
+
     use_direct_paged = (
         mha_batch_prefill_func is not None
         and not is_swa_layer
@@ -980,130 +1413,33 @@ def forward_extend_vectorized_5d(
         )
         max_kv = int(metadata.max_kv_len)
         max_q = int(metadata.max_q_len)
-        scalar_descales = all(
-            isinstance(scale, torch.Tensor)
-            and scale.dtype == torch.float32
-            and scale.numel() == 1
-            and scale.device == q.device
-            for scale in (q_descale_local, k_descale_local, v_descale_local)
-        )
-        use_flydsl_prefill = (
-            get_bool_env_var(FLYDSL_MIMO_PREFILL_ENV, "false")
-            and is_gfx950()
-            and layer.v_head_dim == FLYDSL_MIMO_VALUE_HEAD_DIM
-            and getattr(layer, "mimo_original_v_head_dim", None) == 128
-            and max_q >= FLYDSL_MIMO_PREFILL_MIN_Q
-            and max_kv >= FLYDSL_MIMO_PREFILL_MIN_KV
-            and scalar_descales
-            and metadata.kv_indptr is not None
-            and metadata.kv_indptr.dtype == torch.int32
-            and metadata.paged_kv_indptr.dtype == torch.int32
-            and metadata.paged_kv_indices.dtype == torch.int32
-        )
         q_paged = q_local.contiguous().view(
             -1, layer.tp_q_head_num, layer.qk_head_dim
         )
-
-        use_flypa_prefill = (
-            get_bool_env_var("SGLANG_FLYPA_MIMO_PREFILL", "false")
-            and scalar_descales
-            and metadata.paged_kv_indptr.dtype == torch.int32
-            and metadata.paged_kv_indices.dtype == torch.int32
+        o = mha_batch_prefill_func(
+            q_paged,
+            k_paged,
+            v_paged,
+            backend.qo_indptr[:bs0],
+            metadata.paged_kv_indptr[:bs0],
+            metadata.paged_kv_indices,
+            max_q,
+            max_kv,
+            causal=True,
+            logits_soft_cap=0.0,
+            alibi_slopes=None,
+            return_lse=False,
+            return_attn_probs=False,
+            window_size=(-1, -1),
+            sink_ptr=None,
+            q_descale=q_descale_local,
+            k_descale=k_descale_local,
+            v_descale=v_descale_local,
+            kv_last_page_lens=metadata.paged_kv_last_page_len,
         )
-        if use_flypa_prefill:
-            # print(">>>>>>>>>>>>>>>>> use_flypa_prefill <<<<<<<<<<<<<<<<<")
-            o = flypa(
-                num_qo_heads=layer.tp_q_head_num,
-                num_kv_heads=layer.tp_k_head_num,
-                head_dim_qk=layer.qk_head_dim,
-                head_dim_v=layer.v_head_dim,
-                page_size=backend.page_size,
-                is_causal=True,
-                quant_query_mode="per-tensor",
-            )(q_paged,
-              k_paged,
-              v_paged,
-              backend.qo_indptr[:bs0],
-              None,
-              metadata.paged_kv_indptr[:bs0],
-              metadata.paged_kv_indices,
-              max_q,
-              max_kv,
-              True,
-              q_descale_local,
-              k_descale_local,
-              v_descale_local,
-              metadata.paged_kv_last_page_len)
-        elif use_flydsl_prefill:
-            o = load_flydsl_mimo_prefill_kernel().run(
-                q_paged,
-                k_paged,
-                v_paged,
-                backend.qo_indptr[:bs0],
-                metadata.kv_indptr[:bs0],
-                metadata.paged_kv_indptr[:bs0],
-                metadata.paged_kv_indices,
-                max_seqlen_q=max_q,
-                max_seqlen_kv=max_kv,
-                q_descale=q_descale_local,
-                k_descale=k_descale_local,
-                v_descale=v_descale_local,
-                stream=(
-                    torch.cuda.current_stream(q.device)
-                    if q.device.type == "cuda"
-                    else None
-                ),
-            )
-        else:
-            o = mha_batch_prefill_func(
-                q_paged,
-                k_paged,
-                v_paged,
-                backend.qo_indptr[:bs0],
-                metadata.paged_kv_indptr[:bs0],
-                metadata.paged_kv_indices,
-                max_q,
-                max_kv,
-                causal=True,
-                logits_soft_cap=0.0,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                window_size=(-1, -1),
-                sink_ptr=None,
-                q_descale=q_descale_local,
-                k_descale=k_descale_local,
-                v_descale=v_descale_local,
-                kv_last_page_lens=metadata.paged_kv_last_page_len,
-            )
         if o.dtype != backend.input_dtype:
             o = o.to(backend.input_dtype)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-    if can_use_mimo_chunk_bf16_varlen_asm(
-        backend,
-        q,
-        k,
-        v,
-        layer,
-        forward_batch,
-        window_size,
-        sinks,
-        is_swa_layer,
-        sub_pool,
-        k_buf,
-        v_buf,
-        metadata,
-    ):
-        return mimo_chunk_bf16_varlen_asm(
-            backend,
-            q,
-            layer,
-            forward_batch,
-            k_buf,
-            v_buf,
-            metadata,
-        )
 
     # Path 4: gather-and-linearize. SWA layers gather from the SWA sub-pool;
     # full-attention layers gather from the full pool. Both metadata tensors

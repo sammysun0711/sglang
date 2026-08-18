@@ -638,6 +638,7 @@ def _run_vectorized_prefill_scale_case(
     direct_paged: bool,
     flydsl_prefill: bool = False,
     flydsl_model_marker: bool = True,
+    flypa_env: bool = False,
     swa: bool = False,
 ):
     captured = {}
@@ -662,6 +663,27 @@ def _run_vectorized_prefill_scale_case(
             (q.shape[0], q.shape[1], 128), dtype=torch.bfloat16, device=q.device
         )
 
+    def fake_flypa(**compile_kwargs):
+        def run(q, k, v, *args):
+            captured.update(
+                q=q,
+                k=k,
+                v=v,
+                args=args,
+                compile=compile_kwargs,
+                selected="flypa",
+            )
+            return torch.zeros(
+                (
+                    q.shape[0],
+                    compile_kwargs["num_qo_heads"],
+                    compile_kwargs["head_dim_v"],
+                ),
+                dtype=torch.bfloat16,
+            )
+
+        return run
+
     def fake_gather(k_buf, v_buf, slot_ids):
         captured["gather_slot_ids"] = slot_ids
         return (
@@ -669,6 +691,12 @@ def _run_vectorized_prefill_scale_case(
             torch.zeros((1, 1, 128), dtype=torch.uint8),
         )
 
+    monkeypatch.setenv(
+        aiter_utils.FLYPA_MIMO_PREFILL_ENV, "1" if flypa_env else "0"
+    )
+    monkeypatch.setenv(
+        aiter_utils.FLYDSL_MIMO_PREFILL_ENV, "1" if flydsl_prefill else "0"
+    )
     monkeypatch.setattr(
         aiter_utils, "quantize_query_per_tensor_fp8", fake_quantize
     )
@@ -676,9 +704,11 @@ def _run_vectorized_prefill_scale_case(
     monkeypatch.setattr(
         aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather
     )
-    if flydsl_prefill:
-        monkeypatch.setenv(aiter_utils.FLYDSL_MIMO_PREFILL_ENV, "1")
+    monkeypatch.setattr(aiter_utils, "flypa", fake_flypa)
+    if flydsl_prefill or flypa_env:
         monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+        monkeypatch.setattr(aiter_utils, "is_gfx942", lambda: False)
+    if flydsl_prefill:
         monkeypatch.setattr(
             aiter_utils,
             "load_flydsl_mimo_prefill_kernel",
@@ -801,6 +831,18 @@ def test_qualified_long_mimo_prefill_selects_flydsl(monkeypatch):
     assert captured["kwargs"]["max_seqlen_kv"] == 8192
 
 
+def test_gfx950_fp8_flydsl_is_preferred_over_flypa(monkeypatch):
+    captured = _run_vectorized_prefill_scale_case(
+        monkeypatch,
+        direct_paged=True,
+        flydsl_prefill=True,
+        flypa_env=True,
+    )
+    assert captured["selected"] == "flydsl"
+    assert captured["kwargs"]["max_seqlen_q"] == 4096
+    assert captured["kwargs"]["max_seqlen_kv"] == 8192
+
+
 def test_flydsl_env_falls_back_to_ck_without_v128_mimo_marker(monkeypatch):
     captured = _run_vectorized_prefill_scale_case(
         monkeypatch,
@@ -809,6 +851,358 @@ def test_flydsl_env_falls_back_to_ck_without_v128_mimo_marker(monkeypatch):
         flydsl_model_marker=False,
     )
     assert captured["selected"] == "ck"
+
+
+def _run_flypa_prefill_case(
+    monkeypatch,
+    *,
+    gfx942: bool,
+    gfx950: bool,
+    flypa_env: bool,
+    kv_dtype,
+    with_paged_metadata: bool = True,
+    prefix_lens=None,
+    flydsl_env: bool = False,
+):
+    captured = {}
+
+    def fake_flypa(**compile_kwargs):
+        def run(q, k, v, *args):
+            captured.update(
+                q=q,
+                k=k,
+                v=v,
+                args=args,
+                compile=compile_kwargs,
+                selected="flypa",
+            )
+            return torch.zeros(
+                (q.shape[0], compile_kwargs["num_qo_heads"], compile_kwargs["head_dim_v"]),
+                dtype=torch.bfloat16,
+            )
+
+        return run
+
+    def fake_batch_prefill(q, k, v, *args, **kwargs):
+        captured.update(q=q, k=k, v=v, kwargs=kwargs, selected="ck")
+        return torch.zeros(
+            (q.shape[0], q.shape[1], 128), dtype=torch.bfloat16, device=q.device
+        )
+
+    def fake_gather(k_buf, v_buf, slot_ids):
+        captured["gather_slot_ids"] = slot_ids
+        return (
+            torch.zeros((slot_ids.numel(), 1, 192), dtype=kv_dtype),
+            torch.zeros((slot_ids.numel(), 1, 128), dtype=kv_dtype),
+        )
+
+    monkeypatch.setenv(aiter_utils.FLYPA_MIMO_PREFILL_ENV, "1" if flypa_env else "0")
+    monkeypatch.setenv(
+        aiter_utils.FLYDSL_MIMO_PREFILL_ENV, "1" if flydsl_env else "0"
+    )
+    monkeypatch.setattr(aiter_utils, "is_gfx942", lambda: gfx942)
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: gfx950)
+    monkeypatch.setattr(aiter_utils, "flypa", fake_flypa)
+    monkeypatch.setattr(aiter_utils, "mha_batch_prefill_func", fake_batch_prefill)
+    monkeypatch.setattr(
+        aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather
+    )
+    if flydsl_env:
+
+        def fake_flydsl_prefill(q, k, v, *args, **kwargs):
+            captured.update(
+                q=q, k=k, v=v, args=args, kwargs=kwargs, selected="flydsl"
+            )
+            return torch.zeros(
+                (q.shape[0], q.shape[1], 128),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+
+        monkeypatch.setattr(
+            aiter_utils,
+            "load_flydsl_mimo_prefill_kernel",
+            lambda: SimpleNamespace(run=fake_flydsl_prefill),
+        )
+    if kv_dtype == fp8_dtype:
+        q_descale = torch.tensor([0.125], dtype=torch.float32)
+        monkeypatch.setattr(
+            aiter_utils,
+            "quantize_query_per_tensor_fp8",
+            lambda q: (q.to(fp8_dtype), q_descale),
+        )
+        pack = 16
+        store_dtype = torch.uint8
+        k_buf = torch.zeros((2, 1, 12, 64, 16), dtype=torch.uint8)
+        v_buf = torch.zeros((2, 1, 4, 128, 16), dtype=torch.uint8)
+    else:
+        pack = 8
+        store_dtype = torch.bfloat16
+        k_buf = torch.zeros((2, 1, 24, 64, 8), dtype=torch.bfloat16)
+        v_buf = torch.zeros((2, 1, 8, 128, 8), dtype=torch.bfloat16)
+
+    pool = SimpleNamespace(
+        dtype=kv_dtype,
+        store_dtype=store_dtype,
+        start_layer=0,
+        k_buffer=[k_buf],
+        v_buffer=[v_buf],
+    )
+    metadata = SimpleNamespace(
+        swa_page_table=None,
+        kv_indices=torch.arange(64, dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 64], dtype=torch.int32),
+        paged_kv_indptr=(
+            torch.tensor([0, 1], dtype=torch.int32) if with_paged_metadata else None
+        ),
+        paged_kv_indices=(
+            torch.tensor([0], dtype=torch.int32) if with_paged_metadata else None
+        ),
+        paged_kv_last_page_len=(
+            torch.tensor([64], dtype=torch.int32) if with_paged_metadata else None
+        ),
+        max_q_len=64,
+        max_kv_len=64,
+    )
+    backend = SimpleNamespace(
+        input_dtype=torch.bfloat16,
+        kv_cache_dtype=kv_dtype,
+        page_size=64,
+        logits_soft_cap=0.0,
+        token_to_kv_pool=pool,
+        forward_metadata=metadata,
+        qo_indptr=torch.tensor([0, 64], dtype=torch.int32),
+        k_scale=torch.tensor([0.25], dtype=torch.float32),
+        v_scale=torch.tensor([0.5], dtype=torch.float32),
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        sliding_window_size=-1,
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        head_dim=192,
+        k_scale=None,
+        v_scale=None,
+        mimo_original_v_head_dim=128,
+    )
+    prefix_lens = [64] if prefix_lens is None else list(prefix_lens)
+    extend_len = 64
+    seq_len = prefix_lens[0] + extend_len
+    forward_batch = SimpleNamespace(
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_seq_lens_cpu=[extend_len],
+        seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int32),
+        seq_lens_sum=seq_len,
+    )
+    q = torch.zeros((64, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((64, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((64, 1, 128), dtype=torch.bfloat16)
+    out = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=2,
+        window_size=(-1, -1),
+        sinks=None,
+    )
+    assert out.shape == (64, 16 * 128)
+    return captured, k_buf, v_buf, pack
+
+
+def test_gfx942_bf16_flypa_prefill_skips_gather(monkeypatch):
+    captured, k_buf, v_buf, pack = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=True,
+        gfx950=False,
+        flypa_env=True,
+        kv_dtype=torch.bfloat16,
+    )
+    assert captured["selected"] == "flypa"
+    assert "gather_slot_ids" not in captured
+    assert captured["k"].data_ptr() == k_buf.data_ptr()
+    assert captured["v"].data_ptr() == v_buf.data_ptr()
+    assert captured["q"].shape == (64, 16, 192)
+    assert captured["compile"]["head_dim_v"] == 128
+    assert pack == 8
+
+
+def test_gfx942_fp8_flypa_prefill_skips_ck(monkeypatch):
+    captured, k_buf, v_buf, pack = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=True,
+        gfx950=False,
+        flypa_env=True,
+        kv_dtype=fp8_dtype,
+    )
+    assert captured["selected"] == "flypa"
+    assert captured["k"].data_ptr() == k_buf.data_ptr()
+    assert pack == 16
+    assert captured["q"].dtype == fp8_dtype
+
+
+def test_gfx950_fp8_below_flydsl_size_falls_back_to_flypa(monkeypatch):
+    captured, k_buf, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=False,
+        gfx950=True,
+        flypa_env=True,
+        kv_dtype=fp8_dtype,
+        flydsl_env=True,
+    )
+    assert captured["selected"] == "flypa"
+    assert captured["k"].data_ptr() == k_buf.data_ptr()
+
+
+def test_gfx950_bf16_flypa_prefill_is_enabled(monkeypatch):
+    captured, _, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=False,
+        gfx950=True,
+        flypa_env=True,
+        kv_dtype=torch.bfloat16,
+    )
+    assert captured["selected"] == "flypa"
+
+
+def test_gfx950_flypa_env_keeps_fresh_asm_shortcut(monkeypatch):
+    selected = {}
+
+    def fake_asm(q, k, v, layer, forward_batch):
+        selected["path"] = "asm"
+        return torch.zeros((q.shape[0], 16 * 128), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        aiter_utils, "can_use_mimo_fresh_bf16_asm", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(aiter_utils, "mimo_fresh_bf16_asm", fake_asm)
+    captured, _, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=False,
+        gfx950=True,
+        flypa_env=True,
+        kv_dtype=torch.bfloat16,
+        prefix_lens=[0],
+    )
+    assert selected["path"] == "asm"
+    assert captured.get("selected") != "flypa"
+
+
+def test_gfx942_flypa_env_uses_paged_path_on_fresh_chunk(monkeypatch):
+    captured, _, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=True,
+        gfx950=False,
+        flypa_env=True,
+        kv_dtype=torch.bfloat16,
+        prefix_lens=[0],
+    )
+    assert captured["selected"] == "flypa"
+
+
+def test_gfx950_cached_asm_is_preferred_over_flypa(monkeypatch):
+    selected = {}
+
+    def fake_chunk_asm(*args, **kwargs):
+        selected["path"] = "chunk_asm"
+        q = args[1]
+        return torch.zeros((q.shape[0], 16 * 128), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        aiter_utils, "can_use_mimo_chunk_bf16_varlen_asm", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(aiter_utils, "mimo_chunk_bf16_varlen_asm", fake_chunk_asm)
+    captured, _, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=False,
+        gfx950=True,
+        flypa_env=True,
+        kv_dtype=torch.bfloat16,
+        prefix_lens=[256],
+    )
+    assert selected["path"] == "chunk_asm"
+    assert captured.get("selected") != "flypa"
+
+
+def test_flypa_env_off_gfx942_bf16_gathers(monkeypatch):
+    captured, _, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=True,
+        gfx950=False,
+        flypa_env=False,
+        kv_dtype=torch.bfloat16,
+    )
+    assert captured["selected"] == "ck"
+    assert "gather_slot_ids" in captured
+
+
+def test_flypa_ignored_without_gfx942_or_gfx950(monkeypatch):
+    captured, _, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=False,
+        gfx950=False,
+        flypa_env=True,
+        kv_dtype=torch.bfloat16,
+    )
+    assert captured["selected"] == "ck"
+    assert "gather_slot_ids" in captured
+
+
+def test_gfx942_bf16_flypa_requires_paged_kv_metadata(monkeypatch):
+    captured, _, _, _ = _run_flypa_prefill_case(
+        monkeypatch,
+        gfx942=True,
+        gfx950=False,
+        flypa_env=True,
+        kv_dtype=torch.bfloat16,
+        with_paged_metadata=False,
+    )
+    assert captured["selected"] == "ck"
+    assert "gather_slot_ids" in captured
+
+
+def _mimo_paged_metadata_kwargs(**overrides):
+    kwargs = dict(
+        kv_cache_is_vectorized_5d=True,
+        page_size=64,
+        kv_cache_dtype=torch.bfloat16,
+        q_dtype=torch.bfloat16,
+        num_qo_heads=16,
+        num_kv_heads=1,
+        head_dim=192,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_paged_kv_metadata_enabled_for_bf16_and_fp8_shuffle_5d():
+    assert aiter_utils.can_build_mimo_paged_kv_metadata(**_mimo_paged_metadata_kwargs())
+    assert aiter_utils.can_build_mimo_paged_kv_metadata(
+        **_mimo_paged_metadata_kwargs(kv_cache_dtype=fp8_dtype)
+    )
+
+
+def test_paged_kv_metadata_rejected_outside_mimo_contract():
+    assert not aiter_utils.can_build_mimo_paged_kv_metadata(
+        **_mimo_paged_metadata_kwargs(kv_cache_is_vectorized_5d=False)
+    )
+    assert not aiter_utils.can_build_mimo_paged_kv_metadata(
+        **_mimo_paged_metadata_kwargs(page_size=16)
+    )
+    assert not aiter_utils.can_build_mimo_paged_kv_metadata(
+        **_mimo_paged_metadata_kwargs(kv_cache_dtype=torch.float16)
+    )
+    assert not aiter_utils.can_build_mimo_paged_kv_metadata(
+        **_mimo_paged_metadata_kwargs(num_kv_heads=2)
+    )
+    assert not aiter_utils.can_build_mimo_paged_kv_metadata(
+        **_mimo_paged_metadata_kwargs(num_qo_heads=8)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

@@ -95,6 +95,9 @@ class MiMoV2MTPLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+            # The speculative draft worker deliberately keeps an NHD cache;
+            # its attention kernels still require matching K/V widths.
+            force_v_pad=True,
             prefix=add_prefix("self_attn", prefix),
         )
         self.is_layer_sparse = False

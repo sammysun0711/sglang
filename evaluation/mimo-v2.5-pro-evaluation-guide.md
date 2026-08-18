@@ -30,7 +30,7 @@ cd ..
 git clone https://github.com/sammysun0711/aiter -b mimo-opt
 cd aiter
 git submodule update --init 3rdparty/composable_kernel
-git -C 3rdparty/composable_kernel apply < patches/composable_kernel/mimo_fp8_page64_head192_batch_prefill.patch
+git -C 3rdparty/composable_kernel apply < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch
 pip install -e .
 cd ..
 ```
@@ -39,7 +39,7 @@ cd ..
 FlyDSL installation should be after AITER installation, since it will update FlyDSL 0.2.4 runtime and FlyDSL FA & PA decode kernels.
 ```bash
 git clone https://github.com/sammysun0711/FlyDSL -b mimo-opt
-cd FlyDSL/wheels && python3 -m pip install --no-deps --force-reinstall flydsl-0.2.4-*.whl mimo_flydsl_kernels-0.1.2-*.whl
+cd FlyDSL/wheels && python3 -m pip install --no-deps --force-reinstall flydsl-0.2.4-*.whl mimo_flydsl_kernels-0.1.3-*.whl
 cd ../..
 ```
 

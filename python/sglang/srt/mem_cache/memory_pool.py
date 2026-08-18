@@ -1293,6 +1293,9 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def get_v_head_dim(self):
+        return self.v_head_dim
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,

@@ -128,6 +128,31 @@ def _mimo_moe_inputs(hidden_states):
     return hidden_states, hidden_states
 
 
+def _mimo_needs_v_padding(
+    *,
+    head_dim: int,
+    v_head_dim: int,
+    num_kv_heads: int,
+    server_args,
+    force_v_pad: bool,
+) -> bool:
+    if (
+        head_dim == v_head_dim
+        or server_args is None
+        or server_args.attention_backend != "aiter"
+    ):
+        return False
+
+    native_aiter_v_cache = (
+        not force_v_pad
+        and head_dim == 192
+        and v_head_dim == 128
+        and num_kv_heads == 1
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+    )
+    return not native_aiter_v_cache
+
+
 def load_mimo_v2_qkv_proj_weight(
     name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
 ):
@@ -514,6 +539,7 @@ class MiMoV2Attention(nn.Module):
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         partial_rotary_factor: float = 1.0,
+        force_v_pad: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -538,10 +564,12 @@ class MiMoV2Attention(nn.Module):
         self.head_dim = head_dim
         self.original_v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         server_args = get_global_server_args()
-        self.needs_v_pad = (
-            self.original_v_head_dim != self.head_dim
-            and server_args is not None
-            and server_args.attention_backend == "aiter"
+        self.needs_v_pad = _mimo_needs_v_padding(
+            head_dim=self.head_dim,
+            v_head_dim=self.original_v_head_dim,
+            num_kv_heads=self.num_kv_heads,
+            server_args=server_args,
+            force_v_pad=force_v_pad,
         )
         self.v_head_dim = (
             self.head_dim if self.needs_v_pad else self.original_v_head_dim
@@ -600,9 +628,9 @@ class MiMoV2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        # Preserve the unpadded projected-V width for attention backends.  The
-        # AITER ABI sees padded D192, while the MiMo-specific FlyDSL kernel may
-        # safely compute only this guaranteed-zero-tail D128 prefix.
+        # Preserve the checkpoint's projected-V width as an explicit MiMo
+        # marker. The supported AITER SHUFFLE-5D target route stores native
+        # D128; unsupported AITER/NHD routes still expose padded D192.
         self.attn.mimo_original_v_head_dim = self.original_v_head_dim
 
         self.attention_sink_bias = (

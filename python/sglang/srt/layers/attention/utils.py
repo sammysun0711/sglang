@@ -375,21 +375,23 @@ def reshape_and_cache_shuffle_5d(
     key_stride_token,
     value_stride_token,
     num_heads,
-    head_size,
+    key_head_size,
+    value_head_size,
     block_size,
     X: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    KEY_BLOCK_D: tl.constexpr,
+    VALUE_BLOCK_D: tl.constexpr,
     HAS_SWA: tl.constexpr,
 ):
-    """Scatter per-token (num_tokens, num_heads, head_size) K/V into the
+    """Scatter token-major K/V into the
     SHUFFLE 5D "vectorized" KV cache layout used by aiter CK
     `mha_batch_prefill_func` and aiter `pa_decode_gluon`.
 
-    K cache shape: (num_blocks, num_heads, head_size // X, block_size, X)
-    V cache shape: (num_blocks, num_heads, block_size // X, head_size, X)
+    K cache shape: (num_blocks, num_heads, key_head_size // X, block_size, X)
+    V cache shape: (num_blocks, num_heads, block_size // X, value_head_size, X)
     where X = 16 // element_size (=8 for bf16/fp16, =16 for fp8).
-    block_size must be divisible by X, and head_size must be divisible by X.
+    block_size and both head dimensions must be divisible by X.
 
     Each program handles one token and a HEAD_BLOCK-wide slice of heads.
     """
@@ -409,39 +411,50 @@ def reshape_and_cache_shuffle_5d(
 
     head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
     head_mask = head_idx < num_heads
-    d = tl.arange(0, BLOCK_D)
-    d_mask = d < head_size
-    d_outer = d // X
-    d_inner = d % X
+    key_d = tl.arange(0, KEY_BLOCK_D)
+    key_d_mask = key_d < key_head_size
+    key_d_outer = key_d // X
+    key_d_inner = key_d % X
+    value_d = tl.arange(0, VALUE_BLOCK_D)
+    value_d_mask = value_d < value_head_size
 
-    src_off = token_idx * key_stride_token + head_idx[:, None] * head_size + d[None, :]
-    src_mask = head_mask[:, None] & d_mask[None, :]
-    k = tl.load(key_ptr + src_off, mask=src_mask)
-    src_off_v = (
-        token_idx * value_stride_token + head_idx[:, None] * head_size + d[None, :]
+    key_src_mask = head_mask[:, None] & key_d_mask[None, :]
+    key_src = (
+        token_idx * key_stride_token
+        + head_idx[:, None] * key_head_size
+        + key_d[None, :]
     )
-    v = tl.load(value_ptr + src_off_v, mask=src_mask)
+    k = tl.load(key_ptr + key_src, mask=key_src_mask)
+    src_off_v = (
+        token_idx * value_stride_token
+        + head_idx[:, None] * value_head_size
+        + value_d[None, :]
+    )
+    value_src_mask = head_mask[:, None] & value_d_mask[None, :]
+    v = tl.load(value_ptr + src_off_v, mask=value_src_mask)
 
-    layer_stride = num_heads * head_size * block_size
-    head_stride = head_size * block_size
+    key_layer_stride = num_heads * key_head_size * block_size
+    key_head_stride = key_head_size * block_size
 
     k_tgt = (
-        block_idx * layer_stride
-        + head_idx[:, None] * head_stride
-        + d_outer[None, :] * block_size * X
+        block_idx * key_layer_stride
+        + head_idx[:, None] * key_head_stride
+        + key_d_outer[None, :] * block_size * X
         + slot_in_page * X
-        + d_inner[None, :]
+        + key_d_inner[None, :]
     )
-    tl.store(key_cache_ptr + k_tgt, k, mask=src_mask)
+    tl.store(key_cache_ptr + k_tgt, k, mask=key_src_mask)
 
+    value_layer_stride = num_heads * value_head_size * block_size
+    value_head_stride = value_head_size * block_size
     v_tgt = (
-        block_idx * layer_stride
-        + head_idx[:, None] * head_stride
-        + page_outer * head_size * X
-        + d[None, :] * X
+        block_idx * value_layer_stride
+        + head_idx[:, None] * value_head_stride
+        + page_outer * value_head_size * X
+        + value_d[None, :] * X
         + page_inner
     )
-    tl.store(value_cache_ptr + v_tgt, v, mask=src_mask)
+    tl.store(value_cache_ptr + v_tgt, v, mask=value_src_mask)
 
 
 def launch_reshape_and_cache_shuffle_5d(
@@ -455,27 +468,34 @@ def launch_reshape_and_cache_shuffle_5d(
     """Launcher for reshape_and_cache_shuffle_5d.
 
     Args:
-        key/value: (num_tokens, num_heads, head_size) source tensors
-        key_cache: (num_blocks, num_heads, head_size//X, block_size, X)
-        value_cache: (num_blocks, num_heads, block_size//X, head_size, X)
+        key: (num_tokens, num_heads, key_head_size) source tensor
+        value: (num_tokens, num_heads, value_head_size) source tensor
+        key_cache: (num_blocks, num_heads, key_head_size//X, block_size, X)
+        value_cache: (num_blocks, num_heads, block_size//X, value_head_size, X)
         slot_mapping: per-token destination slot in [0, num_blocks*block_size)
     """
-    num_tokens, num_heads, head_size = key.shape
-    assert value.shape == key.shape, "K/V must share token-major shape"
+    num_tokens, num_heads, key_head_size = key.shape
+    value_tokens, value_heads, value_head_size = value.shape
+    assert (value_tokens, value_heads) == (num_tokens, num_heads), (
+        "K/V must share token and head dimensions"
+    )
     assert key_cache.dim() == 5 and value_cache.dim() == 5
     num_blocks, kc_H, kc_D_over_X, block_size, X = key_cache.shape
-    assert kc_H == num_heads and kc_D_over_X * X == head_size
+    assert kc_H == num_heads and kc_D_over_X * X == key_head_size
     vb_blocks, vc_H, vc_page_over_X, vc_D, vc_X = value_cache.shape
     assert (
-        vc_H == num_heads
+        vb_blocks == num_blocks
+        and vc_H == num_heads
         and vc_page_over_X * X == block_size
-        and vc_D == head_size
+        and vc_D == value_head_size
         and vc_X == X
     )
-    assert block_size % X == 0 and head_size % X == 0
+    assert block_size % X == 0
+    assert key_head_size % X == 0 and value_head_size % X == 0
 
     HEAD_BLOCK = min(4, triton.next_power_of_2(num_heads))
-    BLOCK_D = triton.next_power_of_2(head_size)
+    KEY_BLOCK_D = triton.next_power_of_2(key_head_size)
+    VALUE_BLOCK_D = triton.next_power_of_2(value_head_size)
     grid = (num_tokens, triton.cdiv(num_heads, HEAD_BLOCK))
 
     reshape_and_cache_shuffle_5d[grid](
@@ -488,11 +508,13 @@ def launch_reshape_and_cache_shuffle_5d(
         key.stride(0),
         value.stride(0),
         num_heads,
-        head_size,
+        key_head_size,
+        value_head_size,
         block_size,
         X=X,
         HEAD_BLOCK=HEAD_BLOCK,
-        BLOCK_D=BLOCK_D,
+        KEY_BLOCK_D=KEY_BLOCK_D,
+        VALUE_BLOCK_D=VALUE_BLOCK_D,
         HAS_SWA=(swa_slot_mapping is not None),
     )
 
@@ -501,17 +523,19 @@ def launch_reshape_and_cache_shuffle_5d(
 def gather_shuffle_5d_to_linear(
     key_cache_ptr,
     value_cache_ptr,
-    key_out_ptr,  # (T, num_heads, head_size), store dtype
-    value_out_ptr,  # (T, num_heads, head_size), store dtype
+    key_out_ptr,  # (T, num_heads, key_head_size), store dtype
+    value_out_ptr,  # (T, num_heads, value_head_size), store dtype
     slot_mapping_ptr,  # (T,) absolute pool slot id per token
     key_out_stride_token,
     value_out_stride_token,
     num_heads,
-    head_size,
+    key_head_size,
+    value_head_size,
     block_size,
     X: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    KEY_BLOCK_D: tl.constexpr,
+    VALUE_BLOCK_D: tl.constexpr,
 ):
     """Inverse of :func:`reshape_and_cache_shuffle_5d`.
 
@@ -532,40 +556,50 @@ def gather_shuffle_5d_to_linear(
 
     head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
     head_mask = head_idx < num_heads
-    d = tl.arange(0, BLOCK_D)
-    d_mask = d < head_size
-    d_outer = d // X
-    d_inner = d % X
+    key_d = tl.arange(0, KEY_BLOCK_D)
+    key_d_mask = key_d < key_head_size
+    key_d_outer = key_d // X
+    key_d_inner = key_d % X
+    value_d = tl.arange(0, VALUE_BLOCK_D)
+    value_d_mask = value_d < value_head_size
 
-    layer_stride = num_heads * head_size * block_size
-    head_stride = head_size * block_size
+    key_layer_stride = num_heads * key_head_size * block_size
+    key_head_stride = key_head_size * block_size
 
-    src_mask = head_mask[:, None] & d_mask[None, :]
+    key_src_mask = head_mask[:, None] & key_d_mask[None, :]
     k_src = (
-        block_idx * layer_stride
-        + head_idx[:, None] * head_stride
-        + d_outer[None, :] * block_size * X
+        block_idx * key_layer_stride
+        + head_idx[:, None] * key_head_stride
+        + key_d_outer[None, :] * block_size * X
         + slot_in_page * X
-        + d_inner[None, :]
+        + key_d_inner[None, :]
     )
-    k = tl.load(key_cache_ptr + k_src, mask=src_mask)
+    k = tl.load(key_cache_ptr + k_src, mask=key_src_mask)
+
+    value_layer_stride = num_heads * value_head_size * block_size
+    value_head_stride = value_head_size * block_size
+    value_src_mask = head_mask[:, None] & value_d_mask[None, :]
     v_src = (
-        block_idx * layer_stride
-        + head_idx[:, None] * head_stride
-        + page_outer * head_size * X
-        + d[None, :] * X
+        block_idx * value_layer_stride
+        + head_idx[:, None] * value_head_stride
+        + page_outer * value_head_size * X
+        + value_d[None, :] * X
         + page_inner
     )
-    v = tl.load(value_cache_ptr + v_src, mask=src_mask)
+    v = tl.load(value_cache_ptr + v_src, mask=value_src_mask)
 
     dst_k = (
-        token_idx * key_out_stride_token + head_idx[:, None] * head_size + d[None, :]
+        token_idx * key_out_stride_token
+        + head_idx[:, None] * key_head_size
+        + key_d[None, :]
     )
-    tl.store(key_out_ptr + dst_k, k, mask=src_mask)
+    tl.store(key_out_ptr + dst_k, k, mask=key_src_mask)
     dst_v = (
-        token_idx * value_out_stride_token + head_idx[:, None] * head_size + d[None, :]
+        token_idx * value_out_stride_token
+        + head_idx[:, None] * value_head_size
+        + value_d[None, :]
     )
-    tl.store(value_out_ptr + dst_v, v, mask=src_mask)
+    tl.store(value_out_ptr + dst_v, v, mask=value_src_mask)
 
 
 def launch_gather_shuffle_5d_to_linear(
@@ -576,13 +610,14 @@ def launch_gather_shuffle_5d_to_linear(
     """Inverse of :func:`launch_reshape_and_cache_shuffle_5d`.
 
     Returns ``(key_out, value_out)`` each shaped
-    ``(T, num_heads, head_size)`` in ``key_cache.dtype`` /
+    ``(T, num_heads, key_head_size)`` and
+    ``(T, num_heads, value_head_size)`` in ``key_cache.dtype`` /
     ``value_cache.dtype``. The caller is responsible for passing the
     right per-tensor descales downstream when ``store_dtype`` is fp8.
 
     Args:
-        key_cache:   (num_blocks, num_heads, head_size // X, block_size, X)
-        value_cache: (num_blocks, num_heads, block_size // X, head_size, X)
+        key_cache: (num_blocks, num_heads, key_head_size // X, block_size, X)
+        value_cache: (num_blocks, num_heads, block_size // X, value_head_size, X)
         slot_mapping: (T,) per-token absolute slot id in
             ``[0, num_blocks * block_size)``
     """
@@ -591,23 +626,24 @@ def launch_gather_shuffle_5d_to_linear(
     vc_blocks, vc_H, vc_page_over_X, vc_D, vc_X = value_cache.shape
     assert vc_blocks == num_blocks and vc_H == num_heads
     assert vc_page_over_X * X == block_size and vc_X == X
-    head_size = kc_D_over_X * X
-    assert vc_D == head_size
+    key_head_size = kc_D_over_X * X
+    value_head_size = vc_D
 
     num_tokens = slot_mapping.numel()
     key_out = torch.empty(
-        (num_tokens, num_heads, head_size),
+        (num_tokens, num_heads, key_head_size),
         dtype=key_cache.dtype,
         device=key_cache.device,
     )
     value_out = torch.empty(
-        (num_tokens, num_heads, head_size),
+        (num_tokens, num_heads, value_head_size),
         dtype=value_cache.dtype,
         device=value_cache.device,
     )
 
     HEAD_BLOCK = min(4, triton.next_power_of_2(num_heads))
-    BLOCK_D = triton.next_power_of_2(head_size)
+    KEY_BLOCK_D = triton.next_power_of_2(key_head_size)
+    VALUE_BLOCK_D = triton.next_power_of_2(value_head_size)
     grid = (num_tokens, triton.cdiv(num_heads, HEAD_BLOCK))
 
     gather_shuffle_5d_to_linear[grid](
@@ -619,11 +655,13 @@ def launch_gather_shuffle_5d_to_linear(
         key_out.stride(0),
         value_out.stride(0),
         num_heads,
-        head_size,
+        key_head_size,
+        value_head_size,
         block_size,
         X=X,
         HEAD_BLOCK=HEAD_BLOCK,
-        BLOCK_D=BLOCK_D,
+        KEY_BLOCK_D=KEY_BLOCK_D,
+        VALUE_BLOCK_D=VALUE_BLOCK_D,
     )
     return key_out, value_out
 

@@ -148,6 +148,9 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_v_head_dim(self):
+        return self.full_kv_pool.v_head_dim
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.

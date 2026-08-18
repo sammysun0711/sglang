@@ -65,6 +65,7 @@ FLYDSL_MIMO_QUERY_LENGTH = 4
 FLYDSL_MIMO_QUERY_HEADS = 16
 FLYDSL_MIMO_KV_HEADS = 1
 FLYDSL_MIMO_HEAD_DIM = 192
+FLYDSL_MIMO_VALUE_HEAD_DIM = 128
 FLYDSL_MIMO_PAGE_SIZE = 64
 FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS = 8
 FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS = (8, 16, 24, 32)
@@ -77,6 +78,7 @@ FLYDSL_MIMO_PREFILL_MIN_KV = 8192
 CK_MIMO_PREFILL_QUERY_HEADS = 16
 CK_MIMO_PREFILL_KV_HEADS = 1
 CK_MIMO_PREFILL_HEAD_DIM = 192
+CK_MIMO_PREFILL_VALUE_HEAD_DIM = 128
 CK_MIMO_PREFILL_PAGE_SIZE = 64
 MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS = 8
 
@@ -138,7 +140,7 @@ def can_use_mimo_fresh_bf16_asm(
         and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
         and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
         and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
-        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_VALUE_HEAD_DIM
         and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
         and k.shape[-2:] == (layer.tp_k_head_num, layer.qk_head_dim)
         and v.shape[-2:] == (layer.tp_v_head_num, layer.v_head_dim)
@@ -159,7 +161,7 @@ def mimo_fresh_bf16_asm(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
 ) -> torch.Tensor:
-    """Run gfx950 D192/V128 ASM while preserving MiMo's padded-V ABI."""
+    """Run gfx950 D192/V128 ASM with a native V128 model/cache ABI."""
     lengths = forward_batch.extend_seq_lens_cpu
     batch_size = len(lengths)
     sequence_length = lengths[0]
@@ -175,18 +177,14 @@ def mimo_fresh_bf16_asm(
         layer.tp_k_head_num,
         layer.qk_head_dim,
     )
-    # MiMo pads its 128 projected V lanes to 192 before the cache writer.  The
-    # tail is identically zero, so give ASM the meaningful 128-lane view.
     v_4d = v.view(
         batch_size,
         sequence_length,
         layer.tp_v_head_num,
         layer.v_head_dim,
-    )[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+    )
 
-    # Keep the model ABI at Hq*192. ASM writes the strided first-128 view
-    # directly; the zero allocation makes every padded lane deterministic.
-    output = q.new_zeros(
+    output = q.new_empty(
         (
             batch_size,
             sequence_length,
@@ -194,7 +192,6 @@ def mimo_fresh_bf16_asm(
             layer.v_head_dim,
         )
     )
-    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
     result = fmha_v3_fwd(
         q_4d,
         k_4d,
@@ -207,7 +204,7 @@ def mimo_fresh_bf16_asm(
         False,
         False,
         0,
-        output_v,
+        output,
         None,
         None,
         None,
@@ -215,7 +212,7 @@ def mimo_fresh_bf16_asm(
         None,
         None,
     )
-    if result[0].data_ptr() != output_v.data_ptr():
+    if result[0].data_ptr() != output.data_ptr():
         raise RuntimeError("gfx950 MiMo fresh BF16 ASM ignored its output buffer")
     return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -256,7 +253,7 @@ def can_use_mimo_fresh_bf16_varlen_asm(
         and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
         and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
         and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
-        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_VALUE_HEAD_DIM
         and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
         and k.shape[-2:] == (layer.tp_k_head_num, layer.qk_head_dim)
         and v.shape[-2:] == (layer.tp_v_head_num, layer.v_head_dim)
@@ -285,14 +282,9 @@ def mimo_fresh_bf16_varlen_asm(
     min_length = min(lengths)
     q_varlen = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
     k_varlen = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-    v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)[
-        ..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM
-    ]
+    v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-    output = q.new_zeros(
-        (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
-    )
-    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+    output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
     cu_seqlens = backend.qo_indptr[: batch_size + 1]
     result = fmha_v3_varlen_fwd(
         q_varlen,
@@ -313,7 +305,7 @@ def mimo_fresh_bf16_varlen_asm(
         False,
         False,
         0,
-        output_v,
+        output,
         None,
         None,
         None,
@@ -324,7 +316,7 @@ def mimo_fresh_bf16_varlen_asm(
         None,
         None,
     )
-    if result[0].data_ptr() != output_v.data_ptr():
+    if result[0].data_ptr() != output.data_ptr():
         raise RuntimeError(
             "gfx950 MiMo fresh BF16 varlen ASM ignored its output buffer"
         )
@@ -374,7 +366,7 @@ def can_use_mimo_chunk_bf16_varlen_asm(
     expected_v_tail = (
         CK_MIMO_PREFILL_KV_HEADS,
         CK_MIMO_PREFILL_PAGE_SIZE // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
-        CK_MIMO_PREFILL_HEAD_DIM,
+        CK_MIMO_PREFILL_VALUE_HEAD_DIM,
         MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
     )
     return (
@@ -404,7 +396,7 @@ def can_use_mimo_chunk_bf16_varlen_asm(
         and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
         and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
         and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
-        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_VALUE_HEAD_DIM
         and getattr(layer, "mimo_original_v_head_dim", None)
         == MIMO_FRESH_BF16_ASM_V_HEAD_DIM
         and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
@@ -454,12 +446,9 @@ def mimo_chunk_bf16_varlen_asm(
     k_full, v_full = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
     q_varlen = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
     k_varlen = k_full.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-    v_varlen = v_full.view(-1, layer.tp_v_head_num, layer.v_head_dim)[
-        ..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM
-    ]
+    v_varlen = v_full.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-    output = q.new_zeros((extend_len, layer.tp_q_head_num, layer.v_head_dim))
-    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
+    output = q.new_empty((extend_len, layer.tp_q_head_num, layer.v_head_dim))
     result = fmha_v3_varlen_fwd(
         q_varlen,
         k_varlen,
@@ -479,7 +468,7 @@ def mimo_chunk_bf16_varlen_asm(
         False,
         False,
         0,
-        output_v,
+        output,
         None,
         None,
         None,
@@ -490,7 +479,7 @@ def mimo_chunk_bf16_varlen_asm(
         None,
         None,
     )
-    if result[0].data_ptr() != output_v.data_ptr():
+    if result[0].data_ptr() != output.data_ptr():
         raise RuntimeError(
             "gfx950 MiMo chunk BF16 varlen ASM ignored its output buffer"
         )
@@ -539,7 +528,7 @@ def can_use_mimo_fresh_bf16_swa_varlen(
         and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
         and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
         and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
-        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_VALUE_HEAD_DIM
         and getattr(layer, "mimo_original_v_head_dim", None)
         == MIMO_FRESH_BF16_ASM_V_HEAD_DIM
         and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
@@ -566,23 +555,14 @@ def mimo_fresh_bf16_swa_varlen(
     window_size,
     sinks: torch.Tensor,
 ) -> torch.Tensor:
-    """Run native-D128 CK varlen SWA while preserving MiMo's padded-V ABI."""
+    """Run native-D128 CK varlen SWA with a native V128 ABI."""
     lengths = forward_batch.extend_seq_lens_cpu
     batch_size = len(lengths)
     q_varlen = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
     k_varlen = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-    # MiMo materializes a zero-padded D192 V tensor before attention.  CK
-    # accepts its strided meaningful D128 prefix directly, avoiding both the
-    # extra V math and a materialization.
-    v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)[
-        ..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM
-    ]
+    v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-    # The model immediately slices attention output back to D128 before
-    # o_proj.  Leave the dead padded tail unwritten and direct CK into the
-    # strided prefix of the model ABI allocation.
     output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
-    output_v = output[..., :MIMO_FRESH_BF16_ASM_V_HEAD_DIM]
     cu_seqlens = backend.qo_indptr[: batch_size + 1]
     sink_ptr = sinks if sinks.dtype == torch.float32 else sinks.float()
     result = flash_attn_varlen_func(
@@ -600,9 +580,9 @@ def mimo_fresh_bf16_swa_varlen(
         causal=True,
         window_size=(int(window_size[0]), 0, 0),
         sink_ptr=sink_ptr,
-        out=output_v,
+        out=output,
     )
-    if result.data_ptr() != output_v.data_ptr():
+    if result.data_ptr() != output.data_ptr():
         raise RuntimeError("gfx950 MiMo fresh SWA varlen ignored its output buffer")
     return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -752,16 +732,22 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
 
     compile_tile = getattr(tile_module, "compile_pa_decode_tile", None)
     try:
-        supports_bf16_kv = compile_tile is not None and (
-            "bf16_kv" in inspect.signature(compile_tile).parameters
+        compile_tile_parameters = (
+            inspect.signature(compile_tile).parameters
+            if compile_tile is not None
+            else {}
         )
+        supports_native_v = {
+            "bf16_kv",
+            "v_head_dim",
+        }.issubset(compile_tile_parameters)
     except (TypeError, ValueError):
-        supports_bf16_kv = False
-    if not supports_bf16_kv:
+        supports_native_v = False
+    if not supports_native_v:
         raise RuntimeError(
             "SGLANG_AITER_PA_DECODE_IMPL=flydsl requires "
-            "mimo_flydsl_kernels>=0.1.2 or a compatible FlyDSL source "
-            "whose compile_pa_decode_tile accepts `bf16_kv`; imported "
+            "a compatible FlyDSL source whose compile_pa_decode_tile accepts "
+            "both `bf16_kv` and `v_head_dim`; imported "
             f"incompatible kernel from {getattr(tile_module, '__file__', 'unknown')}"
         )
 
@@ -797,7 +783,7 @@ def forward_extend_vectorized_5d(
        from the (possibly fp8) cache.
 
     2. Direct paged FP8: cached full-attention MiMo chunks with the proven
-       ``16Q/1KV, Dq=Dv=192, page=64`` contract pass the SHUFFLE 5D cache and
+       ``16Q/1KV, Dq=192, Dv=128, page=64`` contract pass the SHUFFLE 5D cache and
        flat ragged page table directly to the tuned CK kernel.
 
     3. Cached BF16 MiMo chunk ASM: for the accuracy baseline's full-attention
@@ -879,8 +865,6 @@ def forward_extend_vectorized_5d(
         # AITER's LINEAR prefill kernel accepts their token stride directly, so
         # avoid materializing full-token copies for the fresh-prompt chunk.
         k_lin = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        # MiMo V is different: F.pad materializes its 128 -> 192 expansion, so
-        # keeping contiguous() here is both harmless and explicit.
         v_lin = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
         total_tokens = k_lin.shape[0]
         kv_indices_lin = torch.arange(
@@ -944,7 +928,7 @@ def forward_extend_vectorized_5d(
     expected_v_tail = (
         CK_MIMO_PREFILL_KV_HEADS,
         CK_MIMO_PREFILL_PAGE_SIZE // 16,
-        CK_MIMO_PREFILL_HEAD_DIM,
+        CK_MIMO_PREFILL_VALUE_HEAD_DIM,
         16,
     )
     use_direct_paged = (
@@ -960,7 +944,7 @@ def forward_extend_vectorized_5d(
         and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
         and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
         and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
-        and layer.v_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_VALUE_HEAD_DIM
         and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
         and float(backend.logits_soft_cap) == 0.0
         and has_paged_metadata
@@ -1006,6 +990,7 @@ def forward_extend_vectorized_5d(
         use_flydsl_prefill = (
             get_bool_env_var(FLYDSL_MIMO_PREFILL_ENV, "false")
             and is_gfx950()
+            and layer.v_head_dim == FLYDSL_MIMO_VALUE_HEAD_DIM
             and getattr(layer, "mimo_original_v_head_dim", None) == 128
             and max_q >= FLYDSL_MIMO_PREFILL_MIN_Q
             and max_kv >= FLYDSL_MIMO_PREFILL_MIN_KV
@@ -1250,7 +1235,7 @@ def forward_decode_vectorized_5d(
     )
     max_logits = torch.empty_like(exp_sums)
     temporary_output = torch.empty(
-        (bs, num_kv_heads, max_part_num, q_group, layer.qk_head_dim),
+        (bs, num_kv_heads, max_part_num, q_group, layer.v_head_dim),
         dtype=q_in.dtype,
         device=q_in.device,
     )
@@ -1298,7 +1283,7 @@ def _get_flydsl_workspace_views(
         * num_partitions
         * FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE
     )
-    output_numel = scalar_numel * FLYDSL_MIMO_HEAD_DIM
+    output_numel = scalar_numel * FLYDSL_MIMO_VALUE_HEAD_DIM
     buffers = (
         ("pmax", backend._flydsl_pa_decode_pmax, scalar_numel),
         ("psum", backend._flydsl_pa_decode_psum, scalar_numel),
@@ -1322,7 +1307,7 @@ def _get_flydsl_workspace_views(
     pmax = backend._flydsl_pa_decode_pmax[:scalar_numel].view(scalar_shape)
     psum = backend._flydsl_pa_decode_psum[:scalar_numel].view(scalar_shape)
     pout = backend._flydsl_pa_decode_pout[:output_numel].view(
-        *scalar_shape, FLYDSL_MIMO_HEAD_DIM
+        *scalar_shape, FLYDSL_MIMO_VALUE_HEAD_DIM
     )
     context_lengths = backend._flydsl_pa_decode_context_lengths[:batch_size]
     return pmax, psum, pout, context_lengths
@@ -1362,10 +1347,13 @@ def forward_target_verify_flydsl_5d(
             "FlyDSL MiMo TARGET_VERIFY requires 16 Q heads and 1 KV head; "
             f"got {num_q_heads}/{num_kv_heads}"
         )
-    if head_dim != FLYDSL_MIMO_HEAD_DIM or v_head_dim != FLYDSL_MIMO_HEAD_DIM:
+    if (
+        head_dim != FLYDSL_MIMO_HEAD_DIM
+        or v_head_dim != FLYDSL_MIMO_VALUE_HEAD_DIM
+    ):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires equal padded QK/V head "
-            f"dimensions of 192; got {head_dim}/{v_head_dim}"
+            "FlyDSL MiMo TARGET_VERIFY requires QK/V head dimensions "
+            f"192/128; got {head_dim}/{v_head_dim}"
         )
     if backend.page_size != FLYDSL_MIMO_PAGE_SIZE:
         raise ValueError(
@@ -1601,10 +1589,17 @@ def forward_target_verify_vectorized_5d(
             f"query-group limit: {query_length} * {query_group_size} = "
             f"{equivalent_group_size} > 64"
         )
-    if layer.qk_head_dim != layer.v_head_dim:
+    asymmetric_mimo = (
+        num_kv_heads == FLYDSL_MIMO_KV_HEADS
+        and layer.qk_head_dim == FLYDSL_MIMO_HEAD_DIM
+        and layer.v_head_dim == FLYDSL_MIMO_VALUE_HEAD_DIM
+    )
+    if layer.qk_head_dim != layer.v_head_dim and not asymmetric_mimo:
         raise ValueError(
-            "vectorized-5D TARGET_VERIFY requires equal padded QK and V head "
-            f"dimensions; got {layer.qk_head_dim} and {layer.v_head_dim}"
+            "vectorized-5D TARGET_VERIFY supports symmetric K/V or the MiMo "
+            "one-KV-head QK192/V128 route; got "
+            f"{num_kv_heads} KV heads and dimensions "
+            f"{layer.qk_head_dim}/{layer.v_head_dim}"
         )
     if backend.page_size not in (16, 64, 1024):
         raise ValueError(
@@ -1667,7 +1662,7 @@ def forward_target_verify_vectorized_5d(
     exp_sums = torch.empty(workspace_shape, dtype=torch.float32, device=q_view.device)
     max_logits = torch.empty_like(exp_sums)
     temporary_output = torch.empty(
-        (*workspace_shape, layer.qk_head_dim),
+        (*workspace_shape, layer.v_head_dim),
         dtype=q_view.dtype,
         device=q_view.device,
     )

@@ -1024,6 +1024,7 @@ def forward_extend_vectorized_5d(
               k_paged,
               v_paged,
               backend.qo_indptr[:bs0],
+              None,
               metadata.paged_kv_indptr[:bs0],
               metadata.paged_kv_indices,
               max_q,

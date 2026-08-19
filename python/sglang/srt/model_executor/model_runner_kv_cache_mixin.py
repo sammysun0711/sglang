@@ -37,6 +37,9 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.models.mimo_v2_utils import (
+    supports_native_mimo_vectorized_v_cache,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -89,15 +92,15 @@ def _use_native_mimo_vectorized_v_cache(
     tensor_parallel_size: int,
 ) -> bool:
     """Match the MiMo attention layer's supported native-V128 contract."""
-    return (
-        attention_backend == "aiter"
-        and kv_cache_layout == "vectorized_5d"
-        and model_config.head_dim == 192
-        and getattr(text_config, "swa_head_dim", None) == 192
-        and getattr(text_config, "v_head_dim", None) == 128
-        and getattr(text_config, "swa_v_head_dim", None) == 128
-        and model_config.get_num_kv_heads(tensor_parallel_size) == 1
-        and model_config.get_swa_num_kv_heads(tensor_parallel_size) == 1
+    return supports_native_mimo_vectorized_v_cache(
+        attention_backend=attention_backend,
+        kv_cache_layout=kv_cache_layout,
+        head_dim=model_config.head_dim,
+        swa_head_dim=getattr(text_config, "swa_head_dim", None),
+        v_head_dim=getattr(text_config, "v_head_dim", None),
+        swa_v_head_dim=getattr(text_config, "swa_v_head_dim", None),
+        full_num_kv_heads=model_config.get_num_kv_heads(tensor_parallel_size),
+        swa_num_kv_heads=model_config.get_swa_num_kv_heads(tensor_parallel_size),
     )
 
 

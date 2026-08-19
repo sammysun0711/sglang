@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -65,6 +66,37 @@ def test_mimo_pool_native_v128_requires_one_tp_local_kv_head(
             tensor_parallel_size=8,
         )
         is expected
+    )
+
+
+def test_mimo_layers_pad_when_either_shared_pool_family_is_not_native(monkeypatch):
+    server_args = SimpleNamespace(attention_backend="aiter")
+    layout = SimpleNamespace(get=lambda: "vectorized_5d")
+    monkeypatch.setattr(mimo_v2.envs, "SGLANG_AITER_KV_CACHE_LAYOUT", layout)
+    monkeypatch.setattr(mimo_v2, "get_attention_tp_size", lambda: 8)
+
+    # Full attention has two TP-local KV heads while SWA has one. The shared
+    # pools therefore use padded V192, and the SWA layer must pad as well.
+    config = SimpleNamespace(
+        head_dim=192,
+        swa_head_dim=192,
+        v_head_dim=128,
+        swa_v_head_dim=128,
+        num_key_value_heads=16,
+        swa_num_key_value_heads=8,
+    )
+    native_v_cache = mimo_v2._mimo_model_uses_native_v_cache(
+        config=config,
+        server_args=server_args,
+    )
+
+    assert not native_v_cache
+    assert mimo_v2._mimo_needs_v_padding(
+        head_dim=192,
+        v_head_dim=128,
+        num_kv_heads=1,
+        server_args=server_args,
+        force_v_pad=not native_v_cache,
     )
 
 
@@ -1164,6 +1196,145 @@ def test_gfx942_bf16_flypa_requires_paged_kv_metadata(monkeypatch):
     )
     assert captured["selected"] == "ck"
     assert "gather_slot_ids" in captured
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_bf16_flypa_matches_torch_with_causal_partial_last_page():
+    arch = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName.split(":", 1)[0]
+    if arch not in ("gfx942", "gfx950"):
+        pytest.skip("BF16 FlyPA is supported on gfx942/gfx950")
+
+    torch.manual_seed(20260819)
+    device = torch.device("cuda")
+    page_size = 64
+    num_pages = 2
+    query_length = 32
+    kv_length = 70
+    num_qo_heads = 16
+    num_kv_heads = 1
+    head_dim_qk = 192
+    head_dim_v = 128
+    pack = 8
+
+    query = (
+        torch.randn(
+            query_length,
+            num_qo_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    key_valid = (
+        torch.randn(
+            kv_length,
+            num_kv_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    value_valid = (
+        torch.randn(
+            kv_length,
+            num_kv_heads,
+            head_dim_v,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+
+    # Fill the invalid tail with a large sentinel. A missing last-page or causal
+    # mask makes the comparison fail decisively instead of passing by chance.
+    key_tokens = torch.full(
+        (num_pages * page_size, num_kv_heads, head_dim_qk),
+        64.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    value_tokens = torch.full(
+        (num_pages * page_size, num_kv_heads, head_dim_v),
+        64.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    key_tokens[:kv_length] = key_valid
+    value_tokens[:kv_length] = value_valid
+    key_cache = (
+        key_tokens.view(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim_qk // pack,
+            pack,
+        )
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value_tokens.view(
+            num_pages,
+            page_size // pack,
+            pack,
+            num_kv_heads,
+            head_dim_v,
+        )
+        .permute(0, 3, 1, 4, 2)
+        .contiguous()
+    )
+
+    cu_seqlens_q = torch.tensor([0, query_length], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    kv_page_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.tensor(
+        [kv_length - page_size], dtype=torch.int32, device=device
+    )
+    unit_scale = torch.ones((), dtype=torch.float32, device=device)
+
+    output = aiter_utils.flypa(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
+        page_size=page_size,
+        is_causal=True,
+        quant_query_mode="per-tensor",
+    )(
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q,
+        None,
+        kv_indptr,
+        kv_page_indices,
+        query_length,
+        kv_length,
+        True,
+        unit_scale,
+        unit_scale,
+        unit_scale,
+        kv_last_page_lens,
+    )
+
+    key_ref = key_valid.float().expand(-1, num_qo_heads, -1)
+    value_ref = value_valid.float().expand(-1, num_qo_heads, -1)
+    scores = torch.einsum("qhd,khd->hqk", query.float(), key_ref) / math.sqrt(
+        head_dim_qk
+    )
+    rows = torch.arange(query_length, device=device)[:, None]
+    columns = torch.arange(kv_length, device=device)[None, :]
+    causal_mask = columns <= (kv_length - query_length + rows)
+    scores.masked_fill_(~causal_mask[None, :, :], float("-inf"))
+    reference = torch.einsum(
+        "hqk,khd->qhd", torch.softmax(scores, dim=-1), value_ref
+    ).to(torch.bfloat16)
+
+    torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
 
 
 def _mimo_paged_metadata_kwargs(**overrides):

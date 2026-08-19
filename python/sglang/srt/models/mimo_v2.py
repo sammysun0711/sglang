@@ -80,6 +80,9 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
+from sglang.srt.models.mimo_v2_utils import (
+    supports_native_mimo_vectorized_v_cache,
+)
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -151,6 +154,24 @@ def _mimo_needs_v_padding(
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
     )
     return not native_aiter_v_cache
+
+
+def _mimo_model_uses_native_v_cache(*, config, server_args) -> bool:
+    """Use the same model-wide native-V128 contract as SWAKVPool allocation."""
+    if server_args is None:
+        return False
+
+    attention_tp_size = get_attention_tp_size()
+    return supports_native_mimo_vectorized_v_cache(
+        attention_backend=server_args.attention_backend,
+        kv_cache_layout=envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower(),
+        head_dim=config.head_dim,
+        swa_head_dim=getattr(config, "swa_head_dim", None),
+        v_head_dim=getattr(config, "v_head_dim", None),
+        swa_v_head_dim=getattr(config, "swa_v_head_dim", None),
+        full_num_kv_heads=max(1, config.num_key_value_heads // attention_tp_size),
+        swa_num_kv_heads=max(1, config.swa_num_key_value_heads // attention_tp_size),
+    )
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -749,6 +770,10 @@ class MiMoV2DecoderLayer(nn.Module):
             "context_len",
             getattr(config, "max_position_embeddings", 32768),
         )
+        force_v_pad = not _mimo_model_uses_native_v_cache(
+            config=config,
+            server_args=get_global_server_args(),
+        )
 
         if self.is_swa_layer():
             self.self_attn = MiMoV2Attention(
@@ -769,6 +794,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                force_v_pad=force_v_pad,
                 prefix=add_prefix("self_attn", prefix),
             )
         else:
@@ -790,6 +816,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                force_v_pad=force_v_pad,
                 prefix=add_prefix("self_attn", prefix),
             )
 

@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    TboDPAttentionPreparer,
+    is_no_a2a_tbo_eligible_batch,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -296,7 +299,19 @@ class SchedulerDPAttnAdapter:
             batch: The batch to process
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
-        if need_sync if need_sync is not None else self.get_require_mlp_sync():
+        should_prepare = (
+            need_sync if need_sync is not None else self.get_require_mlp_sync()
+        )
+        # TP-only TBO still needs the lightweight metadata all-gather that
+        # computes a rank-consistent split and global forward mode, even though
+        # DP attention and MLP gathered buffers are both disabled.
+        if (
+            self.server_args.enable_two_batch_overlap
+            and self.server_args.moe_a2a_backend == "none"
+            and is_no_a2a_tbo_eligible_batch(batch)
+        ):
+            should_prepare = True
+        if should_prepare:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 

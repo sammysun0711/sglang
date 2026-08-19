@@ -19,12 +19,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    launch_tbo_tp_all_reduce,
+    model_forward_maybe_tbo,
+    wait_tbo_tp_all_reduce,
+)
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -39,6 +44,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -74,7 +80,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -501,6 +511,26 @@ class MiMoV2MoE(nn.Module):
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+    def op_tbo_no_ep_experts(self, state):
+        hidden_states = state.pop("hidden_states_mlp_input")
+        _, expert_hidden_states = _mimo_moe_inputs(hidden_states)
+        state.tbo_no_ep_expert_output = self.experts(
+            expert_hidden_states,
+            state.pop("topk_output"),
+        )
+
+    def op_tbo_no_ep_all_reduce_launch(self, state):
+        state.tbo_no_ep_expert_all_reduce = launch_tbo_tp_all_reduce(
+            state.pop("tbo_no_ep_expert_output"),
+            group=get_tp_group(),
+            event_key=("mimo_expert", state.tbo_subbatch_index),
+        )
+
+    def op_tbo_no_ep_all_reduce_wait(self, state):
+        state.hidden_states_after_combine = wait_tbo_tp_all_reduce(
+            state.pop("tbo_no_ep_expert_all_reduce")
+        )
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
@@ -1007,6 +1037,23 @@ class MiMoV2DecoderLayer(nn.Module):
             )
         )
 
+    def op_tbo_no_ep_attn_all_reduce_launch(self, state):
+        state.tbo_no_ep_attn_all_reduce = launch_tbo_tp_all_reduce(
+            state.pop("hidden_states_after_attn"),
+            group=get_attention_tp_group(),
+            event_key=("mimo_attention", state.tbo_subbatch_index),
+        )
+
+    def op_tbo_no_ep_attn_all_reduce_wait_prepare_mlp(self, state):
+        hidden_states = wait_tbo_tp_all_reduce(state.pop("tbo_no_ep_attn_all_reduce"))
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp_after_tbo_all_reduce(
+                hidden_states,
+                state.pop("residual_after_input_ln"),
+                quant_format=self._prefill_moe_quant_format(state.forward_batch),
+            )
+        )
+
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             state.pop("hidden_states_mlp_output"),
@@ -1045,6 +1092,8 @@ class MiMoV2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self._logged_no_ep_tbo = False
+        self._logged_no_ep_tbo_fallback = False
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1085,6 +1134,50 @@ class MiMoV2Model(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def _no_ep_tbo_ineligible_reason(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[str]:
+        server_args = get_global_server_args()
+        if not forward_batch.can_run_tbo:
+            return "the scheduler did not produce a TBO split"
+        if forward_batch.tbo_children is None or len(forward_batch.tbo_children) != 2:
+            return "the TBO split does not contain exactly two children"
+        if any(
+            (child.tbo_padded_len or 0) <= 0
+            for child in forward_batch.tbo_children
+        ):
+            return "at least one TBO child is empty"
+        if (
+            forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.global_forward_mode != ForwardMode.EXTEND
+            or any(
+                child.forward_mode != ForwardMode.EXTEND
+                for child in forward_batch.tbo_children
+            )
+        ):
+            return "only ordinary EXTEND prefill is supported"
+        if forward_batch.spec_info is not None:
+            return "speculative target/draft batches are not supported"
+        if self.pp_group.world_size != 1:
+            return "pipeline parallelism is not supported"
+        if get_tensor_model_parallel_world_size() != 8:
+            return "tensor parallel size must be 8"
+        if get_attention_tp_size() != 8:
+            return "attention tensor parallel size must be 8"
+        if get_moe_expert_parallel_world_size() != 1:
+            return "expert parallelism must be disabled"
+        if is_dp_attention_enabled():
+            return "DP attention is not supported"
+        if server_args.attn_cp_size != 1:
+            return "attention context parallelism is not supported"
+        if server_args.enable_quant_communications:
+            return "quantized communication is not supported"
+        if server_args.enable_aiter_allreduce_fusion:
+            return "AITER all-reduce fusion must be disabled"
+        if not get_moe_a2a_backend().is_none():
+            return "the TP-only path requires moe_a2a_backend=none"
+        return None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1104,7 +1197,30 @@ class MiMoV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if forward_batch.can_run_tbo:
+        run_tbo = forward_batch.can_run_tbo
+        if get_moe_a2a_backend().is_none():
+            ineligible_reason = self._no_ep_tbo_ineligible_reason(forward_batch)
+            run_tbo = ineligible_reason is None
+            if run_tbo and not self._logged_no_ep_tbo:
+                child_lens = [
+                    child.tbo_padded_len for child in forward_batch.tbo_children
+                ]
+                logger.info(
+                    "Running MiMo TP8 non-EP prefill TBO with child lengths %s",
+                    child_lens,
+                )
+                self._logged_no_ep_tbo = True
+            elif (
+                forward_batch.can_run_tbo
+                and not self._logged_no_ep_tbo_fallback
+            ):
+                logger.info(
+                    "Skipping MiMo TP8 non-EP TBO and using the existing path: %s",
+                    ineligible_reason,
+                )
+                self._logged_no_ep_tbo_fallback = True
+
+        if run_tbo:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
 

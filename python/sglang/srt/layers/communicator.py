@@ -780,6 +780,17 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
+        layernorm = self._get_prepare_mlp_layernorm(quant_format)
+
+        return self._communicate_with_all_reduce_and_layer_norm_fn(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+            layernorm=layernorm,
+            context=self._context,
+        )
+
+    def _get_prepare_mlp_layernorm(self, quant_format: str):
         layernorm = self.post_attention_layernorm
         if (
             quant_format == "fp8_moe"
@@ -793,14 +804,30 @@ class LayerCommunicator:
             # performs the qualified TP all-reduce first, then runs one fused
             # RMSNorm/group-quant kernel on its completed result.
             layernorm = _FusedRMSNormFP8GroupQuantForMoe(layernorm)
+        return layernorm
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            layernorm=layernorm,
-            context=self._context,
-        )
+    def prepare_mlp_after_tbo_all_reduce(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        quant_format: str = "",
+    ):
+        """Finish MiMo TP-only TBO's prepare-MLP boundary after async AR.
+
+        The normal no-DP path performs attention-TP all-reduce followed by the
+        post-attention RMSNorm. TP-only TBO launches that all-reduce on its
+        communication stream, waits at the consumer, then calls this helper to
+        preserve the exact RMSNorm/FP8-MoE-input contract.
+        """
+
+        assert self._context.attn_dp_size == 1
+        assert self.layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        assert self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
+
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
+        layernorm = self._get_prepare_mlp_layernorm(quant_format)
+        return layernorm(hidden_states, residual)
 
     def postprocess_layer(
         self,

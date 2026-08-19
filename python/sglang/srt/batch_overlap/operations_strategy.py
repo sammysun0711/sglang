@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
@@ -238,6 +239,8 @@ def _compute_moe_mimov2_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     assert layer.is_layer_sparse, "MiMoV2DecoderLayer moe only support sparse layers"
     if forward_mode == ForwardMode.EXTEND:
+        if get_moe_a2a_backend().is_none():
+            return _compute_moe_mimov2_no_ep_prefill(layer)
         return _compute_moe_mimov2_prefill(layer)
     elif (
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
@@ -245,6 +248,31 @@ def _compute_moe_mimov2_layer_operations_strategy_tbo(
         return _compute_moe_mimov2_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+def _compute_moe_mimov2_no_ep_prefill(layer):
+    """Overlap TP all-reduces with the other child's MHA/MoE computation."""
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_tbo_no_ep_attn_all_reduce_launch,
+            operations.YieldOperation(),
+            layer.op_tbo_no_ep_attn_all_reduce_wait_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_tbo_no_ep_experts,
+            layer.mlp.op_tbo_no_ep_all_reduce_launch,
+            operations.YieldOperation(),
+            layer.mlp.op_tbo_no_ep_all_reduce_wait,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
 
 
 def _compute_moe_mimov2_prefill(layer):

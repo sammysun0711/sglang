@@ -56,6 +56,88 @@ _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 logger = logging.getLogger(__name__)
 
 
+# TP-only MiMo TBO uses one ordered communication stream for both children.
+# Keeping all collectives on one stream preserves identical RCCL ordering across
+# ranks while allowing the compute stream to run the other child's MHA/MoE.
+_tbo_tp_comm_streams = {}
+_tbo_tp_events = {}
+
+
+def _get_tbo_tp_comm_stream(device: torch.device) -> torch.cuda.Stream:
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    stream = _tbo_tp_comm_streams.get(device_index)
+    if stream is None:
+        with torch.cuda.device(device_index):
+            stream = torch.cuda.Stream(device=device_index)
+        _tbo_tp_comm_streams[device_index] = stream
+        logger.info("Initialized TP-only TBO communication stream on device %s", device)
+    return stream
+
+
+def _get_tbo_tp_event(device: torch.device, event_key) -> torch.cuda.Event:
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    key = (device_index, *event_key)
+    event = _tbo_tp_events.get(key)
+    if event is None:
+        with torch.cuda.device(device_index):
+            event = torch.cuda.Event()
+        _tbo_tp_events[key] = event
+    return event
+
+
+def launch_tbo_tp_all_reduce(
+    input_tensor: torch.Tensor,
+    *,
+    group,
+    event_key,
+):
+    """Launch one child TP all-reduce on the shared TBO communication stream.
+
+    The returned tensor may be either in-place or out-of-place depending on the
+    selected SGLang all-reduce backend. The completion event is persistent and
+    is re-recorded for the next layer only after the current layer consumes it.
+    """
+
+    device = input_tensor.device
+    comm_stream = _get_tbo_tp_comm_stream(device)
+    compute_stream = torch.cuda.current_stream(device)
+    ready_event = _get_tbo_tp_event(device, ("ready", *event_key))
+    completion_event = _get_tbo_tp_event(device, ("done", *event_key))
+
+    # Use persistent ready/completion events instead of Stream.wait_stream(),
+    # which may create short-lived events at every layer boundary on ROCm.
+    ready_event.record(compute_stream)
+    with torch.cuda.stream(comm_stream):
+        comm_stream.wait_event(ready_event)
+        output_tensor = group.all_reduce(input_tensor)
+        completion_event.record(comm_stream)
+
+    # Keep the producer alive until wait_tbo_tp_all_reduce() has inserted the
+    # completion-event dependency on its home compute stream.  That explicit
+    # dependency makes record_stream(comm_stream) unnecessary and avoids
+    # pinning every large in-place RCCL result to both streams.
+    return input_tensor, output_tensor, completion_event
+
+
+def wait_tbo_tp_all_reduce(handle):
+    """Make the compute stream wait immediately before consuming an AR result."""
+
+    input_tensor, output_tensor, event = handle
+    compute_stream = torch.cuda.current_stream(output_tensor.device)
+    compute_stream.wait_event(event)
+    # In-place all-reduce returns the producer itself, whose home stream is the
+    # compute stream.  Out-of-place backends allocate on the communication
+    # stream, so only those outputs need their compute-stream use recorded.
+    if output_tensor is not input_tensor:
+        output_tensor.record_stream(compute_stream)
+    del input_tensor
+    return output_tensor
+
+
 # -------------------------------- Compute Basic Info ---------------------------------------
 
 
@@ -369,6 +451,14 @@ class TboCudaGraphRunnerPlugin:
         )
 
 
+def is_no_a2a_tbo_eligible_batch(local_batch: Optional[ScheduleBatch]) -> bool:
+    return (
+        local_batch is not None
+        and local_batch.forward_mode == ForwardMode.EXTEND
+        and local_batch.spec_info is None
+    )
+
+
 class TboDPAttentionPreparer:
     def prepare_all_gather(
         self,
@@ -386,6 +476,13 @@ class TboDPAttentionPreparer:
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
         if not enable_two_batch_overlap:
+            self.local_tbo_split_seq_index = None
+            return False, self._compute_local_forward_mode(local_batch)
+
+        # The TP-only MiMo path supports ordinary prefill only.  Refuse other
+        # modes before constructing child split metadata; the model repeats
+        # this check as defense in depth.
+        if not enable_a2a_moe and not is_no_a2a_tbo_eligible_batch(local_batch):
             self.local_tbo_split_seq_index = None
             return False, self._compute_local_forward_mode(local_batch)
 
@@ -769,6 +866,10 @@ class TboForwardBatchPreparer:
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
+                # Logits processing runs once on the merged parent hidden
+                # states.  Child model forwards must not retain the parent's
+                # input-logprob gather indices.
+                extend_input_logprob_token_ids_gpu=None,
                 sampling_info=None,
                 # For logits and logprobs post processing, thus we do not care
                 temperature=None,

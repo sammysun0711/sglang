@@ -66,6 +66,12 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
 
+    def test_parent_logprob_indices_do_not_leak_into_children(self):
+        parent = _make_target_verify_batch(8)
+        parent.extend_input_logprob_token_ids_gpu = torch.arange(8)
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child.extend_input_logprob_token_ids_gpu)
+
 
 def _make_valued_batch(bs: int) -> ForwardBatch:
     # Distinct per-position values so a filtered slice is unambiguous.

@@ -308,9 +308,25 @@ class SchedulerDPAttnAdapter:
         if (
             self.server_args.enable_two_batch_overlap
             and self.server_args.moe_a2a_backend == "none"
-            and is_no_a2a_tbo_eligible_batch(batch)
         ):
-            should_prepare = True
+            if is_no_a2a_tbo_eligible_batch(batch):
+                should_prepare = True
+            elif batch is not None:
+                # ScheduleBatch objects move from prefill into the running
+                # decode batch.  The TP-only TBO prefill preparation above
+                # writes MLP-sync/TBO metadata onto that object even though
+                # DP attention is disabled.  If the next decode or
+                # speculative-verification step skips preparation, those
+                # prefill values leak into ForwardBatch construction (most
+                # notably global_num_tokens and tbo_split_seq_index) and can
+                # make EAGLE CUDA-graph replay see inconsistent batch/token
+                # shapes.  Restore the ordinary no-DP state whenever the
+                # current batch is outside the supported plain-EXTEND path.
+                batch.global_num_tokens = None
+                batch.global_num_tokens_for_logprob = None
+                batch.tbo_split_seq_index = None
+                batch.global_forward_mode = None
+                batch.is_extend_in_batch = batch.forward_mode.is_extend()
         if should_prepare:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch

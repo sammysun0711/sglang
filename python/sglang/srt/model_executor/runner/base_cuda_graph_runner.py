@@ -39,8 +39,21 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
         BaseCudaGraphBackend,
     )
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def is_tbo_cuda_graph_enabled(server_args: ServerArgs) -> bool:
+    """Return whether decode CUDA graphs need TBO-specific handling.
+
+    TP-only MiMo TBO (``moe_a2a_backend=none``) is prefill-only, so decode and
+    speculative target verification must use the ordinary CUDA-graph path.
+    """
+    return (
+        server_args.enable_two_batch_overlap
+        and server_args.moe_a2a_backend != "none"
+    )
 
 
 @contextmanager
@@ -76,7 +89,7 @@ def get_batch_sizes_to_capture(
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
-    if server_args.enable_two_batch_overlap:
+    if is_tbo_cuda_graph_enabled(server_args):
         mul_base *= 2
         num_tokens_per_bs = 1
 

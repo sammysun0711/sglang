@@ -11,7 +11,17 @@ from sglang.srt.batch_overlap.operations_strategy import (
     _compute_moe_mimov2_layer_operations_strategy_tbo,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    get_batch_sizes_to_capture,
+    is_tbo_cuda_graph_enabled,
+)
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.models import mimo_v2
 
 
@@ -364,7 +374,15 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
 def test_tbo_does_not_force_scheduler_split_metadata_for_unsupported_no_a2a_batch(
     forward_mode, spec_info
 ):
-    batch = SimpleNamespace(forward_mode=forward_mode, spec_info=spec_info)
+    batch = SimpleNamespace(
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        global_num_tokens=[4096],
+        global_num_tokens_for_logprob=[1],
+        tbo_split_seq_index=1,
+        global_forward_mode=ForwardMode.EXTEND,
+        is_extend_in_batch=True,
+    )
     adapter = SimpleNamespace(
         server_args=SimpleNamespace(
             enable_two_batch_overlap=True,
@@ -381,6 +399,11 @@ def test_tbo_does_not_force_scheduler_split_metadata_for_unsupported_no_a2a_batc
     )
 
     assert result is batch
+    assert batch.global_num_tokens is None
+    assert batch.global_num_tokens_for_logprob is None
+    assert batch.tbo_split_seq_index is None
+    assert batch.global_forward_mode is None
+    assert batch.is_extend_in_batch == forward_mode.is_extend()
 
 
 @pytest.mark.parametrize(
@@ -430,3 +453,94 @@ def test_tbo_does_not_force_scheduler_split_metadata_for_a2a_backend():
     )
 
     assert result is batch
+
+
+@pytest.mark.parametrize(
+    ("moe_a2a_backend", "expected"),
+    [("none", False), ("deepep", True)],
+)
+def test_tbo_cuda_graph_policy_depends_on_a2a_backend(moe_a2a_backend, expected):
+    server_args = SimpleNamespace(
+        enable_two_batch_overlap=True,
+        moe_a2a_backend=moe_a2a_backend,
+    )
+
+    assert is_tbo_cuda_graph_enabled(server_args) is expected
+
+
+def test_no_a2a_tbo_keeps_ordinary_decode_capture_sizes():
+    server_args = SimpleNamespace(
+        enable_two_batch_overlap=True,
+        moe_a2a_backend="none",
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(bs=[1, 2, 3, 4]),
+        ),
+        enable_torch_compile=False,
+    )
+    model_runner = SimpleNamespace(
+        server_args=server_args,
+        req_to_token_pool=SimpleNamespace(size=4),
+    )
+
+    with (
+        patch(
+            "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
+            return_value=1,
+        ),
+    ):
+        capture_bs, compile_bs = get_batch_sizes_to_capture(
+            model_runner, num_tokens_per_bs=5
+        )
+
+    assert capture_bs == [1, 2, 3, 4]
+    assert compile_bs == []
+
+
+def _make_decode_graph_runner(enable_tbo_cuda_graph):
+    runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+    runner.require_mlp_tp_gather = False
+    runner.enable_pdmux = False
+    runner.disable_padding = False
+    runner.max_bs = 4
+    runner.require_mlp_sync = False
+    runner.is_encoder_decoder = False
+    runner.capture_hidden_mode = CaptureHiddenMode.NULL
+    runner.enable_tbo_cuda_graph = enable_tbo_cuda_graph
+    runner.num_tokens_per_bs = 1
+    runner.model_runner = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(
+            is_ngram=lambda: False,
+        )
+    )
+    return runner
+
+
+def _make_decode_graph_forward_batch(forward_mode=ForwardMode.DECODE):
+    return SimpleNamespace(
+        replace_embeds=None,
+        batch_size=1,
+        can_run_tbo=False,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        spec_info=None,
+        forward_mode=forward_mode,
+    )
+
+
+@pytest.mark.parametrize(
+    "forward_mode",
+    [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY],
+)
+def test_no_a2a_tbo_decode_graph_accepts_non_tbo_batch(forward_mode):
+    runner = _make_decode_graph_runner(enable_tbo_cuda_graph=False)
+
+    assert runner.can_run(_make_decode_graph_forward_batch(forward_mode))
+
+
+def test_a2a_tbo_decode_graph_still_requires_tbo_batch():
+    runner = _make_decode_graph_runner(enable_tbo_cuda_graph=True)
+
+    assert not runner.can_run(_make_decode_graph_forward_batch())

@@ -72,6 +72,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
     get_batch_sizes_to_capture,
+    is_tbo_cuda_graph_enabled,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
@@ -311,8 +312,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.enable_two_batch_overlap = (
-            model_runner.server_args.enable_two_batch_overlap
+        self.enable_tbo_cuda_graph = is_tbo_cuda_graph_enabled(
+            model_runner.server_args
         )
         self.use_ngram_embedding = model_runner.use_ngram_embedding
         if self.use_ngram_embedding:
@@ -558,7 +559,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
         is_tbo_supported = (
-            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
+            forward_batch.can_run_tbo if self.enable_tbo_cuda_graph else True
         )
 
         is_ngram_supported = (
@@ -845,7 +846,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
-            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            if self.enable_tbo_cuda_graph:
+                self.tbo_plugin.capture_one_batch_size(
+                    forward_batch, num_tokens=num_tokens
+                )
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
@@ -1004,7 +1008,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         # Padded tokens aren't read, so skip zeroing them.
-        if self.enable_two_batch_overlap:
+        if self.enable_tbo_cuda_graph:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
                 bs=bs,

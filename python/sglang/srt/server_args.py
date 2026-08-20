@@ -7806,6 +7806,12 @@ class ServerArgs:
                 "and no attention context parallelism."
             )
 
+        if self.enable_aiter_allreduce_fusion:
+            raise ValueError(
+                "MiMoV2 two batch overlap with moe_a2a_backend='none' is "
+                "incompatible with AITER all-reduce fusion."
+            )
+
         num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
         moe_layer_freq = getattr(hf_config, "moe_layer_freq", None)
         supports_layer_layout = (

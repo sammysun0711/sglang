@@ -10,11 +10,13 @@ from sglang.srt.batch_overlap.operations import YieldOperation
 from sglang.srt.batch_overlap.operations_strategy import (
     _compute_moe_mimov2_layer_operations_strategy_tbo,
 )
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     get_batch_sizes_to_capture,
     is_tbo_cuda_graph_enabled,
@@ -140,6 +142,87 @@ class _FakeGroup:
     def all_reduce(self, input_tensor):
         self.inputs.append(input_tensor)
         return next(self.outputs)
+
+
+class _RecordingAttentionBackend:
+    def __init__(self, fill_value=1):
+        self.token_to_kv_pool = object()
+        self.req_to_token_pool = object()
+        self.fill_value = fill_value
+        self.calls = []
+
+    def init_forward_metadata_out_graph(self, **kwargs):
+        self.calls.append(("out_graph", kwargs))
+
+    def init_forward_metadata_in_graph(self, **kwargs):
+        self.calls.append(("in_graph", kwargs))
+
+    def init_cuda_graph_state(self, **kwargs):
+        self.calls.append(("graph_state", kwargs))
+
+    def on_after_cuda_graph_warmup(self):
+        self.calls.append(("after_warmup", {}))
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        self.calls.append(("fill_value", {}))
+        return self.fill_value
+
+
+def test_no_a2a_tbo_cuda_graph_uses_primary_attention_backend_only():
+    primary = _RecordingAttentionBackend()
+    children = [_RecordingAttentionBackend(), _RecordingAttentionBackend()]
+    wrapper = TboAttnBackend(
+        primary=primary,
+        children=children,
+        enable_cuda_graph_children=False,
+    )
+    replay_batch = SimpleNamespace(tbo_children=None)
+    capture_batch = SimpleNamespace(
+        tbo_children=[
+            SimpleNamespace(batch_size=1),
+            SimpleNamespace(batch_size=1),
+        ]
+    )
+
+    wrapper.init_cuda_graph_state(max_bs=128, max_num_tokens=128)
+    wrapper.init_forward_metadata_out_graph(replay_batch)
+    wrapper.init_forward_metadata_out_graph(capture_batch, in_capture=True)
+    wrapper.init_forward_metadata_in_graph(replay_batch)
+    wrapper.on_after_cuda_graph_warmup()
+
+    assert wrapper.get_cuda_graph_seq_len_fill_value() == 1
+    assert [name for name, _ in primary.calls] == [
+        "graph_state",
+        "out_graph",
+        "out_graph",
+        "in_graph",
+        "after_warmup",
+        "fill_value",
+    ]
+    assert children[0].calls == []
+    assert children[1].calls == []
+
+
+def test_no_a2a_tbo_keeps_eager_prefill_child_attention_metadata():
+    primary = _RecordingAttentionBackend()
+    children = [_RecordingAttentionBackend(), _RecordingAttentionBackend()]
+    wrapper = TboAttnBackend(
+        primary=primary,
+        children=children,
+        enable_cuda_graph_children=False,
+    )
+    parent = SimpleNamespace(
+        tbo_children=[
+            SimpleNamespace(batch_size=1),
+            SimpleNamespace(batch_size=1),
+        ]
+    )
+
+    wrapper.init_forward_metadata_out_graph(parent)
+
+    assert [name for name, _ in primary.calls] == ["out_graph"]
+    assert [name for name, _ in children[0].calls] == ["out_graph"]
+    assert [name for name, _ in children[1].calls] == ["out_graph"]
 
 
 def test_mimo_no_ep_tbo_reuses_stream_and_events_for_out_of_place_ar():
@@ -345,7 +428,11 @@ def test_mimo_no_ep_tbo_gate_accepts_only_ordinary_prefill():
 
 def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
     marker = object()
-    batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, spec_info=None)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        spec_info=None,
+        seq_lens_cpu=[8192],
+    )
     adapter = SimpleNamespace(
         server_args=SimpleNamespace(
             enable_two_batch_overlap=True,
@@ -360,6 +447,61 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
     )
 
     assert result is marker
+
+
+@pytest.mark.parametrize(
+    ("seq_lens_cpu", "expected"),
+    [
+        ([8191], False),
+        ([8192], True),
+        ([16384], True),
+        ([8192, 4096], False),
+        ([], False),
+        (None, False),
+    ],
+)
+def test_no_a2a_tbo_requires_all_sequences_to_reach_8k(seq_lens_cpu, expected):
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        spec_info=None,
+        seq_lens_cpu=seq_lens_cpu,
+    )
+
+    assert two_batch_overlap.is_no_a2a_tbo_eligible_batch(batch) is expected
+
+
+def test_tbo_does_not_force_scheduler_split_metadata_for_sub_8k_prefill():
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        spec_info=None,
+        seq_lens_cpu=[8191],
+        global_num_tokens=[8191],
+        global_num_tokens_for_logprob=[1],
+        tbo_split_seq_index=1,
+        global_forward_mode=ForwardMode.EXTEND,
+        is_extend_in_batch=True,
+    )
+    adapter = SimpleNamespace(
+        server_args=SimpleNamespace(
+            enable_two_batch_overlap=True,
+            moe_a2a_backend="none",
+        ),
+        get_require_mlp_sync=lambda: False,
+        prepare_mlp_sync_batch=lambda _: pytest.fail(
+            "sub-8K TP-only prefill must not be split"
+        ),
+    )
+
+    result = SchedulerDPAttnAdapter.maybe_prepare_mlp_sync_batch(
+        adapter, batch, need_sync=False
+    )
+
+    assert result is batch
+    assert batch.global_num_tokens is None
+    assert batch.global_num_tokens_for_logprob is None
+    assert batch.tbo_split_seq_index is None
+    assert batch.global_forward_mode is None
+    assert batch.is_extend_in_batch
 
 
 @pytest.mark.parametrize(
@@ -466,6 +608,34 @@ def test_tbo_cuda_graph_policy_depends_on_a2a_backend(moe_a2a_backend, expected)
     )
 
     assert is_tbo_cuda_graph_enabled(server_args) is expected
+
+
+@pytest.mark.parametrize(
+    ("moe_a2a_backend", "expected"),
+    [("none", False), ("deepep", True)],
+)
+def test_model_runner_sets_tbo_attention_graph_child_policy(moe_a2a_backend, expected):
+    marker = object()
+    runner = SimpleNamespace(
+        server_args=SimpleNamespace(
+            enable_pdmux=False,
+            enable_two_batch_overlap=True,
+            moe_a2a_backend=moe_a2a_backend,
+        ),
+        is_draft_worker=False,
+        _get_attention_backend=lambda: pytest.fail(
+            "backend creator should be passed through, not called by this test"
+        ),
+    )
+
+    with patch.object(TboAttnBackend, "init_new", return_value=marker) as init_new:
+        ModelRunner.init_attention_backend(runner)
+
+    assert runner.attn_backend is marker
+    init_new.assert_called_once_with(
+        runner._get_attention_backend,
+        enable_cuda_graph_children=expected,
+    )
 
 
 def test_no_a2a_tbo_keeps_ordinary_decode_capture_sizes():

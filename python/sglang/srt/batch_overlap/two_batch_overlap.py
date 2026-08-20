@@ -56,6 +56,11 @@ _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 logger = logging.getLogger(__name__)
 
 
+# Matched MI355X A/B showed low-work no-EP TBO overhead at 4K ISL.
+# Use 8K, the first tested non-regressing ISL, as the enablement boundary.
+_MIMO_NO_EP_TBO_MIN_ISL = 8 * 1024
+
+
 # TP-only MiMo TBO uses one ordered communication stream for both children.
 # Keeping all collectives on one stream preserves identical RCCL ordering across
 # ranks while allowing the compute stream to run the other child's MHA/MoE.
@@ -452,11 +457,18 @@ class TboCudaGraphRunnerPlugin:
 
 
 def is_no_a2a_tbo_eligible_batch(local_batch: Optional[ScheduleBatch]) -> bool:
-    return (
-        local_batch is not None
-        and local_batch.forward_mode == ForwardMode.EXTEND
-        and local_batch.spec_info is None
-    )
+    if (
+        local_batch is None
+        or local_batch.forward_mode != ForwardMode.EXTEND
+        or local_batch.spec_info is not None
+    ):
+        return False
+
+    seq_lens_cpu = getattr(local_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+        return False
+
+    return min(int(seq_len) for seq_len in seq_lens_cpu) >= _MIMO_NO_EP_TBO_MIN_ISL
 
 
 class TboDPAttentionPreparer:

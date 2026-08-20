@@ -2411,7 +2411,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.decode_attn_backend_group.append(self._get_attention_backend())
             self.decode_attn_backend = self.decode_attn_backend_group[0]
         elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
-            self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+            self.attn_backend = TboAttnBackend.init_new(
+                self._get_attention_backend,
+                enable_cuda_graph_children=(self.server_args.moe_a2a_backend != "none"),
+            )
         else:
             self.attn_backend = self._get_attention_backend()
 

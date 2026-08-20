@@ -43,20 +43,25 @@ MIMO_V25_PRO_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = int(os.environ.get("MIMO_TBO_SERVER_TIMEOUT", "3600"))
 NUM_GSM8K_EXAMPLES = int(os.environ.get("MIMO_TBO_GSM8K_EXAMPLES", "200"))
 NUM_BENCHMARK_PROMPTS = int(os.environ.get("MIMO_TBO_NUM_PROMPTS", "64"))
-PERFORMANCE_INPUT_LEN = int(os.environ.get("MIMO_TBO_INPUT_LEN", "16348"))
+PERFORMANCE_INPUT_LEN = int(os.environ.get("MIMO_TBO_INPUT_LEN", "16384"))
 GSM8K_DATA_PATH = os.environ.get("MIMO_TBO_GSM8K_DATA_PATH")
 SHAREGPT_DATASET_PATH = os.environ.get("MIMO_TBO_SHAREGPT_DATASET", "")
+SPECULATIVE_STEPS = 3
 
 # Portable MI35x gates account for the observed MI350X/MI355X performance gap.
 MIN_GSM8K_ACCURACY = float(os.environ.get("MIMO_TBO_MIN_GSM8K_ACCURACY", "0.95"))
 MIN_ACCEPT_LENGTH = float(os.environ.get("MIMO_TBO_MIN_ACCEPT_LENGTH", "3.0"))
-MIN_ACCEPT_RATE = float(os.environ.get("MIMO_TBO_MIN_ACCEPT_RATE", "0.67"))
+MIN_ACCEPT_RATE = float(
+    os.environ.get(
+        "MIMO_TBO_MIN_ACCEPT_RATE",
+        str((MIN_ACCEPT_LENGTH - 1.0) / SPECULATIVE_STEPS),
+    )
+)
 MIN_INPUT_THROUGHPUT = float(
     os.environ.get("MIMO_TBO_MIN_INPUT_THROUGHPUT", "38000")
 )
 MAX_MEAN_TTFT_MS = float(os.environ.get("MIMO_TBO_MAX_MEAN_TTFT_MS", "1750"))
 
-SPECULATIVE_STEPS = 3
 TBO_LOG_MARKER = "Running MiMo TP8 non-EP prefill TBO"
 FATAL_LOG_PATTERNS = (
     r"Scheduler hit an exception",

@@ -80,6 +80,9 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
+from sglang.srt.models.mimo_v2_utils import (
+    supports_native_mimo_vectorized_v_cache,
+)
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -126,6 +129,49 @@ def _mimo_moe_inputs(hidden_states):
         normalized, quantized, scale = hidden_states
         return normalized, (quantized, scale)
     return hidden_states, hidden_states
+
+
+def _mimo_needs_v_padding(
+    *,
+    head_dim: int,
+    v_head_dim: int,
+    num_kv_heads: int,
+    server_args,
+    force_v_pad: bool,
+) -> bool:
+    if (
+        head_dim == v_head_dim
+        or server_args is None
+        or server_args.attention_backend != "aiter"
+    ):
+        return False
+
+    native_aiter_v_cache = (
+        not force_v_pad
+        and head_dim == 192
+        and v_head_dim == 128
+        and num_kv_heads == 1
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+    )
+    return not native_aiter_v_cache
+
+
+def _mimo_model_uses_native_v_cache(*, config, server_args) -> bool:
+    """Use the same model-wide native-V128 contract as SWAKVPool allocation."""
+    if server_args is None:
+        return False
+
+    attention_tp_size = get_attention_tp_size()
+    return supports_native_mimo_vectorized_v_cache(
+        attention_backend=server_args.attention_backend,
+        kv_cache_layout=envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower(),
+        head_dim=config.head_dim,
+        swa_head_dim=getattr(config, "swa_head_dim", None),
+        v_head_dim=getattr(config, "v_head_dim", None),
+        swa_v_head_dim=getattr(config, "swa_v_head_dim", None),
+        full_num_kv_heads=max(1, config.num_key_value_heads // attention_tp_size),
+        swa_num_kv_heads=max(1, config.swa_num_key_value_heads // attention_tp_size),
+    )
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -514,6 +560,7 @@ class MiMoV2Attention(nn.Module):
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         partial_rotary_factor: float = 1.0,
+        force_v_pad: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -538,10 +585,12 @@ class MiMoV2Attention(nn.Module):
         self.head_dim = head_dim
         self.original_v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         server_args = get_global_server_args()
-        self.needs_v_pad = (
-            self.original_v_head_dim != self.head_dim
-            and server_args is not None
-            and server_args.attention_backend == "aiter"
+        self.needs_v_pad = _mimo_needs_v_padding(
+            head_dim=self.head_dim,
+            v_head_dim=self.original_v_head_dim,
+            num_kv_heads=self.num_kv_heads,
+            server_args=server_args,
+            force_v_pad=force_v_pad,
         )
         self.v_head_dim = (
             self.head_dim if self.needs_v_pad else self.original_v_head_dim
@@ -600,9 +649,9 @@ class MiMoV2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        # Preserve the unpadded projected-V width for attention backends.  The
-        # AITER ABI sees padded D192, while the MiMo-specific FlyDSL kernel may
-        # safely compute only this guaranteed-zero-tail D128 prefix.
+        # Preserve the checkpoint's projected-V width as an explicit MiMo
+        # marker. The supported AITER SHUFFLE-5D target route stores native
+        # D128; unsupported AITER/NHD routes still expose padded D192.
         self.attn.mimo_original_v_head_dim = self.original_v_head_dim
 
         self.attention_sink_bias = (
@@ -721,6 +770,10 @@ class MiMoV2DecoderLayer(nn.Module):
             "context_len",
             getattr(config, "max_position_embeddings", 32768),
         )
+        force_v_pad = not _mimo_model_uses_native_v_cache(
+            config=config,
+            server_args=get_global_server_args(),
+        )
 
         if self.is_swa_layer():
             self.self_attn = MiMoV2Attention(
@@ -741,6 +794,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                force_v_pad=force_v_pad,
                 prefix=add_prefix("self_attn", prefix),
             )
         else:
@@ -762,6 +816,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                force_v_pad=force_v_pad,
                 prefix=add_prefix("self_attn", prefix),
             )
 

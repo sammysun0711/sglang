@@ -67,6 +67,8 @@ from sglang.srt.layers.attention.aiter_utils import (
     FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE,
     FLYDSL_MIMO_HEAD_DIM,
     FLYDSL_MIMO_KV_HEADS,
+    FLYDSL_MIMO_VALUE_HEAD_DIM,
+    can_build_mimo_paged_kv_metadata,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
     forward_target_verify_flydsl_5d,
@@ -390,10 +392,16 @@ class AiterAttnBackend(AttentionBackend):
                 "maximum context must not exceed 1,048,576 tokens, got "
                 f"{self.max_context_len}"
             )
-        if (self.num_head, self.num_kv_head, self.head_dim) != (16, 1, 192):
+        if (
+            self.num_head,
+            self.num_kv_head,
+            self.head_dim,
+            self.v_head_dim,
+        ) != (16, 1, FLYDSL_MIMO_HEAD_DIM, FLYDSL_MIMO_VALUE_HEAD_DIM):
             incompatibilities.append(
-                "TP-local shape must be 16Q/1KV/head-192, got "
-                f"{self.num_head}Q/{self.num_kv_head}KV/head-{self.head_dim}"
+                "TP-local shape must be 16Q/1KV/QK192/V128, got "
+                f"{self.num_head}Q/{self.num_kv_head}KV/"
+                f"QK{self.head_dim}/V{self.v_head_dim}"
             )
         if self.input_dtype != torch.bfloat16:
             incompatibilities.append(
@@ -452,7 +460,7 @@ class AiterAttnBackend(AttentionBackend):
         )
         self._flydsl_pa_decode_psum = torch.empty_like(self._flydsl_pa_decode_pmax)
         self._flydsl_pa_decode_pout = torch.empty(
-            scalar_numel * FLYDSL_MIMO_HEAD_DIM,
+            scalar_numel * FLYDSL_MIMO_VALUE_HEAD_DIM,
             dtype=torch.bfloat16,
             device=self.device,
         )
@@ -470,11 +478,12 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self._flydsl_compile_pa_decode_tile(
-            head_dim=192,
+            head_dim=FLYDSL_MIMO_HEAD_DIM,
+            v_head_dim=FLYDSL_MIMO_VALUE_HEAD_DIM,
             query_group_size=16,
             block_size=64,
             num_partitions=self._flydsl_pa_decode_num_partitions,
-            softmax_scale=192**-0.5,
+            softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
             query_dtype="bf16",
             per_token_kv=False,
             query_length=4,
@@ -485,7 +494,7 @@ class AiterAttnBackend(AttentionBackend):
             max_context_partition_num=self._flydsl_pa_decode_num_partitions,
             query_seq_len=4,
             query_group_size=16,
-            head_size=192,
+            head_size=FLYDSL_MIMO_VALUE_HEAD_DIM,
             output_dtype_str="bf16",
             logits_dtype_str="bf16",
         )
@@ -3033,14 +3042,14 @@ class AiterIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
 
-            if (
-                self.attn_backend.kv_cache_is_vectorized_5d
-                and self.attn_backend.page_size == 64
-                and self.data_type == fp8_dtype
-                and self.q_data_type == torch.bfloat16
-                and self.num_qo_heads == 16
-                and self.num_kv_heads == 1
-                and self.head_dim == 192
+            if can_build_mimo_paged_kv_metadata(
+                self.attn_backend.kv_cache_is_vectorized_5d,
+                self.attn_backend.page_size,
+                self.data_type,
+                self.q_data_type,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
             ):
                 page_size = self.attn_backend.page_size
                 page_lens = torch.div(

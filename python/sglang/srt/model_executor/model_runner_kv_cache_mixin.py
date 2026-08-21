@@ -37,6 +37,9 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.models.mimo_v2_utils import (
+    supports_native_mimo_vectorized_v_cache,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -78,6 +81,27 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+def _use_native_mimo_vectorized_v_cache(
+    *,
+    model_config,
+    text_config,
+    attention_backend: str,
+    kv_cache_layout: str,
+    tensor_parallel_size: int,
+) -> bool:
+    """Match the MiMo attention layer's supported native-V128 contract."""
+    return supports_native_mimo_vectorized_v_cache(
+        attention_backend=attention_backend,
+        kv_cache_layout=kv_cache_layout,
+        head_dim=model_config.head_dim,
+        swa_head_dim=getattr(text_config, "swa_head_dim", None),
+        v_head_dim=getattr(text_config, "v_head_dim", None),
+        swa_v_head_dim=getattr(text_config, "swa_v_head_dim", None),
+        full_num_kv_heads=model_config.get_num_kv_heads(tensor_parallel_size),
+        swa_num_kv_heads=model_config.get_swa_num_kv_heads(tensor_parallel_size),
+    )
 
 
 class ModelRunnerKVCacheMixin:
@@ -339,6 +363,18 @@ class ModelRunnerKVCacheMixin:
         # local to draft MHA pools; the target pool continues to follow the
         # environment setting.
         mha_kv_cache_layout = self._get_mha_kv_cache_layout_override()
+        effective_mha_kv_cache_layout = (
+            mha_kv_cache_layout
+            or envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().strip().lower()
+        )
+        text_config = self.model_config.hf_text_config
+        native_mimo_v_cache = _use_native_mimo_vectorized_v_cache(
+            model_config=self.model_config,
+            text_config=text_config,
+            attention_backend=self.server_args.attention_backend,
+            kv_cache_layout=effective_mha_kv_cache_layout,
+            tensor_parallel_size=get_attention_tp_size(),
+        )
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -546,7 +582,10 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
-                    if self.server_args.attention_backend == "aiter":
+                    if (
+                        self.server_args.attention_backend == "aiter"
+                        and not native_mimo_v_cache
+                    ):
                         kwargs["swa_v_head_dim"] = (
                             self.model_config.hf_text_config.swa_head_dim
                         )
@@ -674,9 +713,12 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
-                    # Aiter paged kernels require K/V to have matching head dims.
-                    # The model zero-pads V from v_head_dim to head_dim before caching.
-                    if self.server_args.attention_backend == "aiter":
+                    # AITER/NHD kernels require matching K/V widths. The
+                    # MiMo target's SHUFFLE-5D route instead stores native V128.
+                    if (
+                        self.server_args.attention_backend == "aiter"
+                        and not native_mimo_v_cache
+                    ):
                         kwargs["swa_v_head_dim"] = (
                             self.model_config.hf_text_config.swa_head_dim
                         )

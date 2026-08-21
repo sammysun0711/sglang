@@ -56,8 +56,9 @@ _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 logger = logging.getLogger(__name__)
 
 
-# Matched MI355X A/B showed low-work no-EP TBO overhead at 4K ISL.
-# Use 8K, the first tested non-regressing ISL, as the enablement boundary.
+# Matched MI355X A/B showed that splitting requests with a sub-8K original
+# prompt does not provide enough work to amortize the child kernels and
+# collectives. Use 8K, the first tested non-regressing ISL, as the boundary.
 _MIMO_NO_EP_TBO_MIN_ISL = 8 * 1024
 
 
@@ -66,6 +67,7 @@ _MIMO_NO_EP_TBO_MIN_ISL = 8 * 1024
 # ranks while allowing the compute stream to run the other child's MHA/MoE.
 _tbo_tp_comm_streams = {}
 _tbo_tp_events = {}
+_tbo_tp_warmup_devices = set()
 
 
 def _get_tbo_tp_comm_stream(device: torch.device) -> torch.cuda.Stream:
@@ -141,6 +143,40 @@ def wait_tbo_tp_all_reduce(handle):
         output_tensor.record_stream(compute_stream)
     del input_tensor
     return output_tensor
+
+
+def warmup_tbo_tp_all_reduces(
+    device: torch.device,
+    groups,
+) -> None:
+    """Initialize TP-only TBO collectives on their production stream.
+
+    A short server warmup may be ineligible for TBO, but its ordinary
+    all-reduces would otherwise initialize RCCL on the compute stream first.
+    On MI355X that permanently reduced later TBO overlap for long prefills.
+    Prime both attention and expert TP groups before the first model forward.
+    """
+
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    if device_index in _tbo_tp_warmup_devices:
+        return
+
+    for group_name, group in groups:
+        warmup_tensor = torch.zeros(1, device=device)
+        output_tensor = wait_tbo_tp_all_reduce(
+            launch_tbo_tp_all_reduce(
+                warmup_tensor,
+                group=group,
+                event_key=("startup_warmup", group_name),
+            )
+        )
+        del output_tensor
+
+    torch.cuda.current_stream(device).synchronize()
+    _tbo_tp_warmup_devices.add(device_index)
+    logger.info("Warmed TP-only TBO collectives on device %s", device)
 
 
 # -------------------------------- Compute Basic Info ---------------------------------------
@@ -464,11 +500,17 @@ def is_no_a2a_tbo_eligible_batch(local_batch: Optional[ScheduleBatch]) -> bool:
     ):
         return False
 
-    seq_lens_cpu = getattr(local_batch, "seq_lens_cpu", None)
-    if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+    reqs = getattr(local_batch, "reqs", None)
+    if not reqs:
         return False
 
-    return min(int(seq_len) for seq_len in seq_lens_cpu) >= _MIMO_NO_EP_TBO_MIN_ISL
+    # seq_lens_cpu is the amount admitted by the scheduler in this iteration,
+    # not the request ISL. With a 16K chunk budget and concurrency four, four
+    # 64K prompts can each temporarily report only 4K here. Gate on the stable
+    # request-level prompt length so chunking cannot disable TBO for long ISLs.
+    return all(
+        len(req.origin_input_ids) >= _MIMO_NO_EP_TBO_MIN_ISL for req in reqs
+    )
 
 
 class TboDPAttentionPreparer:

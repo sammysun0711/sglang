@@ -1211,7 +1211,8 @@ class MiMoV2Model(nn.Module):
                 )
                 self._logged_no_ep_tbo = True
             elif (
-                forward_batch.can_run_tbo
+                not run_tbo
+                and forward_batch.can_run_tbo
                 and not self._logged_no_ep_tbo_fallback
             ):
                 logger.info(

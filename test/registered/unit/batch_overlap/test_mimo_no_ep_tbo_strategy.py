@@ -129,9 +129,13 @@ class _FakeStream:
     def __init__(self, name):
         self.name = name
         self.waited_events = []
+        self.synchronize_count = 0
 
     def wait_event(self, event):
         self.waited_events.append(event)
+
+    def synchronize(self):
+        self.synchronize_count += 1
 
 
 class _FakeGroup:
@@ -293,6 +297,69 @@ def test_mimo_no_ep_tbo_reuses_stream_and_events_for_out_of_place_ar():
     two_batch_overlap._tbo_tp_events.clear()
 
 
+def test_mimo_no_ep_tbo_warms_each_tp_group_once_on_production_stream():
+    two_batch_overlap._tbo_tp_warmup_devices.clear()
+    compute_stream = _FakeStream("compute")
+    device = _FakeDevice()
+    attention_group = object()
+    expert_group = object()
+    warmup_tensors = [_FakeTensor(), _FakeTensor()]
+    launched_handles = [object(), object()]
+    waited_outputs = [object(), object()]
+
+    with (
+        patch.object(
+            two_batch_overlap.torch,
+            "zeros",
+            side_effect=warmup_tensors,
+        ) as zeros,
+        patch.object(
+            two_batch_overlap,
+            "launch_tbo_tp_all_reduce",
+            side_effect=launched_handles,
+        ) as launch,
+        patch.object(
+            two_batch_overlap,
+            "wait_tbo_tp_all_reduce",
+            side_effect=waited_outputs,
+        ) as wait,
+        patch.object(
+            two_batch_overlap.torch.cuda,
+            "current_stream",
+            return_value=compute_stream,
+        ),
+    ):
+        groups = (
+            ("attention", attention_group),
+            ("expert", expert_group),
+        )
+        two_batch_overlap.warmup_tbo_tp_all_reduces(device, groups)
+        two_batch_overlap.warmup_tbo_tp_all_reduces(device, groups)
+
+    assert zeros.call_count == 2
+    assert [call.kwargs for call in zeros.call_args_list] == [
+        {"device": device},
+        {"device": device},
+    ]
+    assert launch.call_args_list[0].args == (warmup_tensors[0],)
+    assert launch.call_args_list[0].kwargs == {
+        "group": attention_group,
+        "event_key": ("startup_warmup", "attention"),
+    }
+    assert launch.call_args_list[1].args == (warmup_tensors[1],)
+    assert launch.call_args_list[1].kwargs == {
+        "group": expert_group,
+        "event_key": ("startup_warmup", "expert"),
+    }
+    assert [call.args for call in wait.call_args_list] == [
+        (launched_handles[0],),
+        (launched_handles[1],),
+    ]
+    assert compute_stream.synchronize_count == 1
+
+    two_batch_overlap._tbo_tp_warmup_devices.clear()
+
+
 def test_mimo_no_ep_tbo_in_place_ar_does_not_record_stream():
     two_batch_overlap._tbo_tp_comm_streams.clear()
     two_batch_overlap._tbo_tp_events.clear()
@@ -431,7 +498,7 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         spec_info=None,
-        seq_lens_cpu=[8192],
+        reqs=[SimpleNamespace(origin_input_ids=range(8192))],
     )
     adapter = SimpleNamespace(
         server_args=SimpleNamespace(
@@ -450,21 +517,29 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
 
 
 @pytest.mark.parametrize(
-    ("seq_lens_cpu", "expected"),
+    ("prompt_lens", "seq_lens_cpu", "expected"),
     [
-        ([8191], False),
-        ([8192], True),
-        ([16384], True),
-        ([8192, 4096], False),
-        ([], False),
-        (None, False),
+        ([8191], [8191], False),
+        ([8192], [4096], True),
+        ([16384], [4096], True),
+        ([65536, 65536, 65536, 65536], [4096, 4096, 4096, 4096], True),
+        ([8192, 4096], [4096, 4096], False),
+        ([], [], False),
+        (None, None, False),
     ],
 )
-def test_no_a2a_tbo_requires_all_sequences_to_reach_8k(seq_lens_cpu, expected):
+def test_no_a2a_tbo_uses_original_isl_instead_of_chunk_length(
+    prompt_lens, seq_lens_cpu, expected
+):
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         spec_info=None,
         seq_lens_cpu=seq_lens_cpu,
+        reqs=(
+            [SimpleNamespace(origin_input_ids=range(length)) for length in prompt_lens]
+            if prompt_lens is not None
+            else None
+        ),
     )
 
     assert two_batch_overlap.is_no_a2a_tbo_eligible_batch(batch) is expected
@@ -475,6 +550,7 @@ def test_tbo_does_not_force_scheduler_split_metadata_for_sub_8k_prefill():
         forward_mode=ForwardMode.EXTEND,
         spec_info=None,
         seq_lens_cpu=[8191],
+        reqs=[SimpleNamespace(origin_input_ids=range(8191))],
         global_num_tokens=[8191],
         global_num_tokens_for_logprob=[1],
         tbo_split_seq_index=1,

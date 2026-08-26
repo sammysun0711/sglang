@@ -840,6 +840,55 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
 
+class TestMiMoNoEpTboArgs(CustomTestCase):
+    @staticmethod
+    def _make_server_args(moe_layer_freq):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_two_batch_overlap=True,
+            moe_a2a_backend="none",
+            tp_size=8,
+            dp_size=1,
+            ep_size=1,
+            pp_size=1,
+            attn_cp_size=1,
+            enable_dp_attention=False,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["MiMoV2ForCausalLM"],
+            num_hidden_layers=len(moe_layer_freq),
+            moe_layer_freq=moe_layer_freq,
+        )
+        server_args.get_model_config = lambda: SimpleNamespace(hf_config=hf_config)
+        return server_args
+
+    def test_accepts_one_dense_then_moe_layout(self):
+        server_args = self._make_server_args([0] + [1] * 69)
+        server_args._validate_two_batch_overlap()
+
+    def test_rejects_sparse_layer_zero(self):
+        server_args = self._make_server_args([1, 1, 1, 1])
+        with self.assertRaisesRegex(ValueError, "dense layer 0"):
+            server_args._validate_two_batch_overlap()
+
+    def test_rejects_later_dense_layer(self):
+        server_args = self._make_server_args([0, 1, 0, 1])
+        with self.assertRaisesRegex(ValueError, "followed only by MoE layers"):
+            server_args._validate_two_batch_overlap()
+
+    def test_rejects_aiter_allreduce_fusion(self):
+        server_args = self._make_server_args([0] + [1] * 69)
+        server_args.enable_aiter_allreduce_fusion = True
+        with self.assertRaisesRegex(ValueError, "AITER all-reduce fusion"):
+            server_args._validate_two_batch_overlap()
+
+    def test_rejects_pdmux(self):
+        server_args = self._make_server_args([0] + [1] * 69)
+        server_args.enable_pdmux = True
+        with self.assertRaisesRegex(ValueError, "PD-Multiplexing"):
+            server_args._validate_two_batch_overlap()
+
+
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
 

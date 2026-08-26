@@ -4,18 +4,27 @@ set -euo pipefail
 # 1P1D prefill benchmark
 read -r -a TOKEN_LIST <<< "${TOKEN_LIST_OVERRIDE:-4096 8192 16384 32768 65536 131068 262144 524284 786428 1047548}"
 output_tokens=1
+small_input_concurrency_list="${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_CONCURRENCY_LIST_OVERRIDE:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32}}"
 short_concurrency_list="${SHORT_CONCURRENCY_LIST_OVERRIDE:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16}"
 long_concurrency_list="${LONG_CONCURRENCY_LIST_OVERRIDE:-1}"
 warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
+small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-64}"
 prompt_waves="${PROMPT_WAVES:-4}"
 min_num_prompts="${MIN_NUM_PROMPTS:-32}"
 LOG_DIR="${LOG_DIR:-./logs/benchmark_tp8_prefill}"
 mkdir -p "$LOG_DIR"
 
+if ! [[ "${small_input_num_prompts}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SMALL_INPUT_NUM_PROMPTS_OVERRIDE must be a positive integer, observed '${small_input_num_prompts}'" >&2
+  exit 2
+fi
+
 concurrency_spec_for_input() {
   local input_tokens="$1"
   if [[ -n "${CONCURRENCY_LIST_OVERRIDE:-}" ]]; then
     echo "${CONCURRENCY_LIST_OVERRIDE}"
+  elif (( input_tokens <= 8192 )); then
+    echo "${small_input_concurrency_list}"
   elif (( input_tokens <= 65536 )); then
     echo "${short_concurrency_list}"
   else
@@ -31,6 +40,8 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
     run=1 # only run one round
     if [[ -n "${NUM_PROMPTS_OVERRIDE:-}" ]]; then
       num_prompts="${NUM_PROMPTS_OVERRIDE}"
+    elif (( input_tokens <= 8192 )); then
+      num_prompts="${small_input_num_prompts}"
     else
       num_prompts=$((prompt_waves * concurrency))
       if (( num_prompts < min_num_prompts )); then

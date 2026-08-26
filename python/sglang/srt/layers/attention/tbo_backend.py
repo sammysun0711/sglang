@@ -9,20 +9,31 @@ if TYPE_CHECKING:
 
 
 class TboAttnBackend(AttentionBackend):
-    def __init__(self, primary: AttentionBackend, children: List[AttentionBackend]):
+    def __init__(
+        self,
+        primary: AttentionBackend,
+        children: List[AttentionBackend],
+        enable_cuda_graph_children: bool = True,
+    ):
         super().__init__()
         self.primary = primary
         self.children = children
+        self.enable_cuda_graph_children = enable_cuda_graph_children
         # Dispatcher aliases the primary's pool refs so get_attn_backend()
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
 
     @classmethod
-    def init_new(cls, creator: Callable[[], AttentionBackend]):
+    def init_new(
+        cls,
+        creator: Callable[[], AttentionBackend],
+        enable_cuda_graph_children: bool = True,
+    ):
         return cls(
             primary=creator(),
             children=[creator() for _ in range(2)],
+            enable_cuda_graph_children=enable_cuda_graph_children,
         )
 
     def init_forward_metadata_out_graph(
@@ -35,15 +46,16 @@ class TboAttnBackend(AttentionBackend):
         )
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
-            for child, forward_batch_child in zip(
-                self.children, tbo_children, strict=True
-            ):
-                if forward_batch_child.batch_size > 0:
-                    child.init_forward_metadata_out_graph(
-                        forward_batch=forward_batch_child, in_capture=in_capture
-                    )
+            if not in_capture or self.enable_cuda_graph_children:
+                for child, forward_batch_child in zip(
+                    self.children, tbo_children, strict=True
+                ):
+                    if forward_batch_child.batch_size > 0:
+                        child.init_forward_metadata_out_graph(
+                            forward_batch=forward_batch_child, in_capture=in_capture
+                        )
             return
-        if in_capture:
+        if in_capture or not self.enable_cuda_graph_children:
             return
         # Replay path: build_replay_fb_view returns a SimpleNamespace and
         # tbo_plugin.replay_prepare does not call prepare_raw, so split the
@@ -98,7 +110,7 @@ class TboAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
         tbo_children = getattr(forward_batch, "tbo_children", None)
-        if tbo_children is not None:
+        if self.enable_cuda_graph_children and tbo_children is not None:
             for child, forward_batch_child in zip(
                 self.children, tbo_children, strict=True
             ):
@@ -118,19 +130,22 @@ class TboAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
-        for item in self.children:
-            # TODO for children, maybe can provide *smaller* max_bs to optimize
-            item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
+        if self.enable_cuda_graph_children:
+            for item in self.children:
+                # TODO for children, maybe can provide *smaller* max_bs to optimize
+                item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
 
     def on_after_cuda_graph_warmup(self):
         self.primary.on_after_cuda_graph_warmup()
-        for child in self.children:
-            child.on_after_cuda_graph_warmup()
+        if self.enable_cuda_graph_children:
+            for child in self.children:
+                child.on_after_cuda_graph_warmup()
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
-        for child in self.children:
-            assert ans == child.get_cuda_graph_seq_len_fill_value()
+        if self.enable_cuda_graph_children:
+            for child in self.children:
+                assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
 
     def forward(self, *args, **kwargs):

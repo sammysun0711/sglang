@@ -29,6 +29,7 @@ export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+export ENABLE_TWO_BATCH_OVERLAP="${ENABLE_TWO_BATCH_OVERLAP:-0}"
 
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT="${SGLANG_MIMO_FUSED_RMS_MOE_QUANT:-1}"
 export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-1}"
@@ -44,7 +45,7 @@ export LOG_DIR="${LOG_DIR:-./logs/accuracy_${RUN_ID}}"
 export LOG_FILE="${LOG_FILE:-server_tp8_flydsl_accuracy.log}"
 
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
-echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, overlap=enabled"
+echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
 
@@ -64,6 +65,11 @@ if [[ "${DISABLE_CUSTOM_ALL_REDUCE:-0}" == "1" ]]; then
 fi
 
 echo "Custom all-reduce: ${custom_all_reduce_status}"
+
+tbo_args=()
+if [[ "${ENABLE_TWO_BATCH_OVERLAP}" == "1" ]]; then
+  tbo_args+=(--enable-two-batch-overlap)
+fi
 
 radix_cache_args=()
 radix_cache_status=enabled
@@ -97,6 +103,7 @@ python3 -u -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --enable-multi-layer-eagle \
+  "${tbo_args[@]}" \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \
   "${custom_all_reduce_args[@]}" \

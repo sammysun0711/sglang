@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    TboDPAttentionPreparer,
+    is_no_a2a_tbo_eligible_batch,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -296,7 +299,35 @@ class SchedulerDPAttnAdapter:
             batch: The batch to process
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
-        if need_sync if need_sync is not None else self.get_require_mlp_sync():
+        should_prepare = (
+            need_sync if need_sync is not None else self.get_require_mlp_sync()
+        )
+        # TP-only TBO still needs the lightweight metadata all-gather that
+        # computes a rank-consistent split and global forward mode, even though
+        # DP attention and MLP gathered buffers are both disabled.
+        if (
+            self.server_args.enable_two_batch_overlap
+            and self.server_args.moe_a2a_backend == "none"
+        ):
+            if is_no_a2a_tbo_eligible_batch(batch):
+                should_prepare = True
+            elif batch is not None:
+                # ScheduleBatch objects move from prefill into the running
+                # decode batch.  The TP-only TBO prefill preparation above
+                # writes MLP-sync/TBO metadata onto that object even though
+                # DP attention is disabled.  If the next decode or
+                # speculative-verification step skips preparation, those
+                # prefill values leak into ForwardBatch construction (most
+                # notably global_num_tokens and tbo_split_seq_index) and can
+                # make EAGLE CUDA-graph replay see inconsistent batch/token
+                # shapes.  Restore the ordinary no-DP state whenever the
+                # current batch is outside the supported plain-EXTEND path.
+                batch.global_num_tokens = None
+                batch.global_num_tokens_for_logprob = None
+                batch.tbo_split_seq_index = None
+                batch.global_forward_mode = None
+                batch.is_extend_in_batch = batch.forward_mode.is_extend()
+        if should_prepare:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 

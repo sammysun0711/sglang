@@ -7783,6 +7783,57 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
         return self._mamba_cache_chunk_size
 
+    def _validate_two_batch_overlap(self):
+        if not (self.enable_two_batch_overlap and self.moe_a2a_backend == "none"):
+            return
+
+        hf_config = self.get_model_config().hf_config
+        architectures = getattr(hf_config, "architectures", None) or []
+        model_arch = architectures[0] if architectures else None
+        supports_mimo_tp8_no_ep_tbo = (
+            model_arch == "MiMoV2ForCausalLM"
+            and self.tp_size == 8
+            and self.dp_size == 1
+            and self.ep_size == 1
+            and self.pp_size == 1
+            and self.attn_cp_size == 1
+            and not self.enable_dp_attention
+        )
+        if not supports_mimo_tp8_no_ep_tbo:
+            raise ValueError(
+                "Two batch overlap with moe_a2a_backend='none' is currently "
+                "supported only for MiMoV2ForCausalLM with TP8/DP1/EP1/PP1 "
+                "and no attention context parallelism."
+            )
+
+        if self.enable_pdmux:
+            raise ValueError(
+                "MiMoV2 two batch overlap with moe_a2a_backend='none' is "
+                "incompatible with PD-Multiplexing."
+            )
+
+        if self.enable_aiter_allreduce_fusion:
+            raise ValueError(
+                "MiMoV2 two batch overlap with moe_a2a_backend='none' is "
+                "incompatible with AITER all-reduce fusion."
+            )
+
+        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+        moe_layer_freq = getattr(hf_config, "moe_layer_freq", None)
+        supports_layer_layout = (
+            isinstance(num_hidden_layers, int)
+            and num_hidden_layers >= 2
+            and isinstance(moe_layer_freq, (list, tuple))
+            and len(moe_layer_freq) == num_hidden_layers
+            and not bool(moe_layer_freq[0])
+            and all(bool(is_moe) for is_moe in moe_layer_freq[1:])
+        )
+        if not supports_layer_layout:
+            raise ValueError(
+                "MiMoV2 two batch overlap with moe_a2a_backend='none' requires "
+                "dense layer 0 followed only by MoE layers."
+            )
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -7931,10 +7982,7 @@ class ServerArgs:
             )
 
         # Check two batch overlap
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
-            raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
-            )
+        self._validate_two_batch_overlap()
 
         # Check communications compression
         if self.enable_quant_communications and self.tp_size == 1:

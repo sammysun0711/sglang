@@ -35,6 +35,7 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.jit_kernel.ngram_embedding import update_token_table_decode
+from sglang.srt.batch_overlap.two_batch_overlap import warmup_tbo_tp_all_reduces
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -1251,6 +1252,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
+            if (
+                self.server_args.enable_two_batch_overlap
+                and self.server_args.moe_a2a_backend == "none"
+                and not self.is_draft_worker
+            ):
+                warmup_tbo_tp_all_reduces(
+                    device=torch.device(self.device),
+                    groups=(
+                        ("attention", get_attention_tp_group()),
+                        ("expert", get_tp_group()),
+                    ),
+                )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
@@ -2411,7 +2424,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.decode_attn_backend_group.append(self._get_attention_backend())
             self.decode_attn_backend = self.decode_attn_backend_group[0]
         elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
-            self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+            self.attn_backend = TboAttnBackend.init_new(
+                self._get_attention_backend,
+                enable_cuda_graph_children=(self.server_args.moe_a2a_backend != "none"),
+            )
         else:
             self.attn_backend = self._get_attention_backend()
 

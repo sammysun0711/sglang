@@ -519,8 +519,8 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
 @pytest.mark.parametrize(
     ("prompt_lens", "seq_lens_cpu", "expected"),
     [
-        ([8191], [8191], False),
-        ([8192], [4096], True),
+        ([7999], [7999], False),
+        ([8000], [4000], True),
         ([16384], [4096], True),
         ([65536, 65536, 65536, 65536], [4096, 4096, 4096, 4096], True),
         ([8192, 4096], [4096, 4096], False),
@@ -545,13 +545,13 @@ def test_no_a2a_tbo_uses_original_isl_instead_of_chunk_length(
     assert two_batch_overlap.is_no_a2a_tbo_eligible_batch(batch) is expected
 
 
-def test_tbo_does_not_force_scheduler_split_metadata_for_sub_8k_prefill():
+def test_tbo_does_not_force_scheduler_split_metadata_below_minimum_isl():
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         spec_info=None,
-        seq_lens_cpu=[8191],
-        reqs=[SimpleNamespace(origin_input_ids=range(8191))],
-        global_num_tokens=[8191],
+        seq_lens_cpu=[7999],
+        reqs=[SimpleNamespace(origin_input_ids=range(7999))],
+        global_num_tokens=[7999],
         global_num_tokens_for_logprob=[1],
         tbo_split_seq_index=1,
         global_forward_mode=ForwardMode.EXTEND,
@@ -564,7 +564,7 @@ def test_tbo_does_not_force_scheduler_split_metadata_for_sub_8k_prefill():
         ),
         get_require_mlp_sync=lambda: False,
         prepare_mlp_sync_batch=lambda _: pytest.fail(
-            "sub-8K TP-only prefill must not be split"
+            "below-threshold TP-only prefill must not be split"
         ),
     )
 

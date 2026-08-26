@@ -7806,6 +7806,12 @@ class ServerArgs:
                 "and no attention context parallelism."
             )
 
+        if self.enable_pdmux:
+            raise ValueError(
+                "MiMoV2 two batch overlap with moe_a2a_backend='none' is "
+                "incompatible with PD-Multiplexing."
+            )
+
         if self.enable_aiter_allreduce_fusion:
             raise ValueError(
                 "MiMoV2 two batch overlap with moe_a2a_backend='none' is "

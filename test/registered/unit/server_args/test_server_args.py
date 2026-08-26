@@ -882,6 +882,12 @@ class TestMiMoNoEpTboArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "AITER all-reduce fusion"):
             server_args._validate_two_batch_overlap()
 
+    def test_rejects_pdmux(self):
+        server_args = self._make_server_args([0] + [1] * 69)
+        server_args.enable_pdmux = True
+        with self.assertRaisesRegex(ValueError, "PD-Multiplexing"):
+            server_args._validate_two_batch_overlap()
+
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.

@@ -390,6 +390,7 @@ class MiMoV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
@@ -410,6 +411,7 @@ class MiMoV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
 
@@ -534,8 +536,13 @@ class MiMoV2MoE(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
+            hidden_states = state.pop("hidden_states_mlp_input")
+            if get_moe_a2a_backend().is_mori():
+                # The split TBO path bypasses MoriEPDispatcher.dispatch(),
+                # which normally records this length for combine output slicing.
+                state.num_tokens = _mimo_hidden_num_tokens(hidden_states)
             self.experts.dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
+                hidden_states=hidden_states,
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
@@ -569,7 +576,10 @@ class MiMoV2MoE(nn.Module):
             )
 
     def op_output(self, state):
-        state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
+        final_hidden_states = state.pop("hidden_states_after_combine")
+        if get_moe_a2a_backend().is_mori():
+            final_hidden_states = final_hidden_states[: state.pop("num_tokens")]
+        state.hidden_states_mlp_output = final_hidden_states
 
 
 class MiMoV2Attention(nn.Module):

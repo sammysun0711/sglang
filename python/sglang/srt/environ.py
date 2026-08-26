@@ -244,6 +244,9 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    # Minimum original request input length eligible for MiMo TP-only TBO.
+    # Kept slightly below nominal 8K to tolerate text decode/re-tokenize drift.
+    SGLANG_TBO_MIM_SEQ_LEN = EnvInt(8000)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_NVTX"
     )

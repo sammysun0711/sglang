@@ -1,11 +1,14 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import requests
 
+import sglang.srt.batch_overlap.two_batch_overlap as two_batch_overlap
 from sglang.srt.batch_overlap.two_batch_overlap import (
     compute_split_seq_index,
     compute_split_token_index,
+    is_no_a2a_tbo_eligible_batch,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -76,6 +79,23 @@ class TestTwoBatchOverlap(unittest.TestCase):
 
 
 class TestTwoBatchOverlapUnitTest(unittest.TestCase):
+    def test_mimo_no_ep_tbo_min_isl_boundary(self):
+        def make_batch(*input_lengths):
+            return SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                spec_info=None,
+                reqs=[
+                    SimpleNamespace(origin_input_ids=[0] * input_length)
+                    for input_length in input_lengths
+                ],
+            )
+
+        with patch.object(two_batch_overlap, "_MIMO_NO_EP_TBO_MIN_ISL", 8000):
+            self.assertTrue(is_no_a2a_tbo_eligible_batch(make_batch(8000)))
+            self.assertTrue(is_no_a2a_tbo_eligible_batch(make_batch(8000, 8192)))
+            self.assertFalse(is_no_a2a_tbo_eligible_batch(make_batch(7999)))
+            self.assertFalse(is_no_a2a_tbo_eligible_batch(make_batch(8192, 7999)))
+
     def test_compute_split_seq_and_token_index(self):
         for num_tokens, expect in [
             (0, 0),

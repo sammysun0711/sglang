@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations import (
     execute_overlapped_operations,
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -56,10 +57,16 @@ _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 logger = logging.getLogger(__name__)
 
 
-# Matched MI355X A/B showed that splitting requests with a sub-8K original
-# prompt does not provide enough work to amortize the child kernels and
-# collectives. Use 8K, the first tested non-regressing ISL, as the boundary.
-_MIMO_NO_EP_TBO_MIN_ISL = 8 * 1024
+# Matched MI355X A/B showed that very short requests do not provide enough work
+# to amortize TBO child kernels and collectives. The default is slightly below
+# nominal 8K so text decode/re-tokenize drift does not accidentally disable TBO.
+# Platforms can override the launch-time policy with SGLANG_TBO_MIM_SEQ_LEN.
+_MIMO_NO_EP_TBO_MIN_ISL = envs.SGLANG_TBO_MIM_SEQ_LEN.get()
+if _MIMO_NO_EP_TBO_MIN_ISL <= 0:
+    raise ValueError(
+        "SGLANG_TBO_MIM_SEQ_LEN must be a positive integer, "
+        f"got {_MIMO_NO_EP_TBO_MIN_ISL}"
+    )
 
 
 # TP-only MiMo TBO uses one ordered communication stream for both children.

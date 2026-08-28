@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # launch_router.sh — SGLang PD router
 #
 # Run this on the PREFILL node after both P and D servers are ready.

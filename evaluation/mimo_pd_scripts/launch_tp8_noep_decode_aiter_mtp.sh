@@ -16,7 +16,8 @@ export HSA_NO_SCRATCH_RECLAIM=1
 export SGLANG_HOST_IP="${SGLANG_HOST_IP:-172.16.1.122}"
 export HOST_IP="${HOST_IP:-${SGLANG_HOST_IP}}"
 export MC_GID_INDEX="${MC_GID_INDEX:-1}"
-export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-mlx5_ib0,mlx5_ib1,mlx5_ib2,mlx5_ib3,mlx5_ib4,mlx5_ib5,mlx5_ib6,mlx5_ib7}"
+#export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-mlx5_ib0,mlx5_ib1,mlx5_ib2,mlx5_ib3,mlx5_ib4,mlx5_ib5,mlx5_ib6,mlx5_ib7}"
+export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-rocep121s0,rocep9s0,rocep105s0,rocep25s0,rocep249s0,rocep137s0,rocep233s0,rocep153s0}"
 export MC_TE_METRIC=1
 
 export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=12

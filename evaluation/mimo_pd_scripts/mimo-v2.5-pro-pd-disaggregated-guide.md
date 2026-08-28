@@ -53,9 +53,10 @@ ibv_devinfo -v | head -30
 git clone https://github.com/sammysun0711/llm-distributed-inference.git
 cd llm-distributed-inference/sglang/
 # On node 0, create remote ssh access in prefill container to node 1 decode container and vice versa
+```bash
 ./scripts/setup_docker_passwdless_ssh.sh mi355-gpu-16 
 ```
-# checkout that node0 and node1 can access via ssh without password.
+checkout that node 0 and node 1 can access via ssh without password.
 ```shell
 ssh mi355-gpu-16
 ```

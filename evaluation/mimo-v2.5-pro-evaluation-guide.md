@@ -120,3 +120,6 @@ Follow up customer's swe-bench accuracy verification guide.
 
 ## 10. H200 performance evaluation
 Follow up customer's shared performance data
+
+## 11. Run prefill/decode disaggregated deployment
+Please refer to the [PD disaggregated guide](mimo_pd_scripts/mimo-v2.5-pro-pd-disaggregated-guide.md).

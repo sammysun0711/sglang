@@ -1203,10 +1203,25 @@ class MHATokenToKVPool(KVCache):
             v_size_bytes += get_tensor_size_bytes(v_cache)
         return k_size_bytes, v_size_bytes
 
+    def _disagg_page_nbytes(self, buf: torch.Tensor) -> int:
+        """Bytes in one paged KV slot for disagg RDMA.
+
+        NHD is token-major: ``buf[0]`` is one token, so one page is
+        ``buf[0].nbytes * page_size``.
+
+        ``vectorized_5d`` is page-major: ``buf[0]`` is already one page
+        (K: ``(H, Dk//X, page, X)``, V: ``(H, page//X, Dv, X)``).
+        Multiplying by ``page_size`` again makes Mooncake stride
+        ``page_index * (page_size * page_bytes)``, which overshoots
+        registered MRs and blacklists the decode session.
+        """
+        if getattr(self, "kv_cache_layout", "nhd") == "vectorized_5d":
+            return int(buf[0].nbytes)
+        return int(buf[0].nbytes * self.page_size)
+
     # for disagg
     def get_contiguous_buf_infos(self):
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
+        # NHD: [seq_len, head_num, head_dim] or 5D page-major blocks.
         kv_data_ptrs = [
             self._get_key_buffer(i).data_ptr()
             for i in range(self.start_layer, self.start_layer + self.layer_num)
@@ -1222,10 +1237,10 @@ class MHATokenToKVPool(KVCache):
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
+            self._disagg_page_nbytes(self._get_key_buffer(i))
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
+            self._disagg_page_nbytes(self._get_value_buffer(i))
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens

@@ -2412,6 +2412,11 @@ class ServerArgs:
         "Choose the computation precision of flashinfer mxfp4 moe",
         NS("exec.moe"),
     ] = "default"
+    aiter_mxfp4_stage2_output_dtype: A[
+        Literal["auto", "fp8", "bf16"],
+        "Choose the AITER OPUS MXFP4 stage-2 route-output dtype. Auto preserves AITER's tuned selection; FP8 is faster; BF16 improves numerical agreement before route reduction. Non-OPUS EP kernels retain their native final-BF16 output.",
+        NS("exec.moe"),
+    ] = "auto"
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",

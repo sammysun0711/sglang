@@ -93,6 +93,20 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_aiter_mxfp4_stage2_output_dtype(self):
+        default_args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(default_args.aiter_mxfp4_stage2_output_dtype, "auto")
+
+        bf16_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--aiter-mxfp4-stage2-output-dtype",
+                "bf16",
+            ]
+        )
+        self.assertEqual(bf16_args.aiter_mxfp4_stage2_output_dtype, "bf16")
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",

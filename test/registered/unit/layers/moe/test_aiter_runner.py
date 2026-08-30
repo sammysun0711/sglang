@@ -17,6 +17,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
+@pytest.fixture(autouse=True)
+def _clear_aiter_signature_caches():
+    yield
+    aiter_runner._aiter_fused_moe_supports_no_combine.cache_clear()
+    aiter_runner._aiter_fused_moe_supports_ep_route_convention.cache_clear()
+    aiter_runner._aiter_fused_moe_supports_opus_stage2_output_dtype.cache_clear()
+
+
 def _runner_input():
     topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
     return AiterRunnerInput(
@@ -113,6 +121,176 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+def test_aiter_runner_forwards_gate_layout_for_native_mxfp4(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(is_fp4_experts=True),
+        running_state={},
+    )
+
+    assert captured["gate_mode"] == "INTERLEAVE"
+    assert "swiglu_limit" not in captured
+
+
+@pytest.mark.parametrize("output_dtype", ["auto", "fp8", "bf16"])
+def test_aiter_runner_selects_opus_stage2_output(monkeypatch, output_dtype):
+    captured = {}
+
+    def fused_moe(*, opus_stage2_output_dtype="auto", **kwargs):
+        captured.update(kwargs)
+        captured["opus_stage2_output_dtype"] = opus_stage2_output_dtype
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    aiter_runner._aiter_fused_moe_supports_opus_stage2_output_dtype.cache_clear()
+    monkeypatch.setattr(
+        aiter_runner, "_aiter_mxfp4_stage2_output_dtype", lambda: output_dtype
+    )
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(is_fp4_experts=True),
+        running_state={},
+    )
+
+    assert captured["opus_stage2_output_dtype"] == output_dtype
+
+
+def test_aiter_runner_keeps_native_bf16_output_for_ep(monkeypatch):
+    captured = {}
+
+    def fused_moe(*, opus_stage2_output_dtype="auto", ep_has_fake_route=True, **kwargs):
+        captured.update(kwargs)
+        captured["opus_stage2_output_dtype"] = opus_stage2_output_dtype
+        captured["ep_has_fake_route"] = ep_has_fake_route
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    aiter_runner._aiter_fused_moe_supports_ep_route_convention.cache_clear()
+    monkeypatch.setattr(
+        aiter_runner, "_aiter_mxfp4_stage2_output_dtype", lambda: "bf16"
+    )
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", top_k=2))
+    expert_mask = torch.tensor([1, 1, 0], dtype=torch.int32)
+
+    runner.run(
+        _runner_input(),
+        _quant_info(is_fp4_experts=True, expert_mask=expert_mask),
+        running_state={},
+    )
+
+    assert captured["opus_stage2_output_dtype"] == "auto"
+    assert captured["ep_has_fake_route"] is False
+
+
+def test_aiter_runner_rejects_bf16_opus_stage2_with_legacy_aiter(monkeypatch):
+    def fused_moe(**kwargs):
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    aiter_runner._aiter_fused_moe_supports_opus_stage2_output_dtype.cache_clear()
+    monkeypatch.setattr(
+        aiter_runner, "_aiter_mxfp4_stage2_output_dtype", lambda: "bf16"
+    )
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    with pytest.raises(NotImplementedError, match="opus_stage2_output_dtype"):
+        runner.run(
+            _runner_input(),
+            _quant_info(is_fp4_experts=True),
+            running_state={},
+        )
+
+
+def test_mori_keeps_mxfp8_dispatch_for_native_mxfp4():
+    hidden_states = torch.zeros((4, 64), dtype=torch.float8_e4m3fn)
+    hidden_states_scale = torch.ones((4, 2), dtype=torch.float8_e8m0fnu)
+    topk_ids = torch.zeros((4, 2), dtype=torch.int32)
+    topk_weights = torch.ones((4, 2), dtype=torch.float32)
+    num_local_tokens = torch.tensor([3], dtype=torch.int32)
+    dispatch_output = SimpleNamespace(
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        num_recv_tokens_per_expert=num_local_tokens,
+        origin_topk_ids=topk_ids,
+        origin_topk_weights=topk_weights,
+        out_dtype=torch.bfloat16,
+    )
+
+    output = aiter_runner._pre_permute_deepep_to_aiter(
+        dispatch_output,
+        _quant_info(is_fp4_experts=True),
+        MoeRunnerConfig(num_local_experts=2),
+        running_state={},
+    )
+
+    assert output.hidden_states is hidden_states
+    assert output.a1_scale is hidden_states_scale
+    assert output.quant_type == AiterQuantType.PER_1X32
+    assert output.num_local_tokens is num_local_tokens
+
+
+def test_aiter_runner_uses_routed_only_ep_contract_when_supported(monkeypatch):
+    captured = {}
+
+    def fused_moe(*, ep_has_fake_route=True, **kwargs):
+        captured.update(kwargs)
+        captured["ep_has_fake_route"] = ep_has_fake_route
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    aiter_runner._aiter_fused_moe_supports_ep_route_convention.cache_clear()
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", top_k=2))
+    expert_mask = torch.tensor([1, 1, 0], dtype=torch.int32)
+
+    runner.run(
+        _runner_input(),
+        _quant_info(expert_mask=expert_mask),
+        running_state={},
+    )
+
+    assert captured["topk_ids"].shape[-1] == 2
+    assert captured["topk_weight"].shape[-1] == 2
+    assert captured["expert_mask"] is expert_mask
+    assert captured["ep_has_fake_route"] is False
+
+
+def test_aiter_runner_adds_ep_tuning_sentinel_for_legacy_aiter(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    aiter_runner._aiter_fused_moe_supports_ep_route_convention.cache_clear()
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", top_k=2))
+    expert_mask = torch.tensor([1, 1, 0], dtype=torch.int32)
+
+    runner.run(
+        _runner_input(),
+        _quant_info(expert_mask=expert_mask),
+        running_state={},
+    )
+
+    assert captured["topk_ids"].shape[-1] == 3
+    assert captured["topk_ids"][0, -1].item() == expert_mask.numel()
+    assert captured["topk_weight"][0, -1].item() == 0
+    assert captured["expert_mask"].tolist() == [1, 1, 0, 0]
 
 
 if __name__ == "__main__":

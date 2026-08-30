@@ -3,8 +3,12 @@ kernel bit-exactness, vocab-parallel draft sampler select, host seq-lens
 upper bound, hybrid needs_cpu_seq_lens delegation, filter_batch host
 keep-list."""
 
+import contextlib
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -145,6 +149,245 @@ class TestDflashDraftSamplerVocabParallel(CustomTestCase):
             world=2,
             dtype=torch.float32,
             weight=weight,
+        )
+
+
+class TestDflashTargetHiddenPadding(CustomTestCase):
+    def test_trims_only_trailing_dp_padding_rows(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        captured = {}
+
+        def project_target_hidden(hidden):
+            captured["projected"] = hidden.clone()
+            return hidden
+
+        def append_sequential(**kwargs):
+            captured["append"] = kwargs
+
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(device=torch.device("cpu")),
+            draft_model_runner=SimpleNamespace(tp_group=object()),
+            draft_tp_context=lambda group: contextlib.nullcontext(),
+            draft_model=SimpleNamespace(project_target_hidden=project_target_hidden),
+            _use_fused_kv_materialize=False,
+            _fused_kv_helper=None,
+            _append_target_hidden_sequential=append_sequential,
+        )
+        hidden = torch.arange(24, dtype=torch.float32).view(6, 4)
+        cache_loc = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+        positions = torch.tensor([20, 21, 22, 23], dtype=torch.int64)
+
+        DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc(
+            worker,
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+        )
+
+        torch.testing.assert_close(captured["projected"], hidden[:4])
+        torch.testing.assert_close(captured["append"]["ctx_hidden"], hidden[:4])
+        torch.testing.assert_close(captured["append"]["ctx_cache_loc"], cache_loc)
+        torch.testing.assert_close(captured["append"]["ctx_positions"], positions)
+        self.assertTrue(worker._logged_dp_padding_trim)
+
+    def test_rejects_missing_hidden_rows(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        worker = SimpleNamespace()
+        with self.assertRaisesRegex(ValueError, "cache_loc length mismatch"):
+            DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc(
+                worker,
+                target_hidden=torch.zeros((3, 4)),
+                cache_loc=torch.arange(4),
+                positions=torch.arange(4),
+            )
+
+
+class TestDflashMaskEmbedding(CustomTestCase):
+    def _worker(self, draft_path: Path, embed: torch.nn.Embedding, mask_token_id: int):
+        model = SimpleNamespace(get_input_embeddings=lambda: embed)
+        return SimpleNamespace(
+            server_args=SimpleNamespace(speculative_draft_model_path=str(draft_path)),
+            device=torch.device("cpu"),
+            _mask_token_id=mask_token_id,
+            target_worker=SimpleNamespace(model_runner=SimpleNamespace(model=model)),
+            ps=SimpleNamespace(tp_rank=0),
+        )
+
+    def test_merges_checkpoint_mask_embedding(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            mask_token_id = 3
+            trained = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16)
+            torch.save(
+                {"mask_token_id": mask_token_id, "embedding": trained},
+                tmp_path / "mask_embedding.pt",
+            )
+            embed = torch.nn.Embedding(8, 4, dtype=torch.bfloat16)
+            before = embed.weight.detach().clone()
+            worker = self._worker(tmp_path, embed, mask_token_id)
+
+            DFlashWorkerV2._maybe_merge_trained_mask_embedding(worker)
+
+            torch.testing.assert_close(embed.weight[mask_token_id], trained)
+            torch.testing.assert_close(
+                embed.weight[:mask_token_id], before[:mask_token_id]
+            )
+            torch.testing.assert_close(
+                embed.weight[mask_token_id + 1 :], before[mask_token_id + 1 :]
+            )
+            self.assertIsNone(worker._per_position_mask_embeddings)
+
+    def test_rejects_checkpoint_mask_token_mismatch(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            torch.save(
+                {"mask_token_id": 4, "embedding": torch.ones(4)},
+                tmp_path / "mask_embedding.pt",
+            )
+            worker = self._worker(tmp_path, torch.nn.Embedding(8, 4), mask_token_id=3)
+            with self.assertRaisesRegex(ValueError, "mask token mismatch"):
+                DFlashWorkerV2._maybe_merge_trained_mask_embedding(worker)
+
+
+class TestDflashDpAttentionSetup(CustomTestCase):
+    def test_server_args_allow_dflash_with_dp_attention(self):
+        from sglang.srt.arg_groups.speculative_hook import _handle_dflash
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_draft_model_path = "dummy-draft"
+        args.speculative_num_draft_tokens = 8
+        args.device = "cuda"
+        args.pp_size = 1
+        args.enable_dp_attention = True
+
+        _handle_dflash(args)
+
+    def test_unsharded_embedding_is_cached_without_collective(self):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+        embed = torch.nn.Embedding(8, 4)
+        worker = SimpleNamespace(
+            _full_embed_gpu=None,
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model=SimpleNamespace(get_input_embeddings=lambda: embed),
+                    model_config=SimpleNamespace(vocab_size=7),
+                )
+            ),
+            ps=SimpleNamespace(tp_rank=0),
+        )
+        parallel = SimpleNamespace(enable_dp_attention=True)
+        with mock.patch.object(worker_mod, "get_parallel", return_value=parallel):
+            worker_mod.DFlashWorkerV2._cache_full_embed_weight(worker)
+
+        self.assertEqual(tuple(worker._full_embed_gpu.shape), (7, 4))
+        self.assertEqual(worker._full_embed_gpu.data_ptr(), embed.weight.data_ptr())
+
+    def test_sharded_embedding_is_replicated_across_attention_tp(self):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+        local = torch.arange(8, dtype=torch.float32).view(4, 2)
+        remote = torch.arange(8, 16, dtype=torch.float32).view(4, 2)
+        embed = SimpleNamespace(
+            weight=torch.nn.Parameter(local.clone()),
+            shard_indices=SimpleNamespace(num_org_elements=4),
+        )
+        group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=0,
+            ranks=[0, 1],
+            device_group=object(),
+        )
+        worker = SimpleNamespace(
+            _full_embed_gpu=None,
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model=SimpleNamespace(get_input_embeddings=lambda: embed),
+                    model_config=SimpleNamespace(vocab_size=8),
+                )
+            ),
+            ps=SimpleNamespace(tp_rank=0),
+        )
+        parallel = SimpleNamespace(enable_dp_attention=True, attn_tp_group=group)
+
+        def broadcast(part, src, group):
+            del group
+            if src == 1:
+                part.copy_(remote)
+
+        with mock.patch.object(
+            worker_mod, "get_parallel", return_value=parallel
+        ), mock.patch("torch.distributed.broadcast", side_effect=broadcast):
+            worker_mod.DFlashWorkerV2._cache_full_embed_weight(worker)
+
+        torch.testing.assert_close(
+            worker._full_embed_gpu, torch.cat((local, remote), dim=0)
+        )
+
+    def test_draft_backend_initialization_uses_draft_tp_context(self):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+        events = []
+
+        class Context:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, *_args):
+                events.append("exit")
+
+        worker = SimpleNamespace(
+            draft_tp_context=lambda group: Context(),
+            draft_model_runner=SimpleNamespace(tp_group=object()),
+            _draft_worker=SimpleNamespace(
+                init_attention_backends=lambda: events.append("init")
+            ),
+            model_runner=SimpleNamespace(model_config=SimpleNamespace()),
+        )
+
+        with mock.patch.object(worker_mod, "mambaish_config", return_value=None):
+            worker_mod.DFlashWorkerV2.init_attention_backends(worker)
+        self.assertEqual(events, ["enter", "init", "exit"])
+
+    def test_idle_dp_rank_runs_target_verify_collectives(self):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+        prepared = object()
+        target_worker = SimpleNamespace(
+            forward_batch_generation=mock.Mock(return_value=object())
+        )
+        worker = SimpleNamespace(
+            device=torch.device("cpu"),
+            block_size=8,
+            target_worker=target_worker,
+        )
+        batch = object()
+
+        with mock.patch.object(
+            worker_mod,
+            "get_parallel",
+            return_value=SimpleNamespace(enable_dp_attention=True),
+        ), mock.patch.object(
+            worker_mod.DFlashVerifyInput,
+            "prepare_for_verify",
+            return_value=(prepared, False),
+        ) as prepare:
+            worker_mod.DFlashWorkerV2._run_idle_dp_target_verify(worker, batch)
+
+        prepare.assert_called_once_with(batch, target_worker)
+        target_worker.forward_batch_generation.assert_called_once_with(
+            batch=None,
+            forward_batch=prepared,
+            is_verify=True,
+            skip_attn_backend_init=True,
         )
 
 

@@ -113,6 +113,12 @@ def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionTy
 def _get_dflash_layer_attention_params(
     config, layer_id: int
 ) -> Tuple[int, AttentionType]:
+    draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
+    if draft_cfg.use_swa:
+        sliding_window_size = get_dflash_attention_sliding_window_size(config)
+        assert sliding_window_size is not None
+        return sliding_window_size, AttentionType.ENCODER_ONLY
+
     layer_types = get_dflash_layer_types(config)
     if layer_types is None:
         return -1, AttentionType.ENCODER_ONLY
@@ -200,6 +206,9 @@ class DFlashAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
         rope_theta, rope_scaling = get_rope_config(config)
+        draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
+        if draft_cfg.backbone_rotary_base is not None:
+            rope_theta = draft_cfg.backbone_rotary_base
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
@@ -213,6 +222,7 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
         )
 
         self.scaling = head_dim**-0.5
@@ -226,8 +236,17 @@ class DFlashAttention(nn.Module):
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
+        self.v_scale = draft_cfg.attention_value_scale
         self.attention_sink_bias = None
-        if is_nemotron_35_draft_config(config) and bool(
+        if draft_cfg.attention_sink_bias:
+            self.attention_sink_bias = nn.Parameter(
+                torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
+            )
+            set_weight_attrs(
+                self.attention_sink_bias,
+                {"weight_loader": sharded_weight_loader(0)},
+            )
+        elif is_nemotron_35_draft_config(config) and bool(
             getattr(config, "attention_sink_bias", False)
         ):
             draft_attention_backend = get_spec().speculative_draft_attention_backend
@@ -302,6 +321,8 @@ class DFlashAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             q, k = self.rotary_emb(positions, q, k)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         if self.attention_sink_bias is None:
             attn_output = self.attn(q, k, v, forward_batch)
         else:

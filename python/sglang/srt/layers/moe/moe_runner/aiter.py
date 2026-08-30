@@ -63,6 +63,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     hidden_pad: int = 0
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
+    is_fp4_experts: bool = False
     fused_moe_kwargs: Optional[dict[str, Any]] = None
 
 
@@ -270,8 +271,9 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
-        elif quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
+        elif quant_info.swiglu_limit > 0 or quant_info.is_fp4_experts:
+            # Native MXFP4 weights use the configured gate/up shuffle regardless
+            # of whether the activation has a clamp.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
             # lives elsewhere / is absent.
@@ -287,7 +289,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
-            extra["swiglu_limit"] = quant_info.swiglu_limit
+            if quant_info.swiglu_limit > 0:
+                extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
 

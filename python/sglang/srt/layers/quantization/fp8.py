@@ -151,6 +151,7 @@ if _use_aiter:
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+MXFP4_BLOCK_SIZE = 32
 
 logger = logging.getLogger(__name__)
 
@@ -235,12 +236,18 @@ class Fp8Config(QuantizationConfig):
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
+        store_dtype: str = "fp8",
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.dequant_fp4_to_fp8 = False
+        if store_dtype not in ("fp8", "mxfp4"):
+            raise ValueError(f"Unsupported FP8 checkpoint store_dtype={store_dtype!r}")
+        if store_dtype == "mxfp4" and not is_checkpoint_fp8_serialized:
+            raise ValueError("store_dtype='mxfp4' requires an FP8-serialized checkpoint")
+        self.store_dtype = store_dtype
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -326,6 +333,7 @@ class Fp8Config(QuantizationConfig):
         kv_cache_quant_algo = cls.get_from_keys_or(
             config, ["kv_cache_quant_algo"], None
         )
+        store_dtype = cls.get_from_keys_or(config, ["store_dtype"], "fp8")
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
             if weight_block_size is not None and weight_block_size != [1, 32]:
@@ -342,6 +350,7 @@ class Fp8Config(QuantizationConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
             kv_cache_quant_algo=kv_cache_quant_algo,
+            store_dtype=store_dtype,
         )
 
     def get_quant_method(
@@ -383,7 +392,11 @@ class Fp8Config(QuantizationConfig):
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
                 assert (
                     get_moe_runner_backend().is_auto()
-                ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                    or get_moe_runner_backend().is_aiter()
+                ), (
+                    f"{get_moe_runner_backend()} is not compatible with "
+                    "SGLANG_DSV4_FP4_DEQUANT=1"
+                )
                 return fp8_method
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
@@ -1183,12 +1196,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHTS
         if is_fp4_expert:
+            fp4_storage_dtype = (
+                torch.uint8
+                if getattr(quant_config, "store_dtype", "fp8") == "mxfp4"
+                else torch.int8
+            )
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
                     w13_num_shards * intermediate_size_per_partition,
                     hidden_size // 2,
-                    dtype=torch.int8,
+                    dtype=fp4_storage_dtype,
                 ),
                 requires_grad=False,
             )
@@ -1197,7 +1215,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition // 2,
-                    dtype=torch.int8,
+                    dtype=fp4_storage_dtype,
                 ),
                 requires_grad=False,
             )
@@ -1422,6 +1440,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             use_mxfp8=self.use_mxfp8,
             is_checkpoint_fp8_serialized=self.quant_config.is_checkpoint_fp8_serialized,
             is_fp4_expert=self.is_fp4_expert,
+            fp4_scale_dtype=(
+                torch.uint8 if self.quant_config.store_dtype == "mxfp4" else None
+            ),
             params_dtype=params_dtype,
             with_bias=with_bias,
             **extra_weight_attrs,
@@ -1435,10 +1456,45 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.is_fp4_expert and self.dequant_fp4_to_fp8:
+            from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+            from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
+            for weight_param, scale_param in [
+                (layer.w13_weight, layer.w13_weight_scale_inv),
+                (layer.w2_weight, layer.w2_weight_scale_inv),
+            ]:
+                num_experts = weight_param.shape[0]
+                new_weights = []
+                new_scales = []
+                for e in range(num_experts):
+                    weight_bf16 = MXFP4QuantizeUtil.dequantize(
+                        weight_param.data[e].view(torch.uint8),
+                        dtype=torch.bfloat16,
+                        scale=scale_param.data[e].view(torch.uint8),
+                        block_sizes=[MXFP4_BLOCK_SIZE],
+                    )
+                    weight, scale = per_block_cast_to_fp8(weight_bf16)
+                    new_weights.append(weight)
+                    new_scales.append(scale)
+                weight_param.data = torch.stack(new_weights)
+                scale_param.data = torch.stack(new_scales).float()
+                scale_param.format_ue8m0 = False
+            self.is_fp4_expert = False
+            logger.warning_once("Dequantized FP4 expert weights to FP8.")
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
+
+            if self.quant_config.store_dtype == "mxfp4":
+                layer.w13_weight_scale_inv.data = (
+                    layer.w13_weight_scale_inv.data.view(torch.float8_e8m0fnu)
+                )
+                layer.w2_weight_scale_inv.data = layer.w2_weight_scale_inv.data.view(
+                    torch.float8_e8m0fnu
+                )
 
             # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
             # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
@@ -1641,26 +1697,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
-
-            if self.is_fp4_expert and self.dequant_fp4_to_fp8:
-                for weight_param, scale_param in [
-                    (layer.w13_weight, layer.w13_weight_scale_inv),
-                    (layer.w2_weight, layer.w2_weight_scale_inv),
-                ]:
-                    num_experts = weight_param.shape[0]
-                    new_weights = []
-                    new_scales = []
-                    for e in range(num_experts):
-                        w, s = cast_e2m1fn_to_e4m3fn(
-                            weight_param.data[e], scale_param.data[e]
-                        )
-                        new_weights.append(w)
-                        new_scales.append(s)
-                    weight_param.data = torch.stack(new_weights)
-                    scale_param.data = torch.stack(new_scales).float()
-                    scale_param.format_ue8m0 = False
-                self.is_fp4_expert = False
-                logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
                 if get_moe_runner_backend().is_marlin():
@@ -2719,6 +2755,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            is_fp4_experts=self.is_fp4_expert,
         )
 
 

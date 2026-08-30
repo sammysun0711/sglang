@@ -118,6 +118,16 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def is_mimo_v2_mxfp4(config) -> bool:
+    quantization_config = _quant_config_to_dict(_hf_attr(config, "quantization_config"))
+    return (
+        _hf_arch(config) in MIMO_V2_MODEL_ARCHS
+        and isinstance(quantization_config, dict)
+        and quantization_config.get("quant_method") == "fp8"
+        and quantization_config.get("store_dtype") == "mxfp4"
+    )
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -406,7 +416,9 @@ class ModelConfig:
         routed_experts_quant_method = quantization_config.get(
             "routed_experts_quant_method"
         )
-        self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
+        self.is_fp4_experts: bool = (
+            routed_experts_quant_method == "mxfp4" or is_mimo_v2_mxfp4(self.hf_config)
+        )
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
 

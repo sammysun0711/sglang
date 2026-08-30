@@ -113,6 +113,36 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
 
         self._assert_activation_params_absent(layer)
 
+    def test_mxfp4_checkpoint_uses_raw_byte_storage(self):
+        """Packed E2M1 weights and E8M0 exponents must not be numerically cast."""
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            is_fp4_experts=True,
+            store_dtype="mxfp4",
+        )
+        method = Fp8MoEMethod(config)
+        layer = torch.nn.Module()
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+
+        with patch(
+            "sglang.srt.layers.quantization.fp8.get_parallel",
+            return_value=SimpleNamespace(tp_size=1),
+        ):
+            method.create_weights(
+                layer=layer,
+                num_experts=2,
+                hidden_size=128,
+                intermediate_size_per_partition=128,
+                params_dtype=torch.bfloat16,
+            )
+
+        self.assertEqual(layer.w13_weight.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight.dtype, torch.uint8)
+        self.assertEqual(layer.w13_weight_scale_inv.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight_scale_inv.dtype, torch.uint8)
+
 
 if __name__ == "__main__":
     unittest.main()

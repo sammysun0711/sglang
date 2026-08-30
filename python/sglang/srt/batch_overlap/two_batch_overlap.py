@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import dataclasses
 import logging
 from dataclasses import replace
@@ -73,8 +74,113 @@ if _MIMO_NO_EP_TBO_MIN_ISL <= 0:
 # Keeping all collectives on one stream preserves identical RCCL ordering across
 # ranks while allowing the compute stream to run the other child's MHA/MoE.
 _tbo_tp_comm_streams = {}
+_tbo_tp_compute_streams = {}
+_tbo_tp_cu_splits = {}
 _tbo_tp_events = {}
 _tbo_tp_warmup_devices = set()
+_hip_lib = None
+
+
+def _load_hip():
+    global _hip_lib
+    if _hip_lib is None:
+        lib = ctypes.CDLL("/opt/rocm/lib/libamdhip64.so")
+        lib.hipExtStreamCreateWithCUMask.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.hipExtStreamCreateWithCUMask.restype = ctypes.c_int
+        _hip_lib = lib
+    return _hip_lib
+
+
+def _make_cu_mask(start: int, count: int, n_cu: int):
+    nwords = (n_cu + 31) // 32
+    mask = (ctypes.c_uint32 * nwords)()
+    for i in range(start, min(start + count, n_cu)):
+        if i < 0:
+            continue
+        word = i // 32
+        mask[word] = ctypes.c_uint32(int(mask[word]) | (1 << (i % 32)))
+    return nwords, mask
+
+
+def _create_cu_masked_stream(
+    device_index: int, start: int, count: int, n_cu: int
+) -> torch.cuda.Stream:
+    hip = _load_hip()
+    nwords, mask = _make_cu_mask(start, count, n_cu)
+    raw = ctypes.c_void_p()
+    with torch.cuda.device(device_index):
+        err = hip.hipExtStreamCreateWithCUMask(ctypes.byref(raw), nwords, mask)
+        if err != 0:
+            raise RuntimeError(f"hipExtStreamCreateWithCUMask failed: {err}")
+        stream = torch.cuda.ExternalStream(
+            raw.value, device=torch.device(f"cuda:{device_index}")
+        )
+    stream._tbo_hip_raw = raw  # keep HIP handle alive
+    return stream
+
+
+def _tbo_compute_cu_count() -> int:
+    return int(envs.SGLANG_TBO_COMPUTE_CUS.get())
+
+
+def _resolve_tbo_cu_split(n_cu: int, requested_compute: int):
+    """Map a requested compute CU count to a complementary (compute, comm) split.
+
+    Returns None when CU masking is off or the request cannot leave at least
+    one CU for the RCCL stream. Recommended serving value is 240 (240/64 on
+    MI300X 304 CU; also legal on gfx950 256 CU as 240/16).
+    """
+    if requested_compute <= 0 or n_cu <= 1:
+        return None
+    n_compute = min(int(requested_compute), n_cu - 1)
+    if n_compute <= 0 or n_compute >= n_cu:
+        return None
+    return n_compute, n_cu - n_compute
+
+
+def _get_tbo_cu_split(device_index: int):
+    if device_index in _tbo_tp_cu_splits:
+        return _tbo_tp_cu_splits[device_index]
+    n_cu = torch.cuda.get_device_properties(device_index).multi_processor_count
+    split = _resolve_tbo_cu_split(n_cu, _tbo_compute_cu_count())
+    _tbo_tp_cu_splits[device_index] = split
+    if split is not None:
+        n_compute, n_comm = split
+        logger.info(
+            "TBO CU split on device %s: compute %s / comm %s (requested %s, %s CUs)",
+            device_index,
+            n_compute,
+            n_comm,
+            _tbo_compute_cu_count(),
+            n_cu,
+        )
+    return split
+
+
+def _get_tbo_compute_stream(device: torch.device):
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    split = _get_tbo_cu_split(device_index)
+    if split is None:
+        return None
+    stream = _tbo_tp_compute_streams.get(device_index)
+    if stream is None:
+        n_cu = torch.cuda.get_device_properties(device_index).multi_processor_count
+        n_compute, _n_comm = split
+        stream = _create_cu_masked_stream(device_index, 0, n_compute, n_cu)
+        _tbo_tp_compute_streams[device_index] = stream
+        logger.info(
+            "Initialized TP-only TBO compute stream on device %s with CUs 0-%s / %s",
+            device,
+            n_compute - 1,
+            n_cu,
+        )
+    return stream
 
 
 def _get_tbo_tp_comm_stream(device: torch.device) -> torch.cuda.Stream:
@@ -83,10 +189,27 @@ def _get_tbo_tp_comm_stream(device: torch.device) -> torch.cuda.Stream:
     )
     stream = _tbo_tp_comm_streams.get(device_index)
     if stream is None:
+        n_cu = torch.cuda.get_device_properties(device_index).multi_processor_count
+        split = _get_tbo_cu_split(device_index)
         with torch.cuda.device(device_index):
-            stream = torch.cuda.Stream(device=device_index)
+            if split is not None:
+                _n_compute, n_comm = split
+                start = n_cu - n_comm
+                stream = _create_cu_masked_stream(device_index, start, n_comm, n_cu)
+                logger.info(
+                    "Initialized TP-only TBO communication stream on device %s "
+                    "with CUs %s-%s",
+                    device,
+                    start,
+                    n_cu - 1,
+                )
+            else:
+                stream = torch.cuda.Stream(device=device_index)
+                logger.info(
+                    "Initialized TP-only TBO communication stream on device %s",
+                    device,
+                )
         _tbo_tp_comm_streams[device_index] = stream
-        logger.info("Initialized TP-only TBO communication stream on device %s", device)
     return stream
 
 
@@ -1052,6 +1175,7 @@ def _model_forward_tbo(
         layer_input_scatter_mode=layer_input_scatter_mode,
     )
     original_hidden_states_len = inputs["hidden_states"].shape[0]
+    device = inputs["hidden_states"].device
     del inputs
 
     context = (
@@ -1061,13 +1185,23 @@ def _model_forward_tbo(
             operations_strategy.deep_gemm_num_sms
         )
     )
+    compute_stream = _get_tbo_compute_stream(device) if _is_hip else None
 
     with context:
-        outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
-        )
+        if compute_stream is None:
+            outputs_arr = execute_overlapped_operations(
+                inputs_arr=inputs_arr,
+                operations_arr=[operations_strategy.operations] * 2,
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
+        else:
+            with torch.cuda.stream(compute_stream):
+                outputs_arr = execute_overlapped_operations(
+                    inputs_arr=inputs_arr,
+                    operations_arr=[operations_strategy.operations] * 2,
+                    delta_stages=[0, operations_strategy.tbo_delta_stages],
+                )
+            torch.cuda.current_stream(device).wait_stream(compute_stream)
 
     return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
 

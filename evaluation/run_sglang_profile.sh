@@ -17,6 +17,10 @@ export SGLANG_TORCH_PROFILER_DIR="${profile_output_dir}"
 
 echo "Profiling input=${input_tokens}, output=${output_tokens}, concurrency=${max_concurrency}, prompts=${num_prompts}, warmups=${warmup_requests}"
 echo "Profile output: ${profile_output_dir}"
+dataset_args=()
+if [[ -n "${dataset_path}" && -s "${dataset_path}" ]]; then
+  dataset_args+=(--dataset-path "${dataset_path}")
+fi
 #--profile-activities GPU \
 python3 -m sglang.bench_serving \
     --backend sglang \
@@ -27,12 +31,13 @@ python3 -m sglang.bench_serving \
     --random-input-len ${input_tokens} \
     --random-output-len ${output_tokens} \
     --random-range-ratio 1.0 \
-    --dataset-path "${dataset_path}" \
+    "${dataset_args[@]}" \
     --flush-cache \
     --seed 12345 \
     --num-prompts "${num_prompts}" \
     --warmup-requests "${warmup_requests}" \
     --max-concurrency "${max_concurrency}" \
+    ${TOKENIZE_PROMPT:+--tokenize-prompt} \
     --profile \
     --profile-output-dir "${profile_output_dir}" \
     --profile-prefix "${profile_prefix}"

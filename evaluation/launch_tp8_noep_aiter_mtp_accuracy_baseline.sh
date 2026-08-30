@@ -45,9 +45,19 @@ export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 export ENABLE_TWO_BATCH_OVERLAP="${ENABLE_TWO_BATCH_OVERLAP:-0}"
 export SGLANG_TBO_MIM_SEQ_LEN="${SGLANG_TBO_MIM_SEQ_LEN:-8000}"
+# HIP TBO CU mask. 0 = off (default; unmasked compute/RCCL streams).
+# Remaining CUs go to the TBO RCCL stream via hipExtStreamCreateWithCUMask.
+# Recommended when TBO is on:
+#   MI300X (304 CU) / MI325X (256 CU, gfx942): 240
+#   MI35X  (256 CU, gfx950): 240
+export SGLANG_TBO_COMPUTE_CUS="${SGLANG_TBO_COMPUTE_CUS:-0}"
 
 if ! [[ "${SGLANG_TBO_MIM_SEQ_LEN}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SGLANG_TBO_MIM_SEQ_LEN must be a positive integer, observed '${SGLANG_TBO_MIM_SEQ_LEN}'" >&2
+  exit 2
+fi
+if ! [[ "${SGLANG_TBO_COMPUTE_CUS}" =~ ^[0-9]+$ ]]; then
+  echo "SGLANG_TBO_COMPUTE_CUS must be a non-negative integer, observed '${SGLANG_TBO_COMPUTE_CUS}'" >&2
   exit 2
 fi
 
@@ -66,7 +76,7 @@ export LOG_FILE="${LOG_FILE:-server_tp8_flydsl_accuracy.log}"
 
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
 
-echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap=enabled"
+echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, tbo-compute-cus=${SGLANG_TBO_COMPUTE_CUS}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
 
@@ -134,4 +144,5 @@ python3 -u -m sglang.launch_server \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \
   "${custom_all_reduce_args[@]}" \
+  ${EXTRA_SERVER_ARGS:-} \
   2>&1 | tee "${LOG_DIR}/${LOG_FILE}"

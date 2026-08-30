@@ -247,6 +247,11 @@ class Envs:
     # Minimum original request input length eligible for MiMo TP-only TBO.
     # Kept slightly below nominal 8K to tolerate text decode/re-tokenize drift.
     SGLANG_TBO_MIM_SEQ_LEN = EnvInt(8000)
+    # HIP CU count reserved for TBO compute kernels. 0 = no CU mask (default).
+    # Remaining CUs go to the TBO RCCL stream via hipExtStreamCreateWithCUMask.
+    # Recommended when TBO is on: 240 for MI300X (304 CU, 240/64), MI325X
+    # (256 CU gfx942, 240/16), and MI35X (256 CU gfx950, 240/16).
+    SGLANG_TBO_COMPUTE_CUS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_NVTX"
     )

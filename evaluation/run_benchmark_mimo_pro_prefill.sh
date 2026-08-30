@@ -69,6 +69,7 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --num-prompts "${num_prompts}" \
         --warmup-requests "${warmup_requests}" \
         --max-concurrency "${concurrency}" \
+        ${TOKENIZE_PROMPT:+--tokenize-prompt} \
         2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"
     echo -e "============================================================\n"
   done

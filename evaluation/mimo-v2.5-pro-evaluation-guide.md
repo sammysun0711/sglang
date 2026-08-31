@@ -83,7 +83,23 @@ cd /root/workspace/sglang/evaluation
 ```bash
 ./run_benchmark_mimo_pro_prefill.sh
 ```
-## 6. Run baseline single node decode benchmark with fake prefill
+
+## 6. Run TP4/EP4 MORI + TBO accuracy and prefill benchmark
+
+Run the server first, then run either client in another terminal:
+
+> Install EvalScope: `pip install evalscope==1.11.0`
+
+```bash
+# launch server
+./launch_tp4_ep4_aiter_mori_tbo_mtp_accuracy_baseline.sh
+# run accuracy client
+./run_evalscope_gsm8k_accuracy.sh
+# run benchmark client
+./run_benchmark_mimo_pro_prefill.sh
+```
+
+## 7. Run baseline single node decode benchmark with fake prefill
 Baseline fake-prefill decode keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache
 
 ### Launch server
@@ -102,23 +118,23 @@ cd /root/workspace/sglang/evaluation
 python3 analyze_server_output_throughput.py <path-to-server-log>
 ```
 
-## 7. Profiling & Analysis
+## 8. Profiling & Analysis
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sglang_profile.sh
 ```
 
 
-## 8. Run real-MTP ShareGPT dataset accuracy gate
+## 9. Run real-MTP ShareGPT dataset accuracy gate
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sharegpt_mtp_accuracy_test.sh
 ```
 
-## 9. Run swe-bench & accuracy benchmark test
+## 10. Run swe-bench & accuracy benchmark test
 Follow up customer's swe-bench accuracy verification guide.
 
-## 10. H200 performance evaluation
+## 11. H200 performance evaluation
 Follow up customer's shared performance data
 
 ## 11. Run prefill/decode disaggregated deployment

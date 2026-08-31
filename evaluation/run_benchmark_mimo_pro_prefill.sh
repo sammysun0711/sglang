@@ -44,6 +44,7 @@ warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
 small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-${default_small_num_prompts}}"
 prompt_waves="${PROMPT_WAVES:-4}"
 min_num_prompts="${MIN_NUM_PROMPTS:-32}"
+model_path="${MODEL_PATH:-/models/MiMo-V2.5-Pro/}"
 LOG_DIR="${LOG_DIR:-./logs/benchmark_tp8_prefill}"
 
 require_positive_integer() {
@@ -137,10 +138,16 @@ if [[ "${dry_run}" == "0" ]]; then
   mkdir -p "$LOG_DIR"
 fi
 
+results_csv="${LOG_DIR}/results.csv"
+echo "input_tokens,max_concurrency,num_prompts,mean_ttft_ms,input_throughput" > "${results_csv}"
+
 for input_tokens in "${TOKEN_LIST[@]}"; do
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
+
+    json_file="${LOG_DIR}/benchmark_${input_tokens}_con${concurrency}.jsonl"
+    : > "${json_file}"
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${warmup_requests}"
@@ -149,7 +156,7 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
 
     benchmark_cmd=(python3 -m sglang.bench_serving \
         --backend sglang \
-        --model /models/MiMo-V2.5-Pro/ \
+        --model "${model_path}" \
         --host 0.0.0.0 \
         --port 30001 \
         --dataset-name random \
@@ -160,13 +167,19 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --seed 12345 \
         --num-prompts "${num_prompts}" \
         --warmup-requests "${warmup_requests}" \
-        --max-concurrency "${concurrency}")
+        --max-concurrency "${concurrency}") \
+        --tokenize-prompt \
+        --output-file "${json_file}"
     printf 'Command:'
     printf ' %q' "${benchmark_cmd[@]}"
     printf '\n'
     if [[ "${dry_run}" == "0" ]]; then
       "${benchmark_cmd[@]}" 2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"
     fi
+    jq -r --argjson input "${input_tokens}" --argjson concurrency "${concurrency}" \
+      --argjson prompts "${num_prompts}" \
+      '[$input, $concurrency, $prompts, .mean_ttft_ms, .input_throughput] | @csv' \
+      "${json_file}" >> "${results_csv}"
     echo -e "============================================================\n"
   done
 done
@@ -176,3 +189,4 @@ if [[ "${dry_run}" == "1" ]]; then
 else
   echo "All lengths and concurrency tests completed!"
 fi
+echo "Results: ${results_csv}"

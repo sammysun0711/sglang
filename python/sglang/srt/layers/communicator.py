@@ -20,6 +20,10 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.batch_overlap.comm_stream import (
+    TboCommEvents,
+    TboCommStreamPool,
+)
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
@@ -86,8 +90,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_npu,
     is_sm90_supported,
@@ -336,6 +340,24 @@ class AttentionInputs:
                 self.hidden_states_, self.forward_batch
             )
         return self.hidden_states_
+
+
+@dataclass
+class _TboAttnCommState:
+    hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    output_hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    residual: Optional[torch.Tensor]
+    forward_batch: ForwardBatch
+    events: TboCommEvents
+
+
+@dataclass
+class _TboMlpCommState:
+    input_hidden_states: torch.Tensor
+    output_hidden_states: torch.Tensor
+    residual: Optional[torch.Tensor]
+    layernorm: torch.nn.Module
+    events: TboCommEvents
 
 
 class AttnTpContext:
@@ -593,7 +615,7 @@ class LayerCommunicator:
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 
-    def prepare_attn(
+    def _prepare_attn_local(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -738,6 +760,14 @@ class LayerCommunicator:
                             post_residual_addition,
                         )
 
+        return hidden_states, residual
+
+    def _prepare_attn_after_local(
+        self,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ):
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -749,6 +779,111 @@ class LayerCommunicator:
             )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
+
+    def prepare_attn(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        quant_format: str = "",
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        hidden_states, residual = self._prepare_attn_local(
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format,
+            post_residual_addition,
+        )
+        return self._prepare_attn_after_local(
+            hidden_states,
+            residual,
+            forward_batch,
+        )
+
+    def has_tbo_attn_all_gather(self) -> bool:
+        """Whether prepare-attention performs the TP all-gather split by TBO."""
+        return (
+            self._communicate_simple_fn
+            is CommunicateSimpleFn._scattered_to_tp_attn_full
+        )
+
+    def supports_tbo_attn_communication(self) -> bool:
+        """Whether this layer can use MiMo's TBO attention/MLP communication."""
+        prepare_mlp_fn = self._communicate_with_all_reduce_and_layer_norm_fn
+        return (
+            self._communicate_simple_fn
+            in (
+                CommunicateSimpleFn._trivial,
+                CommunicateSimpleFn._scattered_to_tp_attn_full,
+            )
+            and getattr(prepare_mlp_fn, "func", None)
+            is CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual
+            and get_attention_tp_group() is get_tp_group()
+        )
+
+    @staticmethod
+    def _run_tbo_collective(group, events: TboCommEvents, fn):
+        compute_stream = torch.cuda.current_stream()
+        comm_stream = TboCommStreamPool.get_stream_from_pool(group)
+        with torch.cuda.stream(comm_stream):
+            comm_stream.wait_event(events.compute_done)
+            output = fn()
+            events.comm_done.record(comm_stream)
+        compute_stream.wait_event(events.comm_done)
+        return output
+
+    def prepare_attn_tbo_a(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        quant_format: str = "",
+        post_residual_addition: Optional[torch.Tensor] = None,
+        tbo_subbatch_index: int = 0,
+    ) -> _TboAttnCommState:
+        assert self.supports_tbo_attn_communication()
+        assert self.has_tbo_attn_all_gather()
+        hidden_states, residual = self._prepare_attn_local(
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format,
+            post_residual_addition,
+        )
+        output_hidden_states = (
+            CommunicateSimpleFn._allocate_scattered_to_tp_attn_full_output(
+                hidden_states,
+                self._context,
+            )
+        )
+        events = TboCommStreamPool.get_events(
+            get_attention_tp_group(), tbo_subbatch_index
+        )
+        events.compute_done.record(torch.cuda.current_stream())
+        return _TboAttnCommState(
+            hidden_states=hidden_states,
+            output_hidden_states=output_hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+            events=events,
+        )
+
+    def prepare_attn_tbo_b(self, comm_state: _TboAttnCommState):
+        hidden_states = self._run_tbo_collective(
+            get_attention_tp_group(),
+            comm_state.events,
+            lambda: CommunicateSimpleFn._scattered_to_tp_attn_full_into(
+                output=comm_state.output_hidden_states,
+                hidden_states=comm_state.hidden_states,
+            ),
+        )
+        if self.qkv_latent_func is not None:
+            attn_inputs = AttentionInputs(
+                hidden_states, comm_state.forward_batch, self.qkv_latent_func
+            )
+            get_attn_tp_context().set_attn_inputs(attn_inputs)
+        return hidden_states, comm_state.residual
 
     def _tp_reduce_scatter(
         self,
@@ -828,6 +963,54 @@ class LayerCommunicator:
             return hidden_states, hidden_states
         layernorm = self._get_prepare_mlp_layernorm(quant_format)
         return layernorm(hidden_states, residual)
+
+    def prepare_mlp_tbo_a(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        quant_format: str = "",
+        tbo_subbatch_index: int = 0,
+    ) -> _TboMlpCommState:
+        assert self.supports_tbo_attn_communication()
+        input_hidden_states = hidden_states
+        output_hidden_states = hidden_states.tensor_split(self._context.attn_tp_size)[
+            self._context.attn_tp_rank
+        ]
+        prepare_mlp_fn = self._communicate_with_all_reduce_and_layer_norm_fn
+        residual_input_mode = prepare_mlp_fn.keywords["residual_input_mode"]
+        if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+            residual = residual.tensor_split(self._context.attn_tp_size)[
+                self._context.attn_tp_rank
+            ]
+        events = TboCommStreamPool.get_events(
+            get_attention_tp_group(), tbo_subbatch_index
+        )
+        events.compute_done.record(torch.cuda.current_stream())
+        return _TboMlpCommState(
+            input_hidden_states=input_hidden_states,
+            output_hidden_states=output_hidden_states,
+            residual=residual,
+            layernorm=self._get_prepare_mlp_layernorm(quant_format),
+            events=events,
+        )
+
+    def prepare_mlp_tbo_b(self, comm_state: _TboMlpCommState):
+        def _reduce_scatter():
+            attn_tp_reduce_scatter_tensor(
+                comm_state.output_hidden_states,
+                comm_state.input_hidden_states,
+            )
+            return comm_state.output_hidden_states
+
+        hidden_states = self._run_tbo_collective(
+            get_attention_tp_group(),
+            comm_state.events,
+            _reduce_scatter,
+        )
+        residual = comm_state.residual
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = comm_state.layernorm(hidden_states, residual)
+        return hidden_states, residual
 
     def postprocess_layer(
         self,
@@ -983,15 +1166,29 @@ class CommunicateSimpleFn:
 
     @staticmethod
     def _scattered_to_tp_attn_full(
-        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         forward_batch: ForwardBatch,
         context: CommunicateContext,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        output = CommunicateSimpleFn._allocate_scattered_to_tp_attn_full_output(
+            hidden_states,
+            context,
+        )
+        return CommunicateSimpleFn._scattered_to_tp_attn_full_into(
+            output,
+            hidden_states,
+        )
+
+    @staticmethod
+    def _allocate_scattered_to_tp_attn_full_output(
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        context: CommunicateContext,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_attention_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
                     output = torch.empty(
@@ -1002,22 +1199,26 @@ class CommunicateSimpleFn:
                         dtype=local_hidden_states.dtype,
                         device=local_hidden_states.device,
                     )
-                attn_tp_all_gather_into_tensor(
-                    output,
-                    local_hidden_states,
-                )
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
 
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
-            hidden_states,
-        )
-        attn_tp_all_gather_into_tensor(
-            hidden_states,
-            local_hidden_states,
-        )
-        return hidden_states
+        return get_local_dp_buffer(get_attention_tp_group())
+
+    @staticmethod
+    def _scattered_to_tp_attn_full_into(
+        output: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        if isinstance(hidden_states, tuple):
+            assert isinstance(output, tuple)
+            assert len(output) == len(hidden_states)
+            for gathered, local in zip(output, hidden_states, strict=True):
+                attn_tp_all_gather_into_tensor(gathered, local)
+            return output
+
+        assert isinstance(output, torch.Tensor)
+        attn_tp_all_gather_into_tensor(output, hidden_states)
+        return output
 
 
 class CommunicateWithAllReduceAndLayerNormFn:

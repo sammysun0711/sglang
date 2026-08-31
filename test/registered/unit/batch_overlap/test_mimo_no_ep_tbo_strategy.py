@@ -498,6 +498,7 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         spec_info=None,
+        extend_num_tokens=8192,
         reqs=[SimpleNamespace(origin_input_ids=range(8192))],
     )
     adapter = SimpleNamespace(
@@ -517,24 +518,27 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
 
 
 @pytest.mark.parametrize(
-    ("prompt_lens", "seq_lens_cpu", "expected"),
+    ("prompt_lens", "current_chunk_tokens", "expected"),
     [
         ([7999], [7999], False),
-        ([8000], [4000], True),
-        ([16384], [4096], True),
+        ([8000], [4000], False),
+        ([8000], [8000], True),
+        ([16384], [4096], False),
         ([65536, 65536, 65536, 65536], [4096, 4096, 4096, 4096], True),
         ([8192, 4096], [4096, 4096], False),
         ([], [], False),
         (None, None, False),
     ],
 )
-def test_no_a2a_tbo_uses_original_isl_instead_of_chunk_length(
-    prompt_lens, seq_lens_cpu, expected
+def test_no_a2a_tbo_requires_original_isl_and_current_chunk_threshold(
+    prompt_lens, current_chunk_tokens, expected
 ):
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         spec_info=None,
-        seq_lens_cpu=seq_lens_cpu,
+        extend_num_tokens=(
+            sum(current_chunk_tokens) if current_chunk_tokens is not None else None
+        ),
         reqs=(
             [SimpleNamespace(origin_input_ids=range(length)) for length in prompt_lens]
             if prompt_lens is not None

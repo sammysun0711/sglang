@@ -511,10 +511,16 @@ def is_no_a2a_tbo_eligible_batch(local_batch: Optional[ScheduleBatch]) -> bool:
     if not reqs:
         return False
 
-    # seq_lens_cpu is the amount admitted by the scheduler in this iteration,
-    # not the request ISL. With a 16K chunk budget and concurrency four, four
-    # 64K prompts can each temporarily report only 4K here. Gate on the stable
-    # request-level prompt length so chunking cannot disable TBO for long ISLs.
+    # Require both a long original prompt and enough work in this forward.
+    # A long request can end with a small chunk; splitting that tail creates
+    # under-filled child kernels and costs more than a single unsplit pass.
+    current_chunk_tokens = getattr(local_batch, "extend_num_tokens", None)
+    if (
+        current_chunk_tokens is None
+        or int(current_chunk_tokens) < _MIMO_NO_EP_TBO_MIN_ISL
+    ):
+        return False
+
     return all(
         len(req.origin_input_ids) >= _MIMO_NO_EP_TBO_MIN_ISL for req in reqs
     )

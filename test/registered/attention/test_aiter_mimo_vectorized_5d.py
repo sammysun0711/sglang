@@ -221,6 +221,75 @@ def _make_cached_bf16_chunk_case(prefix_len=256, extend_len=256):
     return backend, layer, forward_batch, q, k, v
 
 
+def _make_cached_bf16_ragged_case(
+    prefix_lengths=(256, 0),
+    extend_lengths=(257, 17),
+):
+    seq_lengths = [
+        prefix_len + extend_len
+        for prefix_len, extend_len in zip(prefix_lengths, extend_lengths)
+    ]
+    total_q = sum(extend_lengths)
+    total_kv = sum(seq_lengths)
+    num_blocks = (total_kv + 63) // 64
+    k_buf = torch.zeros((num_blocks, 1, 24, 64, 8), dtype=torch.bfloat16)
+    v_buf = torch.zeros((num_blocks, 1, 8, 128, 8), dtype=torch.bfloat16)
+    pool = SimpleNamespace(
+        dtype=torch.bfloat16,
+        store_dtype=torch.bfloat16,
+        start_layer=0,
+        k_buffer=[k_buf],
+        v_buffer=[v_buf],
+    )
+
+    qo_indptr = [0]
+    kv_indptr = [0]
+    for extend_len, seq_len in zip(extend_lengths, seq_lengths):
+        qo_indptr.append(qo_indptr[-1] + extend_len)
+        kv_indptr.append(kv_indptr[-1] + seq_len)
+    metadata = SimpleNamespace(
+        swa_page_table=None,
+        kv_indices=torch.arange(total_kv, dtype=torch.int32),
+        kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        max_q_len=max(extend_lengths),
+        max_kv_len=max(seq_lengths),
+    )
+    backend = SimpleNamespace(
+        input_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=64,
+        logits_soft_cap=0.0,
+        token_to_kv_pool=pool,
+        forward_metadata=metadata,
+        qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        sliding_window_size=-1,
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        head_dim=192,
+        scaling=192**-0.5,
+        mimo_original_v_head_dim=128,
+    )
+    forward_batch = SimpleNamespace(
+        extend_prefix_lens_cpu=list(prefix_lengths),
+        extend_seq_lens_cpu=list(extend_lengths),
+        seq_lens_cpu=torch.tensor(seq_lengths, dtype=torch.int32),
+        seq_lens_sum=total_kv,
+    )
+    q = torch.zeros((total_q, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((total_q, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((total_q, 1, 128), dtype=torch.bfloat16)
+    return backend, layer, forward_batch, q, k, v
+
+
 @pytest.mark.parametrize("lengths", [(256, 256), (255, 257)])
 def test_fresh_mimo_swa_uses_native_v128_ck_varlen(monkeypatch, lengths):
     backend, layer, forward_batch, q, k, v, sinks = _make_fresh_swa_case(
@@ -423,6 +492,54 @@ def test_fresh_uniform_mimo_extend_uses_gfx950_bf16_asm(monkeypatch):
     assert torch.isfinite(output).all()
 
 
+def test_tbo_padded_fresh_mimo_extend_uses_gfx950_bf16_asm(monkeypatch):
+    logical_tokens = 257
+    physical_tokens = 264
+    backend, layer, forward_batch, _, _, _ = _make_fresh_asm_case(
+        sequence_length=logical_tokens,
+        batch_size=1,
+    )
+    q = torch.zeros((physical_tokens, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((physical_tokens, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((physical_tokens, 1, 128), dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_asm(q_4d, k_4d, v_4d, *args):
+        out = args[8]
+        captured.update(q=q_4d, k=k_4d, v=v_4d, out=out)
+        out.fill_(3.0)
+        return [out]
+
+    def reject_batch_prefill(*args, **kwargs):
+        raise AssertionError("TBO padding must not force fresh attention to CK")
+
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setattr(aiter_utils, "fmha_v3_fwd", fake_asm)
+    monkeypatch.setattr(
+        aiter_utils, "mha_batch_prefill_func", reject_batch_prefill
+    )
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=2,
+        window_size=(-1, -1),
+        sinks=None,
+    ).view(physical_tokens, 16, 128)
+
+    assert captured["q"].shape == (1, logical_tokens, 16, 192)
+    assert captured["k"].shape == (1, logical_tokens, 1, 192)
+    assert captured["v"].shape == (1, logical_tokens, 1, 128)
+    assert captured["out"].shape == (1, logical_tokens, 16, 128)
+    assert torch.all(output[:logical_tokens] == 3.0)
+    assert torch.count_nonzero(output[logical_tokens:]) == 0
+
+
 def test_fresh_ragged_mimo_extend_uses_gfx950_bf16_varlen_asm(monkeypatch):
     backend, layer, forward_batch, q, k, v = _make_fresh_asm_case()
     forward_batch.extend_seq_lens_cpu = [255, 257]
@@ -558,6 +675,153 @@ def test_cached_bf16_chunk_prefill_uses_gfx950_varlen_asm(monkeypatch):
     assert captured["out"].shape == (256, 16, 128)
     assert captured["out"].stride(-2) == 128
     assert torch.all(output == 11.0)
+
+
+def test_tbo_padded_cached_bf16_chunk_uses_gfx950_varlen_asm(monkeypatch):
+    logical_tokens = 257
+    physical_tokens = 264
+    backend, layer, forward_batch, _, _, _ = _make_cached_bf16_chunk_case(
+        prefix_len=256,
+        extend_len=logical_tokens,
+    )
+    q = torch.zeros((physical_tokens, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((physical_tokens, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((physical_tokens, 1, 128), dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_gather(k_buf, v_buf, slot_ids):
+        seq_len = slot_ids.numel()
+        return (
+            torch.zeros((seq_len, 1, 192), dtype=torch.bfloat16),
+            torch.zeros((seq_len, 1, 128), dtype=torch.bfloat16),
+        )
+
+    def fake_varlen_asm(q_varlen, k_varlen, v_varlen, *args):
+        out = args[15]
+        captured.update(q=q_varlen, k=k_varlen, v=v_varlen, out=out)
+        out.fill_(11.0)
+        return [out]
+
+    def reject_batch_prefill(*args, **kwargs):
+        raise AssertionError("TBO padding must not force cached attention to CK")
+
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
+    monkeypatch.setattr(
+        aiter_utils, "MIMO_FRESH_BF16_ASM_VARLEN_ENABLED", True
+    )
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setattr(aiter_utils, "fmha_v3_varlen_fwd", fake_varlen_asm)
+    monkeypatch.setattr(
+        aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather
+    )
+    monkeypatch.setattr(
+        aiter_utils, "mha_batch_prefill_func", reject_batch_prefill
+    )
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=2,
+        window_size=(-1, -1),
+        sinks=None,
+    ).view(physical_tokens, 16, 128)
+
+    assert captured["q"].shape == (logical_tokens, 16, 192)
+    assert captured["out"].shape == (logical_tokens, 16, 128)
+    assert torch.all(output[:logical_tokens] == 11.0)
+    assert torch.count_nonzero(output[logical_tokens:]) == 0
+
+
+def test_tbo_ragged_cached_bf16_batch_uses_gfx950_varlen_asm(monkeypatch):
+    prefix_lengths = (256, 0)
+    extend_lengths = (257, 17)
+    logical_tokens = sum(extend_lengths)
+    physical_tokens = 280
+    backend, layer, forward_batch, _, _, _ = _make_cached_bf16_ragged_case(
+        prefix_lengths=prefix_lengths,
+        extend_lengths=extend_lengths,
+    )
+    q = torch.zeros((physical_tokens, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((physical_tokens, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((physical_tokens, 1, 128), dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_gather(k_buf, v_buf, slot_ids):
+        captured["slot_ids"] = slot_ids
+        total_kv = slot_ids.numel()
+        return (
+            torch.zeros((total_kv, 1, 192), dtype=torch.bfloat16),
+            torch.zeros((total_kv, 1, 128), dtype=torch.bfloat16),
+        )
+
+    def fake_varlen_asm(q_varlen, k_varlen, v_varlen, *args):
+        out = args[15]
+        captured.update(
+            q=q_varlen,
+            k=k_varlen,
+            v=v_varlen,
+            cu_q=args[0],
+            cu_k=args[1],
+            max_q=args[2],
+            max_k=args[3],
+            min_q=args[4],
+            out=out,
+        )
+        out.fill_(13.0)
+        return [out]
+
+    def reject_flypa(*args, **kwargs):
+        raise AssertionError("qualified ragged BF16 batch must not use FlyPA")
+
+    def reject_batch_prefill(*args, **kwargs):
+        raise AssertionError("qualified ragged BF16 batch must not use CK")
+
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
+    monkeypatch.setattr(
+        aiter_utils, "MIMO_FRESH_BF16_ASM_VARLEN_ENABLED", True
+    )
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setattr(aiter_utils, "fmha_v3_varlen_fwd", fake_varlen_asm)
+    monkeypatch.setattr(
+        aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather
+    )
+    monkeypatch.setattr(
+        aiter_utils, "can_use_mimo_flypa_prefill", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(aiter_utils, "run_mimo_flypa_prefill", reject_flypa)
+    monkeypatch.setattr(
+        aiter_utils, "mha_batch_prefill_func", reject_batch_prefill
+    )
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=3,
+        window_size=(-1, -1),
+        sinks=None,
+    ).view(physical_tokens, 16, 128)
+
+    assert captured["q"].shape == (logical_tokens, 16, 192)
+    assert captured["k"].shape == (530, 1, 192)
+    assert captured["v"].shape == (530, 1, 128)
+    assert captured["cu_q"].tolist() == [0, 257, 274]
+    assert captured["cu_k"].tolist() == [0, 513, 530]
+    assert captured["max_q"] == 257
+    assert captured["max_k"] == 513
+    assert captured["min_q"] == 17
+    assert torch.equal(
+        captured["slot_ids"], backend.forward_metadata.kv_indices
+    )
+    assert torch.all(output[:logical_tokens] == 13.0)
+    assert torch.count_nonzero(output[logical_tokens:]) == 0
 
 
 @pytest.mark.parametrize(
@@ -934,6 +1198,14 @@ def _run_flypa_prefill_case(
     )
     monkeypatch.setattr(aiter_utils, "is_gfx942", lambda: gfx942)
     monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: gfx950)
+    if gfx942 and not gfx950:
+
+        def reject_logical_qkv_views(*args, **kwargs):
+            raise AssertionError("gfx942 must not prepare gfx950 ASM Q/K/V views")
+
+        monkeypatch.setattr(
+            aiter_utils, "_mimo_logical_qkv_views", reject_logical_qkv_views
+        )
     monkeypatch.setattr(aiter_utils, "flypa", fake_flypa)
     monkeypatch.setattr(aiter_utils, "mha_batch_prefill_func", fake_batch_prefill)
     monkeypatch.setattr(
@@ -1335,6 +1607,163 @@ def test_bf16_flypa_matches_torch_with_causal_partial_last_page():
     ).to(torch.bfloat16)
 
     torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_tbo_ragged_cached_bf16_asm_matches_flypa(monkeypatch):
+    arch = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName.split(":", 1)[0]
+    if arch != "gfx950":
+        pytest.skip("MiMo BF16 grouped ASM requires gfx950")
+
+    torch.manual_seed(20260831)
+    device = torch.device("cuda")
+    query_lengths = [257, 17]
+    prefix_lengths = [256, 0]
+    kv_lengths = [513, 17]
+    logical_tokens = sum(query_lengths)
+    physical_tokens = 280
+    num_pages = 10
+    pack = 8
+
+    query = torch.zeros(
+        physical_tokens,
+        16,
+        192,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query[:logical_tokens] = (
+        torch.randn(logical_tokens, 16, 192, device=device) * 0.02
+    ).to(torch.bfloat16)
+    key_tokens = (
+        torch.randn(num_pages * 64, 1, 192, device=device) * 0.02
+    ).to(torch.bfloat16)
+    value_tokens = (
+        torch.randn(num_pages * 64, 1, 128, device=device) * 0.02
+    ).to(torch.bfloat16)
+    key_cache = (
+        key_tokens.view(num_pages, 64, 1, 24, pack)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value_tokens.view(num_pages, 8, pack, 1, 128)
+        .permute(0, 3, 1, 4, 2)
+        .contiguous()
+    )
+
+    slot_ids = torch.cat(
+        (
+            torch.arange(513, dtype=torch.int32, device=device),
+            torch.arange(576, 593, dtype=torch.int32, device=device),
+        )
+    )
+    qo_indptr = torch.tensor([0, 257, 274], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, 513, 530], dtype=torch.int32, device=device)
+    paged_kv_indptr = torch.tensor([0, 9, 10], dtype=torch.int32, device=device)
+    page_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    last_page_lens = torch.tensor([1, 17], dtype=torch.int32, device=device)
+
+    pool = SimpleNamespace(
+        dtype=torch.bfloat16,
+        store_dtype=torch.bfloat16,
+        start_layer=0,
+        k_buffer=[key_cache],
+        v_buffer=[value_cache],
+    )
+    metadata = SimpleNamespace(
+        swa_page_table=None,
+        kv_indices=slot_ids,
+        kv_indptr=kv_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=page_indices,
+        paged_kv_last_page_len=last_page_lens,
+        max_q_len=max(query_lengths),
+        max_kv_len=max(kv_lengths),
+    )
+    backend = SimpleNamespace(
+        input_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=64,
+        logits_soft_cap=0.0,
+        token_to_kv_pool=pool,
+        forward_metadata=metadata,
+        qo_indptr=qo_indptr,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        sliding_window_size=-1,
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        head_dim=192,
+        scaling=192**-0.5,
+        mimo_original_v_head_dim=128,
+    )
+    forward_batch = SimpleNamespace(
+        extend_prefix_lens_cpu=prefix_lengths,
+        extend_seq_lens_cpu=query_lengths,
+        seq_lens_cpu=torch.tensor(kv_lengths, dtype=torch.int32),
+        seq_lens_sum=sum(kv_lengths),
+    )
+    current_key = torch.zeros(
+        physical_tokens, 1, 192, dtype=torch.bfloat16, device=device
+    )
+    current_value = torch.zeros(
+        physical_tokens, 1, 128, dtype=torch.bfloat16, device=device
+    )
+
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
+    monkeypatch.setattr(
+        aiter_utils, "MIMO_FRESH_BF16_ASM_VARLEN_ENABLED", True
+    )
+
+    actual = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        query.view(physical_tokens, -1),
+        current_key,
+        current_value,
+        layer,
+        forward_batch,
+        bs0=3,
+        window_size=(-1, -1),
+        sinks=None,
+    ).view(physical_tokens, 16, 128)
+
+    unit_scale = torch.ones((), dtype=torch.float32, device=device)
+    expected = aiter_utils.flypa(
+        num_qo_heads=16,
+        num_kv_heads=1,
+        head_dim_qk=192,
+        head_dim_v=128,
+        page_size=64,
+        is_causal=True,
+        quant_query_mode="per-tensor",
+    )(
+        query[:logical_tokens],
+        key_cache,
+        value_cache,
+        qo_indptr,
+        None,
+        paged_kv_indptr,
+        page_indices,
+        max(query_lengths),
+        max(kv_lengths),
+        True,
+        unit_scale,
+        unit_scale,
+        unit_scale,
+        last_page_lens,
+    )
+
+    torch.testing.assert_close(
+        actual[:logical_tokens], expected, rtol=2e-2, atol=2e-2
+    )
+    assert torch.count_nonzero(actual[logical_tokens:]) == 0
 
 
 def _mimo_paged_metadata_kwargs(**overrides):

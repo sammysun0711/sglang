@@ -11,8 +11,12 @@ warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
 small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-64}"
 prompt_waves="${PROMPT_WAVES:-4}"
 min_num_prompts="${MIN_NUM_PROMPTS:-32}"
+model_path="${MODEL_PATH:-/models/MiMo-V2.5-Pro/}"
 LOG_DIR="${LOG_DIR:-./logs/benchmark_tp8_prefill}"
 mkdir -p "$LOG_DIR"
+
+results_csv="${LOG_DIR}/results.csv"
+echo "input_tokens,max_concurrency,num_prompts,mean_ttft_ms,input_throughput" > "${results_csv}"
 
 if ! [[ "${small_input_num_prompts}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SMALL_INPUT_NUM_PROMPTS_OVERRIDE must be a positive integer, observed '${small_input_num_prompts}'" >&2
@@ -48,6 +52,9 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         num_prompts="${min_num_prompts}"
       fi
     fi
+    json_file="${LOG_DIR}/benchmark_${input_tokens}_con${concurrency}.jsonl"
+    : > "${json_file}"
+
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Concurrency = ${concurrency} | Run ${run}"
     echo "Measured prompts = ${num_prompts}, warmups = ${warmup_requests}"
@@ -57,7 +64,7 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
     # Run benchmark: display in terminal + write to a separate log
     python3 -m sglang.bench_serving \
         --backend sglang \
-        --model /models/MiMo-V2.5-Pro/ \
+        --model "${model_path}" \
         --host 0.0.0.0 \
         --port 30001 \
         --dataset-name random \
@@ -69,9 +76,17 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --num-prompts "${num_prompts}" \
         --warmup-requests "${warmup_requests}" \
         --max-concurrency "${concurrency}" \
+        --tokenize-prompt \
+        --output-file "${json_file}" \
         2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"
+
+    jq -r --argjson input "${input_tokens}" --argjson concurrency "${concurrency}" \
+      --argjson prompts "${num_prompts}" \
+      '[$input, $concurrency, $prompts, .mean_ttft_ms, .input_throughput] | @csv' \
+      "${json_file}" >> "${results_csv}"
     echo -e "============================================================\n"
   done
 done
 
 echo "All lengths and concurrency tests completed!"
+echo "Results: ${results_csv}"

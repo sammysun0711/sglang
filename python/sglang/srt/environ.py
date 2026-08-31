@@ -556,6 +556,9 @@ class Envs:
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # Experimental MiMo prefill path that schedules attention TP all-gather
+    # and reduce-scatter through the TBO communication stream.
+    SGLANG_MIMO_TBO_ATTN_COMM = EnvBool(False)
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)

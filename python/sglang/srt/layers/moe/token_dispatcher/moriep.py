@@ -38,6 +38,7 @@ from functools import lru_cache
 
 import torch
 
+from sglang.srt.batch_overlap.comm_stream import TboCommStreamPool
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -349,28 +350,6 @@ def init_mori_op(
     return mori_op
 
 
-class CommStreamPool:
-    _streams = {}  # key -> torch.cuda.Stream
-
-    @classmethod
-    def _make_key(cls, group):
-        return (torch.cuda.current_device(), id(group))
-
-    @classmethod
-    def get_stream_from_pool(cls, group) -> torch.cuda.Stream:
-        key = cls._make_key(group)
-        stream = cls._streams.get(key)
-        if stream is None:
-            stream = torch.cuda.Stream(priority=0)
-            cls._streams[key] = stream
-        return stream
-
-    @classmethod
-    def clear_group(cls, group):
-        key = (torch.cuda.current_device(), id(group))
-        cls._streams.pop(key, None)
-
-
 class _MoriEPDispatcherImplBase:
     def __init__(
         self,
@@ -538,7 +517,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
-            self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+            self._comm_stream = TboCommStreamPool.get_stream_from_pool(self.group)
 
     def _capture_event_if_async(self) -> Optional[torch.cuda.Event]:
         assert self.enable_dual_stream, "dual stream must be enabled"

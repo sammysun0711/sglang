@@ -1611,10 +1611,7 @@ def test_bf16_flypa_matches_torch_with_causal_partial_last_page():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_tbo_ragged_cached_bf16_asm_matches_flypa(monkeypatch):
-    arch = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).gcnArchName.split(":", 1)[0]
-    if arch != "gfx950":
+    if not aiter_utils.is_gfx950():
         pytest.skip("MiMo BF16 grouped ASM requires gfx950")
 
     torch.manual_seed(20260831)

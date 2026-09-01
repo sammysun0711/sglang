@@ -50,8 +50,8 @@ python3 -m sglang.bench_serving \
   --output-details
 ```
 
-- `--gsp-prewarm-prefixes` primes every generated prefix group after cache flushing and
-  before measured traffic. Priming requests are excluded from benchmark metrics.
+- `--gsp-prewarm-prefixes` automatically flushes the cache, then primes every generated
+  prefix group before measured traffic. Priming requests are excluded from benchmark metrics.
 - `--gsp-prewarm-concurrency` limits concurrent priming requests; its default is `1`.
 
 The example targets an approximately 87.5% shared prefix before cache-page rounding.

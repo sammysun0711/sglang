@@ -298,7 +298,12 @@ def sample_generated_shared_prefix_requests(
             else None
         )
         turn_questions = questions[src_g][src_p]
-        turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
+        first_turn_prompt = (
+            f"{system_prompt}\n\n{turn_questions[0]}"
+            if system_prompt
+            else turn_questions[0]
+        )
+        turn_prompts = [first_turn_prompt] + turn_questions[1:]
         full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
         prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
         output_len_val = int(output_lens[src_g, src_p])

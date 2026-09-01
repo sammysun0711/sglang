@@ -56,8 +56,10 @@ from sglang.benchmark.serving import (
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
     RequestFuncOutput,
+    _build_gsp_prewarm_extra_request_body,
     _finite_positive_float,
     _positive_int,
+    _should_flush_cache_before_benchmark,
     async_request_openai_embeddings,
     collect_gsp_cache_prefix_requests,
     flush_server_cache,
@@ -160,6 +162,19 @@ _BENCH_SERVING_CLI_CASES = {
         "--ready-check-timeout-sec",
         "0",
     ],
+    "prewarm_prompt_count_mismatch": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-prewarm-prefixes",
+        "--num-prompts",
+        "3",
+        "--gsp-num-groups",
+        "2",
+        "--gsp-prompts-per-group",
+        "2",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
 }
 
 
@@ -230,6 +245,22 @@ class TestEmbeddingBenchmarkBackends(CustomTestCase):
 
 
 class TestBenchmarkCacheFlush(CustomTestCase):
+    def test_gsp_prewarm_always_flushes_before_benchmark(self):
+        self.assertTrue(
+            _should_flush_cache_before_benchmark(
+                backend="sglang",
+                flush_cache=False,
+                gsp_prewarm_prefixes=True,
+            )
+        )
+        self.assertFalse(
+            _should_flush_cache_before_benchmark(
+                backend="sglang",
+                flush_cache=False,
+                gsp_prewarm_prefixes=False,
+            )
+        )
+
     def test_cache_flush_uses_the_backend_specific_request(self):
         """SGLang forwards its timeout without changing other backend requests."""
         with (
@@ -1229,6 +1260,26 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(row.cache_prefix for row in rows))
 
+    def test_gsp_zero_prefix_does_not_add_shared_delimiter(self):
+        args = make_args(
+            dataset_name="generated-shared-prefix",
+            gsp_num_groups=4,
+            gsp_prompts_per_group=1,
+            gsp_system_prompt_len=0,
+            gsp_question_len=4,
+            gsp_output_len=2,
+            gsp_range_ratio=1.0,
+            gsp_ordered=True,
+            seed=19,
+        )
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        rows = get_dataset(args, self.tokenizer, model_id="dummy-model")
+
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(not row.prompt.startswith("\n") for row in rows))
+        self.assertTrue(all(row.cache_prefix is None for row in rows))
+
     def test_gsp_prefix_prewarm_requests_and_stats(self):
         rows = [
             DatasetRow(
@@ -1256,11 +1307,18 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
 
         stats = asyncio.run(
             prewarm_gsp_prefix_cache(
+                backend="sglang",
                 request_func=request_func,
                 api_url="http://127.0.0.1:30000/generate",
                 model_id="test-model",
                 input_requests=rows,
-                extra_request_body={},
+                extra_request_body={
+                    "sampling_params": {
+                        "temperature": 1.0,
+                        "max_new_tokens": 99,
+                        "top_p": 0.9,
+                    }
+                },
                 max_concurrency=2,
             )
         )
@@ -1269,6 +1327,18 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             [request.prompt for request in seen], ["prefix-a ", "prefix-b "]
         )
         self.assertTrue(all(request.output_len == 1 for request in seen))
+        self.assertTrue(
+            all(
+                request.extra_request_body["sampling_params"]
+                == {
+                    "temperature": 0.0,
+                    "max_new_tokens": 1,
+                    "ignore_eos": True,
+                    "top_p": 0.9,
+                }
+                for request in seen
+            )
+        )
         self.assertEqual(stats["num_prefixes"], 2)
         self.assertEqual(stats["prewarm_requests"], 2)
         self.assertEqual(stats["primed_prefix_tokens"], 14)
@@ -1293,6 +1363,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "intentional failure"):
             asyncio.run(
                 prewarm_gsp_prefix_cache(
+                    backend="sglang",
                     request_func=request_func,
                     api_url="http://127.0.0.1:30000/generate",
                     model_id="test-model",
@@ -1658,11 +1729,27 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "prewarm_bad_concurrency",
             "prewarm_fast_prepare",
             "prewarm_multi_turn",
+            "prewarm_prompt_count_mismatch",
         ):
             with self.subTest(case=case):
                 res = _bench_serving_cli_results()[case]
                 self.assertEqual(res.returncode, 2, res.stderr)
                 self.assertIn("gsp-prewarm", res.stderr + res.stdout)
+
+    def test_gsp_prewarm_oai_parameters_override_global_body(self):
+        body = _build_gsp_prewarm_extra_request_body(
+            "sglang-oai-chat",
+            {
+                "temperature": 1.0,
+                "max_completion_tokens": 99,
+                "ignore_eos": False,
+                "top_p": 0.9,
+            },
+        )
+        self.assertEqual(body["temperature"], 0.0)
+        self.assertEqual(body["max_completion_tokens"], 1)
+        self.assertTrue(body["ignore_eos"])
+        self.assertEqual(body["top_p"], 0.9)
 
     def test_bench_serving_cli_rejects_zipf_without_alpha_before_server(self):
         # Malformed CLI combinations (zipf with no alpha) must fail at

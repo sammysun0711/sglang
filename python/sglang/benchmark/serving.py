@@ -1068,6 +1068,26 @@ def _build_gsp_prewarm_extra_request_body(
     return body
 
 
+def _expected_cache_match_len(request: DatasetRow) -> int:
+    match_len = getattr(request, "cache_prefix_match_len", None)
+    if match_len is None:
+        match_len = getattr(request, "cache_prefix_len", 0) or 0
+    # SGLang leaves at least one prompt token for extend/logprob computation.
+    return min(match_len, max(request.prompt_len - 1, 0))
+
+
+def _server_page_size(server_info: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not isinstance(server_info, dict):
+        return None
+    page_size = server_info.get("page_size")
+    if isinstance(page_size, int) and page_size > 0:
+        return page_size
+    decode_info = server_info.get("decode")
+    if isinstance(decode_info, list) and decode_info:
+        return _server_page_size(decode_info[0])
+    return None
+
+
 async def prewarm_gsp_prefix_cache(
     backend: str,
     request_func: Callable,
@@ -1126,8 +1146,7 @@ async def prewarm_gsp_prefix_cache(
         )
 
     expected_cached_tokens = sum(
-        min(getattr(request, "cache_prefix_len", 0) or 0, request.prompt_len)
-        for request in input_requests
+        _expected_cache_match_len(request) for request in input_requests
     )
     expected_prompt_tokens = sum(request.prompt_len for request in input_requests)
     expected_hit_rate_pct = (
@@ -2026,6 +2045,31 @@ async def benchmark(
                 "storage_backend": storage_backend_name,
             }
         if prefix_cache_config is not None:
+            page_size = _server_page_size(server_info)
+            if page_size is not None:
+                page_aligned_expected_cached_tokens = sum(
+                    _expected_cache_match_len(request) // page_size * page_size
+                    for request in input_requests
+                )
+                expected_prompt_tokens = prefix_cache_config["expected_prompt_tokens"]
+                prefix_cache_config.update(
+                    page_size=page_size,
+                    page_aligned_expected_cached_tokens=(
+                        page_aligned_expected_cached_tokens
+                    ),
+                    page_aligned_expected_hit_rate_pct=round(
+                        page_aligned_expected_cached_tokens
+                        / expected_prompt_tokens
+                        * 100,
+                        2,
+                    ),
+                )
+            else:
+                prefix_cache_config.update(
+                    page_size=None,
+                    page_aligned_expected_cached_tokens=None,
+                    page_aligned_expected_hit_rate_pct=None,
+                )
             prefix_cache_config["actual_hit_rate_pct"] = (
                 round(hit_rate, 2) if args.cache_report else None
             )

@@ -37,6 +37,7 @@ from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
+    _controlled_token_pool,
     _zipf_group_probs,
     get_gen_prefix_cache_path,
     sample_generated_shared_prefix_requests,
@@ -59,6 +60,7 @@ from sglang.benchmark.serving import (
     _build_gsp_prewarm_extra_request_body,
     _finite_positive_float,
     _positive_int,
+    _server_page_size,
     _should_flush_cache_before_benchmark,
     async_request_openai_embeddings,
     collect_gsp_cache_prefix_requests,
@@ -1219,9 +1221,102 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 12)
         self.assertTrue(all(row.cache_prefix for row in rows))
         self.assertTrue(all(row.cache_prefix_len > 0 for row in rows))
+        self.assertTrue(all(row.cache_prefix_match_len > 0 for row in rows))
         prefix_requests = collect_gsp_cache_prefix_requests(rows)
         self.assertEqual(len(prefix_requests), 3)
         self.assertTrue(all(row.output_len == 1 for row in prefix_requests))
+
+    def test_gsp_prewarm_uses_controlled_prefix_and_suffix_tokens(self):
+        args = make_args(
+            dataset_name="generated-shared-prefix",
+            num_prompts=12,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=4,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_output_len=2,
+            gsp_range_ratio=1.0,
+            gsp_ordered=True,
+            gsp_prewarm_prefixes=True,
+            seed=21,
+        )
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        rows = get_dataset(args, self.tokenizer, model_id="dummy-model")
+
+        token_pool = _controlled_token_pool(self.tokenizer)
+        token_positions = {
+            token_id: position for position, token_id in enumerate(token_pool)
+        }
+        prefixes = {
+            row.cache_prefix: self.tokenizer.encode(row.cache_prefix) for row in rows
+        }
+        first_prefix_tokens = [prefix[0] for prefix in prefixes.values()]
+        self.assertEqual(len(first_prefix_tokens), len(set(first_prefix_tokens)))
+        for prefix in prefixes.values():
+            positions = [token_positions[token_id] for token_id in prefix]
+            for left, right in zip(positions, positions[1:]):
+                self.assertEqual(right, (left + 1) % len(token_pool))
+
+        first_suffix_tokens = {}
+        for row in rows:
+            prompt_ids = self.tokenizer.encode(row.prompt)
+            prefix_ids = self.tokenizer.encode(row.cache_prefix)
+            expected_lcp = 0
+            for prefix_token, prompt_token in zip(prefix_ids, prompt_ids):
+                if prefix_token != prompt_token:
+                    break
+                expected_lcp += 1
+            self.assertEqual(row.cache_prefix_match_len, expected_lcp)
+            token = prompt_ids[row.cache_prefix_match_len]
+            first_suffix_tokens.setdefault(row.cache_prefix, []).append(token)
+        for tokens in first_suffix_tokens.values():
+            self.assertEqual(len(tokens), len(set(tokens)))
+
+    def test_controlled_token_pool_excludes_byte_fallback_tokens(self):
+        vocab = {
+            "[UNK]": 0,
+            "[PAD]": 1,
+            "[BOS]": 2,
+            "[EOS]": 3,
+            "<0x41>": 4,
+            "safe_token": 5,
+        }
+        tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = Whitespace()
+        hf_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            bos_token="[BOS]",
+            eos_token="[EOS]",
+        )
+
+        self.assertEqual(_controlled_token_pool(hf_tokenizer), [5])
+        common = dict(
+            system_prompt_len=1,
+            question_len=1,
+            output_len=1,
+            range_ratio=1.0,
+            tokenizer=hf_tokenizer,
+            seed=22,
+            num_turns=1,
+            fast_prepare=False,
+            ordered=True,
+            include_cache_prefix=True,
+        )
+        with self.assertRaisesRegex(ValueError, "at most 1 non-empty prefix groups"):
+            sample_generated_shared_prefix_requests(
+                num_groups=2,
+                prompts_per_group=1,
+                **common,
+            )
+        with self.assertRaisesRegex(ValueError, "largest group has 2"):
+            sample_generated_shared_prefix_requests(
+                num_groups=1,
+                prompts_per_group=2,
+                **common,
+            )
 
     def test_gsp_prewarm_regenerates_legacy_cache_without_metadata(self):
         from sglang.benchmark.datasets import generated_shared_prefix as gsp_mod
@@ -1246,6 +1341,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,
             tokenizer=self.tokenizer,
+            controlled_generation=True,
         )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as f:
@@ -1253,10 +1349,14 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
 
         random.seed(args.seed)
         np.random.seed(args.seed)
-        with patch.object(gsp_mod, "gen_prompt", wraps=gsp_mod.gen_prompt) as gen:
+        with patch.object(
+            gsp_mod,
+            "_generate_controlled_prefixes",
+            wraps=gsp_mod._generate_controlled_prefixes,
+        ) as generate_prefixes:
             rows = get_dataset(args, self.tokenizer, model_id="dummy-model")
 
-        self.assertGreater(gen.call_count, 0)
+        self.assertGreater(generate_prefixes.call_count, 0)
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(row.cache_prefix for row in rows))
 
@@ -1288,6 +1388,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 output_len=2,
                 cache_prefix="prefix-a ",
                 cache_prefix_len=6,
+                cache_prefix_match_len=5,
             )
             for i in range(2)
         ] + [
@@ -1297,6 +1398,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 output_len=2,
                 cache_prefix="prefix-b ",
                 cache_prefix_len=8,
+                cache_prefix_match_len=7,
             )
         ]
         seen = []
@@ -1342,9 +1444,9 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(stats["num_prefixes"], 2)
         self.assertEqual(stats["prewarm_requests"], 2)
         self.assertEqual(stats["primed_prefix_tokens"], 14)
-        self.assertEqual(stats["expected_cached_tokens"], 20)
+        self.assertEqual(stats["expected_cached_tokens"], 17)
         self.assertEqual(stats["expected_prompt_tokens"], 40)
-        self.assertEqual(stats["expected_hit_rate_pct"], 50.0)
+        self.assertEqual(stats["expected_hit_rate_pct"], 42.5)
 
     def test_gsp_prefix_prewarm_failure_is_fatal(self):
         rows = [
@@ -1888,13 +1990,21 @@ class TestPrefixCacheBenchmark(unittest.TestCase):
         row = {
             "tag": "prefix-cache-in128-out8-hit50-c1",
             "completed": 50,
-            "total_input_tokens": 6400,
+            "total_input_tokens": 640000,
             "server_info": {"page_size": 64},
             "cache_report": {"cache_hit_rate_pct": 25.0},
-            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+            "prefix_cache_config": {
+                "expected_hit_rate_pct": 50.0,
+                "page_aligned_expected_hit_rate_pct": 25.0,
+            },
         }
-        self.assertEqual(cache_hit_tolerance_for_row(row, 0.5), 50.0)
+        self.assertEqual(cache_hit_tolerance_for_row(row, 0.5), 0.5)
         self.assertIsNone(result_validation_error(row, 50, 50, 0.5))
+
+    def test_server_page_size_supports_regular_and_pd_server_info(self):
+        self.assertEqual(_server_page_size({"page_size": 64}), 64)
+        self.assertEqual(_server_page_size({"decode": [{"page_size": 32}]}), 32)
+        self.assertIsNone(_server_page_size({}))
 
     def test_load_completed_results_validates_warm_and_cold_points(self):
         warm_tag = "prefix-cache-in32768-out512-hit50-c8"
@@ -1954,10 +2064,13 @@ class TestPrefixCacheBenchmark(unittest.TestCase):
         row = {
             "tag": "prefix-cache-in128-out8-hit50-c1",
             "completed": 50,
-            "total_input_tokens": 6400,
+            "total_input_tokens": 640000,
             "server_info": {"page_size": 64},
             "cache_report": {"cache_hit_rate_pct": 25.0},
-            "prefix_cache_config": {"expected_hit_rate_pct": 50.0},
+            "prefix_cache_config": {
+                "expected_hit_rate_pct": 50.0,
+                "page_aligned_expected_hit_rate_pct": 25.0,
+            },
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             result_path = Path(temp_dir) / "results.jsonl"
@@ -1967,8 +2080,11 @@ class TestPrefixCacheBenchmark(unittest.TestCase):
             with summary_path.open(newline="") as summary_file:
                 summary = next(csv.DictReader(summary_file))
 
-        self.assertEqual(summary["cache_hit_error_percentage_points"], "25.0")
-        self.assertEqual(summary["allowed_cache_hit_error_percentage_points"], "50.0")
+        self.assertEqual(summary["expected_hit_rate_pct"], "25.0")
+        self.assertEqual(summary["tokenizer_expected_hit_rate_pct"], "50.0")
+        self.assertEqual(summary["page_aligned_expected_hit_rate_pct"], "25.0")
+        self.assertEqual(summary["cache_hit_error_percentage_points"], "0.0")
+        self.assertEqual(summary["allowed_cache_hit_error_percentage_points"], "0.5")
         self.assertEqual(summary["cache_hit_within_tolerance"], "True")
 
 

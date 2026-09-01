@@ -96,7 +96,7 @@
   <text x="102" y="574" class="body">
     <tspan x="102" dy="0">prompt = system prefix + question</tspan>
     <tspan x="102" dy="22">prompt_len / output_len</tspan>
-    <tspan x="102" dy="22">cache_prefix / cache_prefix_len</tspan>
+    <tspan x="102" dy="22">cache_prefix / prefix_len / match_len</tspan>
     <tspan x="102" dy="22">optional routing_key</tspan>
   </text>
   <text x="243" y="670" text-anchor="middle" class="small">legacy cache entries regenerate if metadata is absent</text>
@@ -150,7 +150,7 @@
     <tspan x="490" dy="0">TTFT / TPOT / ITL percentiles</tspan>
     <tspan x="490" dy="22">request and token throughput</tspan>
     <tspan x="490" dy="22">cache_report: observed tokens</tspan>
-    <tspan x="490" dy="22">prefix_cache_config: expected tokens</tspan>
+    <tspan x="490" dy="22">prefix_cache_config: tokenizer / page expected</tspan>
   </text>
 
   <!-- Validation diamond -->

@@ -72,7 +72,7 @@
     <text x="24" y="154" class="field">routing_key?</text>
     <rect x="16" y="170" width="348" height="70" rx="10" fill="#d9f1e8" stroke="#55a887"/>
     <text x="30" y="196" class="field">cache_prefix?</text>
-    <text x="30" y="220" class="field">cache_prefix_len?</text>
+    <text x="30" y="220" class="field">cache_prefix_len? / match_len?</text>
     <text x="24" y="268" class="note">One measured prompt; also source for priming</text>
   </g>
 
@@ -127,7 +127,7 @@
     <text x="24" y="130" class="field">request / input / output throughput</text>
     <rect x="16" y="148" width="260" height="112" rx="10" fill="#e7f7f1" stroke="#55a887"/>
     <text x="28" y="174" class="label">prefix_cache_config</text>
-    <text x="28" y="198" class="note">expected tokens / rate</text>
+    <text x="28" y="198" class="note">tokenizer / page expected rate</text>
     <text x="28" y="218" class="note">priming counts</text>
     <text x="28" y="238" class="note">actual rate / availability</text>
     <rect x="292" y="148" width="262" height="112" rx="10" fill="#e5f5fb" stroke="#55a4bd"/>

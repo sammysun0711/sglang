@@ -54,10 +54,19 @@ python3 -m sglang.bench_serving \
   prefix group before measured traffic. Priming requests are excluded from benchmark metrics.
 - `--gsp-prewarm-concurrency` limits concurrent priming requests; its default is `1`.
 
+Prewarmed GSP workloads use a deterministic cyclic token sequence for each shared
+prefix, with a distinct first source token per group. Within each group, measured
+questions receive distinct first source suffix tokens to reduce accidental deeper
+RadixCache hits for later requests. Text generation excludes special and byte-fallback
+tokens; locally re-tokenized prefix/full-prompt LCP lengths are recorded because text
+tokenization is not perfectly reversible.
+
 The example targets an approximately 87.5% shared prefix before cache-page rounding.
-Use `cache_report.cache_hit_rate_pct` as the achieved rate and
-`prefix_cache_config.expected_hit_rate_pct` as the generated expectation. When a legacy
-on-disk GSP dataset lacks prefix metadata, the benchmark regenerates it automatically.
+Use `cache_report.cache_hit_rate_pct` as the achieved rate,
+`prefix_cache_config.expected_hit_rate_pct` as the tokenizer-level expectation, and
+`prefix_cache_config.page_aligned_expected_hit_rate_pct` as the server-page-aligned
+expectation when `server_info.page_size` is available. When a legacy on-disk GSP
+dataset lacks current prefix metadata, the benchmark regenerates it automatically.
 Explicit prewarming requires accurate, single-turn requests and is incompatible with
 `--gsp-fast-prepare` and `--gsp-num-turns` greater than one.
 
@@ -84,7 +93,7 @@ python3 benchmark/prefix_cache/bench_prefix_cache.py \
 
 For every matrix point, the runner:
 
-1. Derives the shared-prefix and unique-suffix lengths from total input length and the
+1. Derives the shared-prefix and request-specific suffix lengths from total input length and the
    requested hit percentage.
 2. Generates `DatasetRow` requests with exact `cache_prefix` metadata.
 3. Runs generic server warmups and flushes the prefix cache.
@@ -98,7 +107,9 @@ For a 0% cold control, every request receives a unique group and no prefix is pr
 
 ## Cache-hit validation
 
-A point is complete only when all requested responses succeed and:
+A point is complete only when all requested responses succeed and the actual hit rate
+matches the page-aligned expectation when available, otherwise the tokenizer-level
+expectation:
 
 ```text
 abs(actual_hit_rate - expected_hit_rate)

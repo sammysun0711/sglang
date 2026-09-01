@@ -995,6 +995,18 @@ def flush_server_cache(
     response.raise_for_status()
 
 
+def _should_flush_cache_before_benchmark(
+    backend: str,
+    flush_cache: bool,
+    gsp_prewarm_prefixes: bool,
+) -> bool:
+    return (
+        ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI"))
+        or flush_cache
+        or gsp_prewarm_prefixes
+    )
+
+
 def collect_gsp_cache_prefix_requests(
     input_requests: List[DatasetRow],
 ) -> List[DatasetRow]:
@@ -1027,7 +1039,57 @@ def collect_gsp_cache_prefix_requests(
     return prefix_requests
 
 
+def _build_gsp_prewarm_extra_request_body(
+    backend: str,
+    extra_request_body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Force minimal deterministic generation for cache-priming requests."""
+    body = dict(extra_request_body)
+    if backend in ("sglang", "sglang-native"):
+        sampling_params = dict(body.get("sampling_params") or {})
+        sampling_params.update(
+            temperature=0.0,
+            max_new_tokens=1,
+            ignore_eos=True,
+        )
+        body["sampling_params"] = sampling_params
+    elif backend == "sglang-oai-chat":
+        body.update(
+            temperature=0.0,
+            max_completion_tokens=1,
+            ignore_eos=True,
+        )
+    else:
+        body.update(
+            temperature=0.0,
+            max_tokens=1,
+            ignore_eos=True,
+        )
+    return body
+
+
+def _expected_cache_match_len(request: DatasetRow) -> int:
+    match_len = getattr(request, "cache_prefix_match_len", None)
+    if match_len is None:
+        match_len = getattr(request, "cache_prefix_len", 0) or 0
+    # SGLang leaves at least one prompt token for extend/logprob computation.
+    return min(match_len, max(request.prompt_len - 1, 0))
+
+
+def _server_page_size(server_info: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not isinstance(server_info, dict):
+        return None
+    page_size = server_info.get("page_size")
+    if isinstance(page_size, int) and page_size > 0:
+        return page_size
+    decode_info = server_info.get("decode")
+    if isinstance(decode_info, list) and decode_info:
+        return _server_page_size(decode_info[0])
+    return None
+
+
 async def prewarm_gsp_prefix_cache(
+    backend: str,
     request_func: Callable,
     api_url: str,
     model_id: str,
@@ -1057,7 +1119,9 @@ async def prewarm_gsp_prefix_cache(
             output_len=1,
             lora_name=lora_name,
             image_data=None,
-            extra_request_body=extra_request_body,
+            extra_request_body=_build_gsp_prewarm_extra_request_body(
+                backend, extra_request_body
+            ),
             routing_key=prefix_request.routing_key,
         )
         async with semaphore:
@@ -1082,8 +1146,7 @@ async def prewarm_gsp_prefix_cache(
         )
 
     expected_cached_tokens = sum(
-        min(getattr(request, "cache_prefix_len", 0) or 0, request.prompt_len)
-        for request in input_requests
+        _expected_cache_match_len(request) for request in input_requests
     )
     expected_prompt_tokens = sum(request.prompt_len for request in input_requests)
     expected_hit_rate_pct = (
@@ -1576,9 +1639,9 @@ async def benchmark(
     # Flush cache after warmup so the measured run does not benefit from
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
-    should_flush_cache = (
-        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
-    ) or flush_cache
+    should_flush_cache = _should_flush_cache_before_benchmark(
+        backend, flush_cache, gsp_prewarm_prefixes
+    )
     if should_flush_cache:
         flush_server_cache(base_url, backend, flush_cache_timeout)
 
@@ -1587,6 +1650,7 @@ async def benchmark(
     prefix_cache_config = None
     if gsp_prewarm_prefixes:
         prefix_cache_config = await prewarm_gsp_prefix_cache(
+            backend=backend,
             request_func=base_request_func,
             api_url=api_url,
             model_id=model_id,
@@ -1981,10 +2045,35 @@ async def benchmark(
                 "storage_backend": storage_backend_name,
             }
         if prefix_cache_config is not None:
+            page_size = _server_page_size(server_info)
+            if page_size is not None:
+                page_aligned_expected_cached_tokens = sum(
+                    _expected_cache_match_len(request) // page_size * page_size
+                    for request in input_requests
+                )
+                expected_prompt_tokens = prefix_cache_config["expected_prompt_tokens"]
+                prefix_cache_config.update(
+                    page_size=page_size,
+                    page_aligned_expected_cached_tokens=(
+                        page_aligned_expected_cached_tokens
+                    ),
+                    page_aligned_expected_hit_rate_pct=round(
+                        page_aligned_expected_cached_tokens
+                        / expected_prompt_tokens
+                        * 100,
+                        2,
+                    ),
+                )
+            else:
+                prefix_cache_config.update(
+                    page_size=None,
+                    page_aligned_expected_cached_tokens=None,
+                    page_aligned_expected_hit_rate_pct=None,
+                )
             prefix_cache_config["actual_hit_rate_pct"] = (
                 round(hit_rate, 2) if args.cache_report else None
             )
-            prefix_cache_config["hit_rate_verified"] = bool(args.cache_report)
+            prefix_cache_config["cache_report_available"] = bool(args.cache_report)
             result["prefix_cache_config"] = prefix_cache_config
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -2367,6 +2456,14 @@ def _validate_parsed_gsp_args(
             parser.error(
                 "--gsp-prewarm-prefixes currently supports single-turn GSP "
                 "workloads only; omit it for natural multi-turn cache reuse"
+            )
+        expected_num_prompts = args.gsp_num_groups * args.gsp_prompts_per_group
+        if args.num_prompts != expected_num_prompts:
+            parser.error(
+                "--gsp-prewarm-prefixes requires --num-prompts to equal "
+                "--gsp-num-groups * --gsp-prompts-per-group; "
+                f"got {args.num_prompts} != {args.gsp_num_groups} * "
+                f"{args.gsp_prompts_per_group} ({expected_num_prompts})"
             )
 
 
@@ -2768,7 +2865,10 @@ def cli_main():
     parser.add_argument(
         "--flush-cache",
         action="store_true",
-        help="Flush the cache before running the benchmark",
+        help=(
+            "Flush the cache before running the benchmark. This is enabled "
+            "automatically with --gsp-prewarm-prefixes."
+        ),
     )
     parser.add_argument(
         "--flush-cache-timeout",
@@ -2851,9 +2951,9 @@ def cli_main():
         "--gsp-prewarm-prefixes",
         action="store_true",
         help=(
-            "Prewarm every generated shared-prefix group after the optional "
-            "cache flush and before measured traffic. Priming requests are "
-            "excluded from benchmark metrics."
+            "Flush the cache, then prewarm every generated shared-prefix group "
+            "before measured traffic. Priming requests are excluded from "
+            "benchmark metrics."
         ),
     )
     group.add_argument(

@@ -72,9 +72,11 @@ def result_validation_error(
     cache_report = row.get("cache_report") or {}
     actual_hit_rate_pct = cache_report.get("cache_hit_rate_pct")
     prefix_config = row.get("prefix_cache_config") or {}
-    expected_hit_rate_pct = prefix_config.get(
-        "expected_hit_rate_pct", target_hit_rate_pct
-    )
+    expected_hit_rate_pct = prefix_config.get("page_aligned_expected_hit_rate_pct")
+    if not isinstance(expected_hit_rate_pct, (int, float)):
+        expected_hit_rate_pct = prefix_config.get(
+            "expected_hit_rate_pct", target_hit_rate_pct
+        )
     if not isinstance(actual_hit_rate_pct, (int, float)) or not math.isfinite(
         actual_hit_rate_pct
     ):
@@ -252,6 +254,8 @@ def write_summary(
         "completed",
         "max_concurrency",
         "expected_hit_rate_pct",
+        "tokenizer_expected_hit_rate_pct",
+        "page_aligned_expected_hit_rate_pct",
         "actual_hit_rate_pct",
         "cache_hit_error_percentage_points",
         "allowed_cache_hit_error_percentage_points",
@@ -272,7 +276,13 @@ def write_summary(
         for tag, row in sorted(rows_by_tag.items()):
             prefix = row.get("prefix_cache_config") or {}
             cache = row.get("cache_report") or {}
-            expected_hit_rate = prefix.get("expected_hit_rate_pct", 0)
+            tokenizer_expected_hit_rate = prefix.get("expected_hit_rate_pct", 0)
+            page_aligned_expected_hit_rate = prefix.get(
+                "page_aligned_expected_hit_rate_pct"
+            )
+            expected_hit_rate = page_aligned_expected_hit_rate
+            if not isinstance(expected_hit_rate, (int, float)):
+                expected_hit_rate = tokenizer_expected_hit_rate
             actual_hit_rate = cache.get("cache_hit_rate_pct")
             cache_hit_error = (
                 abs(actual_hit_rate - expected_hit_rate)
@@ -289,6 +299,10 @@ def write_summary(
                     "completed": row.get("completed"),
                     "max_concurrency": row.get("max_concurrency"),
                     "expected_hit_rate_pct": expected_hit_rate,
+                    "tokenizer_expected_hit_rate_pct": (tokenizer_expected_hit_rate),
+                    "page_aligned_expected_hit_rate_pct": (
+                        page_aligned_expected_hit_rate
+                    ),
                     "actual_hit_rate_pct": actual_hit_rate,
                     "cache_hit_error_percentage_points": cache_hit_error,
                     "allowed_cache_hit_error_percentage_points": (

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.5/}"
+export MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.5-Pro/}"
 export SGLANG_USE_AITER=1
 export SGLANG_MOE_PADDING=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -38,8 +38,8 @@ export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 export RANDOM_SEED="${RANDOM_SEED:-12345}"
-export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
-export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.75}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
@@ -53,8 +53,8 @@ export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN="${SGLANG_AITER_MIMO_FRESH_BF16_S
 # MORI leaves the next attention input sharded. Keep QKV quantization after the
 # TP all-gather because the current ROCm all-gather path does not support FP8.
 export SGLANG_MIMO_FUSED_RMS_QKV_QUANT=0
-# The current N=6144 fused pre-MoE kernel targets MiMo-V2.5-Pro no-EP. It is
-# inapplicable to this EP4/A2A launcher and is disabled explicitly for clarity.
+# Fused pre-MoE quantization is restricted to no-EP execution in MiMoV2 and is
+# disabled explicitly for this EP8/A2A launcher.
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
 export SGLANG_MORI_DISPATCH_DTYPE="${SGLANG_MORI_DISPATCH_DTYPE:-auto}"
 export SGLANG_MORI_COMBINE_DTYPE="${SGLANG_MORI_COMBINE_DTYPE:-bf16}"
@@ -64,7 +64,8 @@ unset MORI_DISABLE_P2P
 # MORI launch-config workflow:
 # - MANUAL keeps SGLang's constructor defaults (IntraNode: 80 blocks, 16 waves/block).
 # - AUTO loads the active MORI package's dispatch/combine tuning JSON at startup.
-#   Example: MORI_EP_LAUNCH_CONFIG_MODE=AUTO ./launch_tp4_ep4_aiter_mori_tbo_mtp_accuracy_baseline.sh
+#   Example: MORI_EP_LAUNCH_CONFIG_MODE=AUTO ./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+#   Retune EP8 for MiMo-V2.5-Pro hidden_size=6144 before comparing performance.
 # - MORI_TUNING_SCOPE only controls the offline tuner and is intentionally not set here.
 export MORI_EP_LAUNCH_CONFIG_MODE="${MORI_EP_LAUNCH_CONFIG_MODE:-MANUAL}"
 case "${MORI_EP_LAUNCH_CONFIG_MODE}" in
@@ -112,7 +113,7 @@ unset SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
 
 export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 export LOG_DIR="${LOG_DIR:-./logs/accuracy_${RUN_ID}}"
-export LOG_FILE="${LOG_FILE:-server_tp4_ep4_aiter_mori_tbo_mtp_accuracy.log}"
+export LOG_FILE="${LOG_FILE:-server_tp8_ep8_aiter_mori_tbo_mtp_accuracy.log}"
 
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
 mkdir -p "${LOG_DIR}"
@@ -155,28 +156,29 @@ if [[ "${ENABLE_TBO}" == "1" ]]; then
   tbo_status=enabled
 fi
 
-# MiMo TBO decode/target-verify graphs are aligned to eight requests. In
+# MiMo TP8/EP8 TBO decode/target-verify graphs are conservatively aligned to
+# 2 TBO children * attention TP8 = 16 requests. In
 # validation, a smaller request pool reproducibly produced non-finite target-
 # verification logits. Keep at least one complete graph bucket unless decode
 # graphs are disabled; the exact undersized-pool failure site remains broader
 # than this launcher-side guard.
 if [[ "${ENABLE_TBO}" == "1" && "${CUDA_GRAPH_BACKEND_DECODE}" != "disabled" ]]; then
-  if (( MAX_RUNNING_REQUESTS < 8 )); then
-    echo "TBO decode graph requires MAX_RUNNING_REQUESTS >= 8, got: ${MAX_RUNNING_REQUESTS}" >&2
+  if (( MAX_RUNNING_REQUESTS < 16 )); then
+    echo "TP8 TBO decode graph requires MAX_RUNNING_REQUESTS >= 16, got: ${MAX_RUNNING_REQUESTS}" >&2
     exit 2
   fi
 fi
 
 echo "Radix cache: ${radix_cache_status}"
 echo "HIP non-greedy EAGLE verifier: ${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY}"
-echo "Configuration: model=${MODEL_PATH}, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, tp=4, ep=4, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, mori-mode=normal, mori-launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tbo=${tbo_status}, attn-comm-tbo=${SGLANG_MIMO_TBO_ATTN_COMM}, war-barrier=${SGLANG_ENABLE_WAR_BARRIER}, async-assert=${SGLANG_ENABLE_ASYNC_ASSERT}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, seed=${RANDOM_SEED}, reasoning-parser=${REASONING_PARSER}, overlap=enabled"
+echo "Configuration: model=${MODEL_PATH}, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, tp=8, ep=8, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, mori-mode=normal, mori-launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tbo=${tbo_status}, attn-comm-tbo=${SGLANG_MIMO_TBO_ATTN_COMM}, war-barrier=${SGLANG_ENABLE_WAR_BARRIER}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, seed=${RANDOM_SEED}, reasoning-parser=${REASONING_PARSER}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
 
 python3 -u -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
-  --tp-size 4 \
-  --ep-size 4 \
+  --tp-size 8 \
+  --ep-size 8 \
   --moe-a2a-backend mori \
   --moe-runner-backend aiter \
   --deepep-mode normal \
@@ -194,7 +196,6 @@ python3 -u -m sglang.launch_server \
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
   --max-prefill-tokens 1048576 \
   --attention-backend aiter \
-  --mm-attention-backend aiter_attn \
   "${kv_cache_args[@]}" \
   --page-size 64 \
   --speculative-algorithm EAGLE \

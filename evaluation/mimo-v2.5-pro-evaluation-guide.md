@@ -84,7 +84,7 @@ cd /root/workspace/sglang/evaluation
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-## 6. Run TP4/EP4 MORI + TBO accuracy and prefill benchmark
+## 6. Run TP8/EP8 MORI + TBO accuracy and prefill benchmark
 
 Run the server first, then run either client in another terminal:
 
@@ -92,7 +92,7 @@ Run the server first, then run either client in another terminal:
 
 ```bash
 # launch server
-./launch_tp4_ep4_aiter_mori_tbo_mtp_accuracy_baseline.sh
+./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
 # run accuracy client
 ./run_evalscope_gsm8k_accuracy.sh
 # run benchmark client

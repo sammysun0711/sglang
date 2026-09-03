@@ -5,7 +5,8 @@ import torch
 
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
@@ -278,7 +279,62 @@ def _compute_moe_mimov2_no_ep_prefill(layer):
 def _compute_moe_mimov2_prefill(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
-    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+    deep_gemm_num_sms = None
+    if not _is_hip:
+        # DeepEPConfig reads CUDA-only state from the deep_ep package. ROCm
+        # dispatcher backends (including MORI) do not reserve DeepGEMM SMs.
+        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+    enable_attn_comm_tbo = envs.SGLANG_MIMO_TBO_ATTN_COMM.get()
+
+    if enable_attn_comm_tbo:
+        if not _is_hip:
+            raise RuntimeError("MiMo attention-communication TBO requires ROCm")
+        if not get_moe_a2a_backend().is_mori():
+            raise RuntimeError(
+                "MiMo attention-communication TBO requires the MORI A2A backend"
+            )
+        if not get_deepep_mode().resolve(is_extend_in_batch=True).is_normal():
+            raise RuntimeError(
+                "MiMo attention-communication TBO currently supports MORI normal mode only"
+            )
+        if not layer.layer_communicator.supports_tbo_attn_communication():
+            raise RuntimeError(
+                "MiMo attention-communication TBO requires either a no-op or TP "
+                "all-gather before attention, plus TP reduce-scatter before MoE "
+                "on the same group"
+            )
+        prepare_attn_operations = (
+            [
+                layer.op_comm_prepare_attn_a,
+                operations.YieldOperation(),
+                layer.op_comm_prepare_attn_b,
+            ]
+            if layer.layer_communicator.has_tbo_attn_all_gather()
+            else [layer.op_comm_prepare_attn]
+        )
+        return OperationsStrategy(
+            deep_gemm_num_sms=deep_gemm_num_sms,
+            tbo_delta_stages=0,
+            operations=[
+                *prepare_attn_operations,
+                layer.self_attn.op_prepare,
+                layer.self_attn.op_core,
+                layer.op_comm_prepare_mlp_a,
+                operations.YieldOperation(),
+                layer.op_comm_prepare_mlp_b,
+                layer.mlp.op_gate,
+                layer.mlp.op_select_experts,
+                layer.mlp.op_dispatch_a,
+                operations.YieldOperation(),
+                layer.mlp.op_dispatch_b,
+                layer.mlp.op_experts,
+                layer.mlp.op_combine_a,
+                operations.YieldOperation(),
+                layer.mlp.op_combine_b,
+                layer.mlp.op_output,
+                layer.op_comm_postprocess_layer,
+            ],
+        )
 
     return OperationsStrategy(
         deep_gemm_num_sms=deep_gemm_num_sms,

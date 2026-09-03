@@ -84,6 +84,7 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
             return SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
                 spec_info=None,
+                extend_num_tokens=sum(input_lengths),
                 reqs=[
                     SimpleNamespace(origin_input_ids=[0] * input_length)
                     for input_length in input_lengths

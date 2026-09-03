@@ -126,6 +126,60 @@ def _is_scalar_f32_scale(scale) -> bool:
     )
 
 
+def _mimo_logical_qkv_views(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Return live-token Q/K/V views and the physical query row count.
+
+    TBO pads token-major tensors to the attention-TP width while keeping
+    ``extend_seq_lens_cpu`` logical. MiMo's ASM kernels consume only the live
+    prefix; downstream TBO stages still require an output with the original
+    physical row count.
+    """
+    lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    physical_tokens = q.shape[0]
+    if lengths is None:
+        return q, k, v, physical_tokens
+
+    logical_tokens = sum(int(length) for length in lengths)
+    if logical_tokens < 0:
+        raise ValueError(f"MiMo extend token count must be non-negative: {lengths}")
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if tensor.shape[0] < logical_tokens:
+            raise ValueError(
+                f"MiMo {name} has {tensor.shape[0]} physical rows but metadata "
+                f"requires {logical_tokens} live rows"
+            )
+
+    return (
+        q[:logical_tokens],
+        k[:logical_tokens],
+        v[:logical_tokens],
+        physical_tokens,
+    )
+
+
+def _allocate_mimo_asm_output(
+    q: torch.Tensor,
+    logical_tokens: int,
+    output_tokens: int,
+    num_heads: int,
+    value_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate a physical TBO output and return its live-token prefix."""
+    if output_tokens < logical_tokens:
+        raise ValueError(
+            f"MiMo ASM output has {output_tokens} rows for {logical_tokens} live tokens"
+        )
+    output = q.new_empty((output_tokens, num_heads, value_head_dim))
+    if output_tokens > logical_tokens:
+        output[logical_tokens:].zero_()
+    return output, output[:logical_tokens]
+
+
 def can_use_mimo_fresh_bf16_asm(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -182,6 +236,7 @@ def mimo_fresh_bf16_asm(
     v: torch.Tensor,
     layer: RadixAttention,
     forward_batch: ForwardBatch,
+    output_token_count: int | None = None,
 ) -> torch.Tensor:
     """Run gfx950 D192/V128 ASM with a native V128 model/cache ABI."""
     lengths = forward_batch.extend_seq_lens_cpu
@@ -206,13 +261,19 @@ def mimo_fresh_bf16_asm(
         layer.v_head_dim,
     )
 
-    output = q.new_empty(
-        (
-            batch_size,
-            sequence_length,
-            layer.tp_q_head_num,
-            layer.v_head_dim,
-        )
+    logical_tokens = batch_size * sequence_length
+    output_storage, output_live = _allocate_mimo_asm_output(
+        q,
+        logical_tokens,
+        logical_tokens if output_token_count is None else output_token_count,
+        layer.tp_q_head_num,
+        layer.v_head_dim,
+    )
+    output = output_live.view(
+        batch_size,
+        sequence_length,
+        layer.tp_q_head_num,
+        layer.v_head_dim,
     )
     result = fmha_v3_fwd(
         q_4d,
@@ -236,7 +297,7 @@ def mimo_fresh_bf16_asm(
     )
     if result[0].data_ptr() != output.data_ptr():
         raise RuntimeError("gfx950 MiMo fresh BF16 ASM ignored its output buffer")
-    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 def can_use_mimo_fresh_bf16_varlen_asm(
@@ -296,6 +357,7 @@ def mimo_fresh_bf16_varlen_asm(
     v: torch.Tensor,
     layer: RadixAttention,
     forward_batch: ForwardBatch,
+    output_token_count: int | None = None,
 ) -> torch.Tensor:
     """Run gfx950's grouped D192/V128 ASM on a fresh ragged MiMo batch."""
     lengths = forward_batch.extend_seq_lens_cpu
@@ -306,7 +368,14 @@ def mimo_fresh_bf16_varlen_asm(
     k_varlen = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
     v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-    output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+    logical_tokens = q.shape[0]
+    output_storage, output = _allocate_mimo_asm_output(
+        q,
+        logical_tokens,
+        logical_tokens if output_token_count is None else output_token_count,
+        layer.tp_q_head_num,
+        layer.v_head_dim,
+    )
     cu_seqlens = backend.qo_indptr[: batch_size + 1]
     result = fmha_v3_varlen_fwd(
         q_varlen,
@@ -342,7 +411,7 @@ def mimo_fresh_bf16_varlen_asm(
         raise RuntimeError(
             "gfx950 MiMo fresh BF16 varlen ASM ignored its output buffer"
         )
-    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 def can_use_mimo_chunk_bf16_varlen_asm(
@@ -360,25 +429,26 @@ def can_use_mimo_chunk_bf16_varlen_asm(
     v_buf: torch.Tensor,
     metadata,
 ) -> bool:
-    """Return whether a cached chunk-prefill can reuse MiMo BF16 varlen ASM."""
+    """Return whether cached ragged prefill can reuse MiMo BF16 varlen ASM."""
     extend_lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
     prefix_lengths = getattr(forward_batch, "extend_prefix_lens_cpu", None)
     seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-    valid_single_chunk = (
+    valid_ragged_batch = (
         extend_lengths is not None
         and prefix_lengths is not None
         and seq_lens_cpu is not None
-        and len(extend_lengths) == 1
-        and len(prefix_lengths) == 1
-        and len(seq_lens_cpu) == 1
+        and len(extend_lengths) > 0
+        and len(extend_lengths) == len(prefix_lengths) == len(seq_lens_cpu)
     )
-    if not valid_single_chunk:
+    if not valid_ragged_batch:
         return False
 
-    extend_len = int(extend_lengths[0])
-    prefix_len = int(prefix_lengths[0])
-    seq_len = int(seq_lens_cpu[0])
+    extend_lengths = [int(length) for length in extend_lengths]
+    prefix_lengths = [int(length) for length in prefix_lengths]
+    seq_lengths = [int(length) for length in seq_lens_cpu]
+    total_q = sum(extend_lengths)
     total_kv = int(forward_batch.seq_lens_sum)
+    batch_size = len(extend_lengths)
     expected_k_tail = (
         CK_MIMO_PREFILL_KV_HEADS,
         CK_MIMO_PREFILL_HEAD_DIM // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
@@ -399,13 +469,20 @@ def can_use_mimo_chunk_bf16_varlen_asm(
         and not is_swa_layer
         and sinks is None
         and tuple(window_size) == (-1, -1)
-        and prefix_len > 0
-        and extend_len > 128
-        and seq_len == prefix_len + extend_len
-        and total_kv == seq_len
-        and q.shape[0] == extend_len
-        and k.shape[0] == extend_len
-        and v.shape[0] == extend_len
+        and any(prefix_len > 0 for prefix_len in prefix_lengths)
+        and all(prefix_len >= 0 for prefix_len in prefix_lengths)
+        and all(extend_len > 0 for extend_len in extend_lengths)
+        and max(extend_lengths) > 128
+        and all(
+            seq_len == prefix_len + extend_len
+            for seq_len, prefix_len, extend_len in zip(
+                seq_lengths, prefix_lengths, extend_lengths
+            )
+        )
+        and total_kv == sum(seq_lengths)
+        and q.shape[0] == total_q
+        and k.shape[0] == total_q
+        and v.shape[0] == total_q
         and q.dtype == torch.bfloat16
         and k.dtype == torch.bfloat16
         and v.dtype == torch.bfloat16
@@ -437,11 +514,11 @@ def can_use_mimo_chunk_bf16_varlen_asm(
         and metadata.kv_indices.device == q.device
         and metadata.kv_indptr.device == q.device
         and backend.qo_indptr.device == q.device
-        and metadata.kv_indices.numel() >= seq_len
-        and metadata.kv_indptr.numel() >= 2
-        and backend.qo_indptr.numel() >= 2
-        and int(metadata.max_q_len) == extend_len
-        and int(metadata.max_kv_len) == seq_len
+        and metadata.kv_indices.numel() >= total_kv
+        and metadata.kv_indptr.numel() >= batch_size + 1
+        and backend.qo_indptr.numel() >= batch_size + 1
+        and int(metadata.max_q_len) == max(extend_lengths)
+        and int(metadata.max_kv_len) == max(seq_lengths)
         and k_buf.ndim == 5
         and v_buf.ndim == 5
         and tuple(k_buf.shape[1:]) == expected_k_tail
@@ -460,26 +537,36 @@ def mimo_chunk_bf16_varlen_asm(
     k_buf: torch.Tensor,
     v_buf: torch.Tensor,
     metadata,
+    output_token_count: int | None = None,
 ) -> torch.Tensor:
-    """Run gfx950 D192/V128 ASM for one cached MiMo chunk-prefill."""
-    extend_len = int(forward_batch.extend_seq_lens_cpu[0])
-    seq_len = int(forward_batch.seq_lens_cpu[0])
-    slot_ids = metadata.kv_indices[:seq_len]
+    """Run gfx950 D192/V128 ASM for a cached ragged MiMo prefill batch."""
+    extend_lengths = [int(length) for length in forward_batch.extend_seq_lens_cpu]
+    seq_lengths = [int(length) for length in forward_batch.seq_lens_cpu]
+    batch_size = len(extend_lengths)
+    total_q = sum(extend_lengths)
+    total_kv = sum(seq_lengths)
+    slot_ids = metadata.kv_indices[:total_kv]
     k_full, v_full = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
     q_varlen = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
     k_varlen = k_full.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
     v_varlen = v_full.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-    output = q.new_empty((extend_len, layer.tp_q_head_num, layer.v_head_dim))
+    output_storage, output = _allocate_mimo_asm_output(
+        q,
+        total_q,
+        total_q if output_token_count is None else output_token_count,
+        layer.tp_q_head_num,
+        layer.v_head_dim,
+    )
     result = fmha_v3_varlen_fwd(
         q_varlen,
         k_varlen,
         v_varlen,
-        backend.qo_indptr[:2],
-        metadata.kv_indptr[:2],
-        extend_len,
-        seq_len,
-        extend_len,
+        backend.qo_indptr[: batch_size + 1],
+        metadata.kv_indptr[: batch_size + 1],
+        max(extend_lengths),
+        max(seq_lengths),
+        min(extend_lengths),
         0.0,
         layer.scaling,
         0.0,
@@ -505,7 +592,7 @@ def mimo_chunk_bf16_varlen_asm(
         raise RuntimeError(
             "gfx950 MiMo chunk BF16 varlen ASM ignored its output buffer"
         )
-    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 def can_use_mimo_fresh_bf16_swa_varlen(
@@ -1158,6 +1245,15 @@ def forward_extend_vectorized_5d(
     Returns the ``(T, H_q * D_v)`` attention output, ready to be
     returned from ``AiterAttnBackend.forward_extend``.
     """
+    asm_q, asm_k, asm_v = q, k, v
+    asm_output_kwargs = {}
+    if MIMO_FRESH_BF16_ASM_ENABLED and is_gfx950():
+        asm_q, asm_k, asm_v, physical_q_tokens = _mimo_logical_qkv_views(
+            q, k, v, forward_batch
+        )
+        if asm_q.shape[0] != physical_q_tokens:
+            asm_output_kwargs = {"output_token_count": physical_q_tokens}
+
     # Path 1: fresh-prompt shortcut.
     extend_no_prefix = forward_batch.extend_prefix_lens_cpu is not None and not any(
         forward_batch.extend_prefix_lens_cpu
@@ -1176,28 +1272,41 @@ def forward_extend_vectorized_5d(
     if extend_no_prefix:
         if can_use_mimo_fresh_bf16_asm(
             backend,
-            q,
-            k,
-            v,
+            asm_q,
+            asm_k,
+            asm_v,
             layer,
             forward_batch,
             window_size,
             sinks,
         ):
-            return mimo_fresh_bf16_asm(q, k, v, layer, forward_batch)
+            return mimo_fresh_bf16_asm(
+                asm_q,
+                asm_k,
+                asm_v,
+                layer,
+                forward_batch,
+                **asm_output_kwargs,
+            )
 
         if can_use_mimo_fresh_bf16_varlen_asm(
             backend,
-            q,
-            k,
-            v,
+            asm_q,
+            asm_k,
+            asm_v,
             layer,
             forward_batch,
             window_size,
             sinks,
         ):
             return mimo_fresh_bf16_varlen_asm(
-                backend, q, k, v, layer, forward_batch
+                backend,
+                asm_q,
+                asm_k,
+                asm_v,
+                layer,
+                forward_batch,
+                **asm_output_kwargs,
             )
 
         if can_use_mimo_fresh_bf16_swa_varlen(
@@ -1296,9 +1405,9 @@ def forward_extend_vectorized_5d(
     # gfx942 never qualifies for either (is_gfx950() is false).
     if can_use_mimo_chunk_bf16_varlen_asm(
         backend,
-        q,
-        k,
-        v,
+        asm_q,
+        asm_k,
+        asm_v,
         layer,
         forward_batch,
         window_size,
@@ -1311,12 +1420,13 @@ def forward_extend_vectorized_5d(
     ):
         return mimo_chunk_bf16_varlen_asm(
             backend,
-            q,
+            asm_q,
             layer,
             forward_batch,
             k_buf,
             v_buf,
             metadata,
+            **asm_output_kwargs,
         )
 
     if can_use_mimo_flydsl_fp8_prefill(

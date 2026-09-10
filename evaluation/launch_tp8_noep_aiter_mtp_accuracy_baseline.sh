@@ -38,16 +38,27 @@ export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
+# Optional reproducibility control; unset preserves SGLang's seed selection.
+export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
-export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-65536}"
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
-export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
 export ENABLE_TWO_BATCH_OVERLAP="${ENABLE_TWO_BATCH_OVERLAP:-0}"
-export SGLANG_TBO_MIM_SEQ_LEN="${SGLANG_TBO_MIM_SEQ_LEN:-8000}"
+export SGLANG_TBO_MIM_SEQ_LEN="${SGLANG_TBO_MIM_SEQ_LEN:-2000}"
 
 if ! [[ "${SGLANG_TBO_MIM_SEQ_LEN}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SGLANG_TBO_MIM_SEQ_LEN must be a positive integer, observed '${SGLANG_TBO_MIM_SEQ_LEN}'" >&2
+  exit 2
+fi
+if ! [[ "${TOKENIZER_WORKER_NUM}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TOKENIZER_WORKER_NUM must be a positive integer" >&2
+  exit 2
+fi
+if [[ -n "${SERVER_RANDOM_SEED}" ]] && ! [[ "${SERVER_RANDOM_SEED}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "SERVER_RANDOM_SEED must be a non-negative integer or unset" >&2
   exit 2
 fi
 
@@ -68,11 +79,16 @@ echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-ver
 
 echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
+echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
 echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
 
 mkdir -p ${LOG_DIR}
 
 cuda_graph_args=(--cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}")
+seed_args=()
+if [[ -n "${SERVER_RANDOM_SEED}" ]]; then
+  seed_args+=(--random-seed "${SERVER_RANDOM_SEED}")
+fi
 if [[ -n "${CUDA_GRAPH_BS_DECODE}" ]]; then
   read -r -a cuda_graph_bs <<< "${CUDA_GRAPH_BS_DECODE}"
   cuda_graph_args+=(--cuda-graph-bs-decode "${cuda_graph_bs[@]}")
@@ -111,6 +127,8 @@ echo "HIP non-greedy EAGLE verifier: ${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY}"
 python3 -u -m sglang.launch_server \
   --model-path /models/MiMo-V2.5-Pro/ \
   --tp-size 8 \
+  --tokenizer-worker-num "${TOKENIZER_WORKER_NUM}" \
+  "${seed_args[@]}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --host 0.0.0.0 \
   --port 30001 \

@@ -135,6 +135,10 @@ class ForwardMetadata:
     paged_kv_last_page_len: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # Lazily compacted request-major SWA metadata used by cached MiMo varlen.
+    mimo_swa_kv_indices: Optional[torch.Tensor] = None
+    mimo_swa_kv_indptr: Optional[torch.Tensor] = None
+    mimo_swa_max_kv_len: Optional[int] = None
 
 
 global_workspace_buffer = None

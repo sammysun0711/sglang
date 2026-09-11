@@ -34,5 +34,6 @@ python3 -m sglang.bench_serving \
     --warmup-requests "${warmup_requests}" \
     --max-concurrency "${max_concurrency}" \
     --profile \
+    --tokenize-prompt \
     --profile-output-dir "${profile_output_dir}" \
     --profile-prefix "${profile_prefix}"

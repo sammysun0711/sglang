@@ -64,6 +64,8 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import aiter_w8a8_block_fp8_linear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -915,7 +917,20 @@ class MiMoV2DecoderLayer(nn.Module):
             is_gfx95_supported() or is_gfx942_supported()
         ):
             return ""
-        weight = getattr(getattr(self.self_attn, "qkv_proj", None), "weight", None)
+        qkv_proj = getattr(self.self_attn, "qkv_proj", None)
+        quant_method = getattr(qkv_proj, "quant_method", None)
+        # The fused producer emits per-1x128 FP8 with AITER's scale layout.
+        # Check the selected consumer before replacing its BF16 input.
+        if (
+            not isinstance(quant_method, Fp8LinearMethod)
+            or not quant_method.block_quant
+            or quant_method.use_mxfp8
+            or quant_method.use_marlin
+            or quant_method.quant_config.weight_block_size != [128, 128]
+            or quant_method.w8a8_block_fp8_linear is not aiter_w8a8_block_fp8_linear
+        ):
+            return ""
+        weight = getattr(qkv_proj, "weight", None)
         # gfx942 rewrites FP8 weights to e4m3fnuz at load time
         # (Fp8LinearMethod.process_weights_after_loading_block_quant), so both
         # FP8 element types have to be accepted here.  The fused kernel takes

@@ -8,6 +8,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 export HSA_NO_SCRATCH_RECLAIM=1
 export MC_GID_INDEX=3
 export MC_TE_METRIC=1
+export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-112}"
 export SGLANG_SPEC_NAN_DETECTION=1
 export SGLANG_SPEC_OOB_DETECTION=1
 export SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY="${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY:-1}"
@@ -37,7 +38,7 @@ export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
 export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
-export RANDOM_SEED="${RANDOM_SEED:-12345}"
+export RANDOM_SEED="${RANDOM_SEED:-1234}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.75}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
@@ -48,11 +49,15 @@ export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM="${SGLANG_AITER_MIMO_FRESH_BF16_ASM:-1}"
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN="${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN:-1}"
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN="${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN:-1}"
+# Cached-SWA compacts prefix-tail + extend KV for the BF16 varlen kernel.
+# This is independent of TBO and remains opt-in for the SWA on/off experiment.
+export SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN="${SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN:-0}"
 
 # EP + MORI + TBO settings.
-# MORI leaves the next attention input sharded. Keep QKV quantization after the
-# TP all-gather because the current ROCm all-gather path does not support FP8.
-export SGLANG_MIMO_FUSED_RMS_QKV_QUANT=0
+# QKV fusion also enables gathering prequantized FP8 activations (as uint8)
+# with FP32 scales and scale-layout restoration. Set to 0 for the combined
+# fused-RMSNorm/quant + FP8-all-gather ablation; there is no separate AG toggle.
+export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-1}"
 # Fused pre-MoE quantization is restricted to no-EP execution in MiMoV2 and is
 # disabled explicitly for this EP8/A2A launcher.
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
@@ -65,6 +70,8 @@ unset MORI_DISABLE_P2P
 # - MANUAL keeps SGLang's constructor defaults (IntraNode: 80 blocks, 16 waves/block).
 # - AUTO loads the active MORI package's dispatch/combine tuning JSON at startup.
 #   Example: MORI_EP_LAUNCH_CONFIG_MODE=AUTO ./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+#   Set MORI_EP_TUNING_CONFIG=/path/to/config.json to select a frozen bundle.
+#   The file is inactive in MANUAL mode; setting a path does not switch modes.
 #   Retune EP8 for MiMo-V2.5-Pro hidden_size=6144 before comparing performance.
 # - MORI_TUNING_SCOPE only controls the offline tuner and is intentionally not set here.
 export MORI_EP_LAUNCH_CONFIG_MODE="${MORI_EP_LAUNCH_CONFIG_MODE:-MANUAL}"
@@ -78,6 +85,7 @@ esac
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-${CHUNKED_PREFILL_SIZE}}"
 export SGLANG_ENABLE_WAR_BARRIER="${SGLANG_ENABLE_WAR_BARRIER:-0}"
 export ENABLE_TBO="${ENABLE_TBO:-1}"
+export TBO_MIN_EXTEND_TOKENS="${TBO_MIN_EXTEND_TOKENS:-2048}"
 export TBO_TOKEN_DISTRIBUTION_THRESHOLD="${TBO_TOKEN_DISTRIBUTION_THRESHOLD:-0.48}"
 
 case "${ENABLE_TBO}" in
@@ -108,6 +116,52 @@ else
   export SGLANG_MIMO_TBO_ATTN_COMM=0
 fi
 
+for toggle in SGLANG_MIMO_FUSED_RMS_QKV_QUANT SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN; do
+  case "${!toggle}" in
+    0 | 1) ;;
+    *)
+      echo "${toggle} must be 0 or 1, got: ${!toggle}" >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ "${ENABLE_TBO}" == "1" ]] &&
+  ! [[ "${TBO_MIN_EXTEND_TOKENS}" =~ ^[0-9]+$ && "${TBO_MIN_EXTEND_TOKENS}" =~ [1-9] ]]; then
+  echo "TBO_MIN_EXTEND_TOKENS must be a positive integer, got: ${TBO_MIN_EXTEND_TOKENS}" >&2
+  exit 2
+fi
+
+# Optional tuning inputs: leave unset for runtime defaults. AITER also accepts
+# a colon-separated CSV list. Validate and fingerprint inputs without importing
+# SGLang/AITER/MORI or triggering their config merging and device discovery.
+tuning_config_info=()
+for config_var in AITER_CONFIG_FMOE MORI_EP_TUNING_CONFIG; do
+  config_value="${!config_var:-}"
+  if [[ -z "${config_value}" ]]; then
+    unset "${config_var}"
+    tuning_config_info+=("${config_var}=<unset; runtime default>")
+    continue
+  fi
+  export "${config_var}"
+  if [[ "${config_var}" == "MORI_EP_TUNING_CONFIG" && "${MORI_EP_LAUNCH_CONFIG_MODE}" == "MANUAL" ]]; then
+    tuning_config_info+=("${config_var}=${config_value} (inactive in MANUAL mode)")
+    continue
+  fi
+  config_paths=("${config_value}")
+  if [[ "${config_var}" == "AITER_CONFIG_FMOE" ]]; then
+    IFS=: read -r -a config_paths <<< "${config_value}"
+  fi
+  tuning_config_info+=("${config_var}=${config_value}")
+  for config_path in "${config_paths[@]}"; do
+    if [[ ! -f "${config_path}" || ! -r "${config_path}" ]]; then
+      echo "${config_var} requires a readable file, got: ${config_path}" >&2
+      exit 2
+    fi
+    config_hash="$(sha256sum < "${config_path}")"
+    tuning_config_info+=("${config_var} SHA256 ${config_hash%% *} ${config_path}")
+  done
+done
+
 # Real MTP acceptance for accuracy validation.
 unset SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
 
@@ -115,7 +169,6 @@ export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 export LOG_DIR="${LOG_DIR:-./logs/accuracy_${RUN_ID}}"
 export LOG_FILE="${LOG_FILE:-server_tp8_ep8_aiter_mori_tbo_mtp_accuracy.log}"
 
-echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
 mkdir -p "${LOG_DIR}"
 
 cuda_graph_args=(--cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}")
@@ -130,8 +183,6 @@ if [[ "${DISABLE_CUSTOM_ALL_REDUCE:-0}" == "1" ]]; then
   custom_all_reduce_args+=(--disable-custom-all-reduce)
   custom_all_reduce_status=disabled
 fi
-
-echo "Custom all-reduce: ${custom_all_reduce_status}"
 
 kv_cache_args=()
 if [[ -n "${KV_CACHE_DTYPE}" && "${KV_CACHE_DTYPE}" != "auto" ]]; then
@@ -151,6 +202,7 @@ tbo_status=disabled
 if [[ "${ENABLE_TBO}" == "1" ]]; then
   tbo_args+=(
     --enable-two-batch-overlap
+    --tbo-min-extend-tokens "${TBO_MIN_EXTEND_TOKENS}"
     --tbo-token-distribution-threshold "${TBO_TOKEN_DISTRIBUTION_THRESHOLD}"
   )
   tbo_status=enabled
@@ -169,11 +221,22 @@ if [[ "${ENABLE_TBO}" == "1" && "${CUDA_GRAPH_BACKEND_DECODE}" != "disabled" ]];
   fi
 fi
 
-echo "Radix cache: ${radix_cache_status}"
-echo "HIP non-greedy EAGLE verifier: ${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY}"
-echo "Configuration: model=${MODEL_PATH}, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, tp=8, ep=8, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, mori-mode=normal, mori-launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tbo=${tbo_status}, attn-comm-tbo=${SGLANG_MIMO_TBO_ATTN_COMM}, war-barrier=${SGLANG_ENABLE_WAR_BARRIER}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, seed=${RANDOM_SEED}, reasoning-parser=${REASONING_PARSER}, overlap=enabled"
-echo "Server log: ${LOG_DIR}/${LOG_FILE}"
-echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
+{
+  echo "Working directory: ${PWD}"
+  echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
+  echo "Custom all-reduce: ${custom_all_reduce_status}"
+  echo "Radix cache: ${radix_cache_status}"
+  echo "HIP non-greedy EAGLE verifier: ${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY}"
+  echo "Configuration: model=${MODEL_PATH}, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, tp=8, ep=8, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, mori-mode=normal, mori-launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tbo=${tbo_status}, attn-comm-tbo=${SGLANG_MIMO_TBO_ATTN_COMM}, war-barrier=${SGLANG_ENABLE_WAR_BARRIER}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, seed=${RANDOM_SEED}, reasoning-parser=${REASONING_PARSER}, overlap=enabled"
+  echo "Server log: ${LOG_DIR}/${LOG_FILE}"
+  echo "TBO minimum EXTEND tokens: ${TBO_MIN_EXTEND_TOKENS}"
+  echo "TBO token distribution threshold: ${TBO_TOKEN_DISTRIBUTION_THRESHOLD}"
+  echo "Cached SWA fast path: ${SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN}"
+  echo "MORI transport: dispatch=${SGLANG_MORI_DISPATCH_DTYPE}, combine=${SGLANG_MORI_COMBINE_DTYPE}, dispatch-capacity-per-rank=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}, receive-cap=${SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS:-0}, sdma=${MORI_ENABLE_SDMA}"
+  echo "NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS}"
+  printf '%s\n' "${tuning_config_info[@]}"
+  echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
+} | tee "${LOG_DIR}/launcher_config.log"
 
 python3 -u -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \

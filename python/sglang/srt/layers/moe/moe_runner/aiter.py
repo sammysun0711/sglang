@@ -123,6 +123,13 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
 
 
 @functools.cache
+def _aiter_fused_moe_supports_ep_route_convention() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "ep_has_fake_route" in inspect.signature(fused_moe).parameters
+
+
+@functools.cache
 def _aiter_fused_moe_supports_transposed_a1_scale() -> bool:
     from aiter.fused_moe import fused_moe
 
@@ -199,6 +206,14 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+
+        if (
+            quant_info.expert_mask is not None
+            and self.config.top_k is not None
+            and runner_input.topk_ids.shape[-1] == self.config.top_k
+            and _aiter_fused_moe_supports_ep_route_convention()
+        ):
+            extra["ep_has_fake_route"] = False
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,

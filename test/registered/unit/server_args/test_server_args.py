@@ -840,6 +840,34 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
 
+class TestTboMinExtendTokensArgs(CustomTestCase):
+    def test_cli_default_and_overrides(self):
+        for value in (None, 1, 2048, 32768):
+            with self.subTest(value=value):
+                cli = ["--model-path", "dummy"]
+                if value is not None:
+                    cli += ["--tbo-min-extend-tokens", str(value)]
+                args = prepare_server_args(cli)
+                self.assertEqual(
+                    args.tbo_min_extend_tokens, 2048 if value is None else value
+                )
+
+    def test_rejects_nonpositive_and_noninteger_values(self):
+        for value in (0, -1, 1.5, "1", None, True):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "tbo-min-extend-tokens must be a positive integer"
+            ):
+                ServerArgs(model_path="dummy", tbo_min_extend_tokens=value)
+
+    def test_cli_rejects_invalid_values(self):
+        for value in ("0", "-1", "1.5", "invalid"):
+            with self.subTest(value=value), patch("sys.stderr"):
+                with self.assertRaises((ValueError, SystemExit)):
+                    prepare_server_args(
+                        ["--model-path", "dummy", "--tbo-min-extend-tokens", value]
+                    )
+
+
 class TestMiMoNoEpTboArgs(CustomTestCase):
     @staticmethod
     def _make_server_args(moe_layer_freq):

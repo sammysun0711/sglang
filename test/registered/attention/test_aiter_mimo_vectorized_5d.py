@@ -290,6 +290,79 @@ def _make_cached_bf16_ragged_case(
     return backend, layer, forward_batch, q, k, v
 
 
+def _make_cached_bf16_swa_ragged_case(
+    prefix_lengths=(257, 3),
+    extend_lengths=(257, 129),
+    physical_tokens=None,
+):
+    seq_lengths = [
+        prefix_len + extend_len
+        for prefix_len, extend_len in zip(prefix_lengths, extend_lengths)
+    ]
+    logical_tokens = sum(extend_lengths)
+    if physical_tokens is None:
+        physical_tokens = logical_tokens
+    total_kv = sum(seq_lengths)
+    num_blocks = (total_kv + 63) // 64
+    k_buf = torch.zeros((num_blocks, 1, 24, 64, 8), dtype=torch.bfloat16)
+    v_buf = torch.zeros((num_blocks, 1, 8, 128, 8), dtype=torch.bfloat16)
+    pool = SimpleNamespace(
+        dtype=torch.bfloat16,
+        store_dtype=torch.bfloat16,
+        start_layer=0,
+        k_buffer=[k_buf],
+        v_buffer=[v_buf],
+    )
+
+    qo_indptr = [0]
+    kv_indptr = [0]
+    for extend_len, seq_len in zip(extend_lengths, seq_lengths):
+        qo_indptr.append(qo_indptr[-1] + extend_len)
+        kv_indptr.append(kv_indptr[-1] + seq_len)
+    metadata = SimpleNamespace(
+        swa_page_table=torch.arange(total_kv, dtype=torch.int32) + 1000,
+        kv_indices=torch.arange(total_kv, dtype=torch.int32),
+        kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        max_q_len=max(extend_lengths),
+        max_kv_len=max(seq_lengths),
+    )
+    backend = SimpleNamespace(
+        input_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=64,
+        logits_soft_cap=0.0,
+        token_to_kv_pool=pool,
+        forward_metadata=metadata,
+        qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        sliding_window_size=128,
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        head_dim=192,
+        scaling=192**-0.5,
+        mimo_original_v_head_dim=128,
+    )
+    forward_batch = SimpleNamespace(
+        extend_prefix_lens_cpu=list(prefix_lengths),
+        extend_seq_lens_cpu=list(extend_lengths),
+        seq_lens_cpu=torch.tensor(seq_lengths, dtype=torch.int32),
+        seq_lens_sum=total_kv,
+    )
+    q = torch.zeros((physical_tokens, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((physical_tokens, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((physical_tokens, 1, 128), dtype=torch.bfloat16)
+    sinks = torch.linspace(-1.0, 1.0, 16, dtype=torch.bfloat16)
+    return backend, layer, forward_batch, q, k, v, sinks
+
+
 @pytest.mark.parametrize("lengths", [(256, 256), (255, 257)])
 def test_fresh_mimo_swa_uses_native_v128_ck_varlen(monkeypatch, lengths):
     backend, layer, forward_batch, q, k, v, sinks = _make_fresh_swa_case(
@@ -350,6 +423,48 @@ def test_fresh_mimo_swa_uses_native_v128_ck_varlen(monkeypatch, lengths):
     assert captured["kwargs"]["out"].shape == (sum(lengths), 16, 128)
     assert captured["kwargs"]["out"].stride(-2) == 128
     assert torch.all(output == 7.0)
+
+
+def test_tbo_padded_fresh_mimo_swa_uses_logical_varlen_rows(monkeypatch):
+    logical_tokens = 257
+    physical_tokens = 264
+    backend, layer, forward_batch, _, _, _, sinks = _make_fresh_swa_case(
+        lengths=(logical_tokens,)
+    )
+    q = torch.zeros((physical_tokens, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((physical_tokens, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((physical_tokens, 1, 128), dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_varlen(q_varlen, k_varlen, v_varlen, *args, **kwargs):
+        captured.update(q=q_varlen, k=k_varlen, v=v_varlen, out=kwargs["out"])
+        kwargs["out"].fill_(7.0)
+        return kwargs["out"]
+
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_SWA_VARLEN_ENABLED", True)
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", False)
+    monkeypatch.setattr(aiter_utils, "MIMO_CACHED_BF16_SWA_VARLEN_ENABLED", False)
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setattr(aiter_utils, "flash_attn_varlen_func", fake_varlen)
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=2,
+        window_size=(128, -1),
+        sinks=sinks,
+    ).view(physical_tokens, 16, 128)
+
+    assert captured["q"].shape == (logical_tokens, 16, 192)
+    assert captured["k"].shape == (logical_tokens, 1, 192)
+    assert captured["v"].shape == (logical_tokens, 1, 128)
+    assert captured["out"].shape == (logical_tokens, 16, 128)
+    assert torch.all(output[:logical_tokens] == 7.0)
+    assert torch.count_nonzero(output[logical_tokens:]) == 0
 
 
 def test_fresh_mimo_swa_gfx942_fallback_uses_asymmetric_batch_prefill(
@@ -448,6 +563,193 @@ def test_fresh_mimo_swa_varlen_contract_guards_fall_back(monkeypatch, guard):
         forward_batch,
         window_size,
         sinks,
+    )
+
+
+@pytest.mark.parametrize("prefix_len", [0, 1, 127, 128, 129, 4096])
+@pytest.mark.parametrize("extend_len", [1, 129, 257])
+def test_cached_mimo_swa_compaction_preserves_causal_window(prefix_len, extend_len):
+    window = 128
+    ranges, kv_lengths, kv_indptr = aiter_utils._mimo_cached_swa_varlen_layout(
+        [prefix_len], [extend_len], window
+    )
+
+    tail_len = min(prefix_len, window)
+    assert ranges == [(prefix_len - tail_len, prefix_len + extend_len)]
+    assert kv_lengths == [tail_len + extend_len]
+    assert kv_indptr == [0, tail_len + extend_len]
+
+    compact_origin = prefix_len - tail_len
+    for query_index in range(extend_len):
+        absolute_query = prefix_len + query_index
+        original_keys = list(range(max(0, absolute_query - window), absolute_query + 1))
+        compact_query = tail_len + query_index
+        compact_keys = [
+            compact_origin + key_index
+            for key_index in range(max(0, compact_query - window), compact_query + 1)
+        ]
+        assert compact_keys == original_keys
+
+
+@pytest.mark.parametrize("padded_metadata_bounds", [False, True])
+@pytest.mark.parametrize("strided_q", [False, True])
+def test_cached_mimo_swa_uses_tail_varlen_with_sink_and_tbo_padding(
+    monkeypatch, padded_metadata_bounds, strided_q
+):
+    prefix_lengths = (257, 3)
+    extend_lengths = (257, 129)
+    logical_tokens = sum(extend_lengths)
+    physical_tokens = 392
+    backend, layer, forward_batch, q, k, v, sinks = _make_cached_bf16_swa_ragged_case(
+        prefix_lengths=prefix_lengths,
+        extend_lengths=extend_lengths,
+        physical_tokens=physical_tokens,
+    )
+    if padded_metadata_bounds:
+        backend.forward_metadata.max_q_len += 8
+        backend.forward_metadata.max_kv_len += 64
+    if strided_q:
+        q = torch.zeros((physical_tokens, 2 * 16 * 192), dtype=q.dtype)[:, ::2]
+    captured = {}
+
+    def fake_gather(k_buf, v_buf, slot_ids):
+        captured["slot_ids"] = slot_ids
+        compact_tokens = slot_ids.numel()
+        return (
+            torch.zeros((compact_tokens, 1, 192), dtype=torch.bfloat16),
+            torch.zeros((compact_tokens, 1, 128), dtype=torch.bfloat16),
+        )
+
+    def fake_varlen(q_varlen, k_varlen, v_varlen, *args, **kwargs):
+        captured.update(
+            q=q_varlen,
+            k=k_varlen,
+            v=v_varlen,
+            cu_q=args[0],
+            cu_k=args[1],
+            max_q=args[2],
+            max_k=args[3],
+            kwargs=kwargs,
+        )
+        kwargs["out"].fill_(17.0)
+        return kwargs["out"]
+
+    def reject_batch_prefill(*args, **kwargs):
+        raise AssertionError("qualified cached SWA must not use paged prefill")
+
+    monkeypatch.setattr(aiter_utils, "MIMO_CACHED_BF16_SWA_VARLEN_ENABLED", True)
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setattr(aiter_utils, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather)
+    monkeypatch.setattr(aiter_utils, "mha_batch_prefill_func", reject_batch_prefill)
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=3,
+        window_size=(128, -1),
+        sinks=sinks,
+    ).view(physical_tokens, 16, 128)
+
+    # Request 0 keeps full positions [129, 514); request 1 keeps [514, 646).
+    expected_slots = torch.cat(
+        (
+            backend.forward_metadata.swa_page_table[129:514],
+            backend.forward_metadata.swa_page_table[514:646],
+        )
+    )
+    assert torch.equal(captured["slot_ids"], expected_slots)
+    assert captured["q"].shape == (logical_tokens, 16, 192)
+    assert captured["q"].is_contiguous()
+    assert captured["k"].shape == (517, 1, 192)
+    assert captured["v"].shape == (517, 1, 128)
+    assert captured["cu_q"].tolist() == [0, 257, 386]
+    assert captured["cu_k"].tolist() == [0, 385, 517]
+    assert captured["max_q"] == 257
+    assert captured["max_k"] == 385
+    assert captured["kwargs"]["min_seqlen_q"] == 0
+    assert captured["kwargs"]["causal"] is True
+    assert captured["kwargs"]["window_size"] == (128, 0, 0)
+    assert captured["kwargs"]["sink_ptr"].dtype == torch.float32
+    assert captured["kwargs"]["out"].shape == (logical_tokens, 16, 128)
+    assert backend.forward_metadata.mimo_swa_kv_indices is captured["slot_ids"]
+    assert backend.forward_metadata.mimo_swa_kv_indptr.tolist() == [0, 385, 517]
+    assert backend.forward_metadata.mimo_swa_max_kv_len == 385
+    assert torch.all(output[:logical_tokens] == 17.0)
+    assert torch.count_nonzero(output[logical_tokens:]) == 0
+
+
+@pytest.mark.parametrize(
+    "guard", ["disabled", "wrong_arch", "short", "window", "no_sink"]
+)
+def test_cached_mimo_swa_falls_back_to_batch_prefill(monkeypatch, guard):
+    lengths = (128, 129) if guard == "short" else (257, 129)
+    backend, layer, batch, q, k, v, sinks = _make_cached_bf16_swa_ragged_case(
+        extend_lengths=lengths
+    )
+    window = 64 if guard == "window" else 128
+    layer.sliding_window_size = window
+    if guard == "no_sink":
+        sinks = None
+    captured = {}
+
+    def gather(k_buf, v_buf, slots):
+        captured["slots"] = slots
+        return q.new_zeros((slots.numel(), 1, 192)), q.new_zeros(
+            (slots.numel(), 1, 128)
+        )
+
+    def batch_prefill(q, *args, **kwargs):
+        captured["window"] = kwargs["window_size"]
+        return q.new_zeros((q.shape[0], 16, 128))
+
+    def reject_varlen(*args, **kwargs):
+        raise AssertionError("unsupported cached SWA must use the fallback")
+
+    monkeypatch.setattr(
+        aiter_utils, "MIMO_CACHED_BF16_SWA_VARLEN_ENABLED", guard != "disabled"
+    )
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: guard != "wrong_arch")
+    monkeypatch.setattr(aiter_utils, "flash_attn_varlen_func", reject_varlen)
+    monkeypatch.setattr(aiter_utils, "launch_gather_shuffle_5d_to_linear", gather)
+    monkeypatch.setattr(aiter_utils, "mha_batch_prefill_func", batch_prefill)
+
+    result = aiter_utils.forward_extend_vectorized_5d(
+        backend, q, k, v, layer, batch, bs0=3, window_size=(window, -1), sinks=sinks
+    )
+    assert result.shape == (sum(lengths), 16 * 128)
+    assert torch.equal(captured["slots"], backend.forward_metadata.swa_page_table)
+    assert captured["window"] == (window, -1)
+
+
+@pytest.mark.parametrize(
+    "guard", ["cache_dtype", "cache_shape", "seq_lengths", "slot_count", "indptr_dtype"]
+)
+def test_cached_mimo_swa_rejects_incompatible_cache_or_metadata(monkeypatch, guard):
+    backend, layer, batch, q, _, _, sinks = _make_cached_bf16_swa_ragged_case()
+    pool = backend.token_to_kv_pool
+    k_buf, v_buf = pool.k_buffer[0], pool.v_buffer[0]
+    metadata = backend.forward_metadata
+    if guard == "cache_dtype":
+        k_buf = k_buf.to(torch.float16)
+    elif guard == "cache_shape":
+        v_buf = v_buf[:, :, :, :64, :]
+    elif guard == "seq_lengths":
+        batch.seq_lens_cpu[0] += 1
+    elif guard == "slot_count":
+        metadata.swa_page_table = metadata.swa_page_table[:-1]
+    elif guard == "indptr_dtype":
+        backend.qo_indptr = backend.qo_indptr.to(torch.int64)
+    monkeypatch.setattr(aiter_utils, "MIMO_CACHED_BF16_SWA_VARLEN_ENABLED", True)
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setattr(aiter_utils, "flash_attn_varlen_func", lambda: None)
+
+    assert not aiter_utils.can_use_mimo_cached_bf16_swa_varlen(
+        backend, q, layer, batch, (128, -1), sinks, True, k_buf, v_buf, metadata
     )
 
 
@@ -2120,6 +2422,7 @@ def _make_flydsl_bf16_backend():
 
 def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
     captured = {}
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def fake_compile_pa_decode_tile(**kwargs):
         captured["tile"] = kwargs

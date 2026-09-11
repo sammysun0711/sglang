@@ -346,6 +346,7 @@ def test_prepare_attn_tbo_preallocates_output_before_collective(monkeypatch):
     group = object()
     compute_stream = object()
     output = object()
+    input_states = communicator._Fp8TransposedScaleInput((object(), object()))
     events = comm_stream.TboCommEvents(
         compute_done=SimpleNamespace(
             record=lambda stream: calls.append(("compute_done", stream))
@@ -379,7 +380,7 @@ def test_prepare_attn_tbo_preallocates_output_before_collective(monkeypatch):
     layer_communicator._context = object()
     layer_communicator.supports_tbo_attn_communication = lambda: True
     layer_communicator.has_tbo_attn_all_gather = lambda: True
-    layer_communicator._prepare_attn_local = lambda *args: ("input", "residual")
+    layer_communicator._prepare_attn_local = lambda *args: (input_states, "residual")
 
     pending = layer_communicator.prepare_attn_tbo_a(
         "hidden_states",
@@ -388,10 +389,10 @@ def test_prepare_attn_tbo_preallocates_output_before_collective(monkeypatch):
         tbo_subbatch_index=1,
     )
 
-    assert pending.hidden_states == "input"
+    assert pending.hidden_states is input_states
     assert pending.output_hidden_states is output
     assert calls == [
-        ("allocate", "input", layer_communicator._context),
+        ("allocate", input_states, layer_communicator._context),
         ("compute_done", compute_stream),
     ]
 
@@ -434,14 +435,164 @@ def test_tbo_attn_all_gather_tuple_allocation_uses_attention_group(monkeypatch):
         torch.empty((2, 1), dtype=torch.float16),
         torch.empty((2, 5), dtype=torch.bfloat16),
     )
-    output = communicator.CommunicateSimpleFn._allocate_scattered_to_tp_attn_full_output(
-        local,
-        SimpleNamespace(attn_tp_size=4),
+    output = (
+        communicator.CommunicateSimpleFn._allocate_scattered_to_tp_attn_full_output(
+            local,
+            SimpleNamespace(attn_tp_size=4),
+        )
     )
 
     assert [item.shape for item in output] == [(8, 3), (8, 1), (8, 5)]
     assert [item.dtype for item in output] == [item.dtype for item in local]
     assert symmetric_memory_calls == [(group, True)] * 3
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("with_extra", [False, True])
+@pytest.mark.parametrize("num_tokens", [0, 1, 3])
+@pytest.mark.parametrize("use_tbo", [False, True])
+def test_attn_all_gather_fp8_preserves_payloads_and_scale_layout(
+    monkeypatch,
+    transposed,
+    with_extra,
+    num_tokens,
+    use_tbo,
+):
+    # Both layouts have identical shape/strides; the global flag cannot tell
+    # us which layout this particular tuple uses.
+    monkeypatch.setattr(communicator, "_fused_rms_quant_transpose_scale", True)
+    group = object()
+    monkeypatch.setattr(communicator, "get_attention_tp_group", lambda: group)
+    monkeypatch.setattr(communicator, "is_allocation_symmetric", lambda: False)
+
+    local_activation = torch.arange(num_tokens * 256, dtype=torch.float32).reshape(
+        num_tokens, 256
+    )
+    local_activation = (local_activation % 16).to(torch.float8_e4m3fn)
+    logical_local_scale = torch.tensor(
+        [[0.25, 1.25], [0.5, 1.5], [0.75, 1.75]],
+        dtype=torch.float32,
+    )[:num_tokens]
+    encoded_local_scale = (
+        logical_local_scale.transpose(0, 1).contiguous().view_as(logical_local_scale)
+        if transposed
+        else logical_local_scale
+    )
+    local = (local_activation, encoded_local_scale)
+    if with_extra:
+        local += (local_activation.to(torch.bfloat16),)
+    if transposed:
+        local = communicator._Fp8TransposedScaleInput(local)
+
+    calls = []
+
+    def fake_all_gather(output, input_):
+        calls.append((output.dtype, input_.dtype, input_.clone()))
+        rows = input_.shape[0]
+        output[:rows].copy_(input_)
+        output[rows:].copy_(input_)
+
+    monkeypatch.setattr(
+        communicator,
+        "attn_tp_all_gather_into_tensor",
+        fake_all_gather,
+    )
+
+    context = SimpleNamespace(attn_tp_size=2)
+    if use_tbo:
+        buffers = (
+            communicator.CommunicateSimpleFn._allocate_scattered_to_tp_attn_full_output(
+                local,
+                context,
+            )
+        )
+        assert (
+            isinstance(buffers, communicator._Fp8TransposedScaleAllGatherBuffers)
+            == transposed
+        )
+        gathered = communicator.CommunicateSimpleFn._scattered_to_tp_attn_full_into(
+            buffers,
+            local,
+        )
+    else:
+        layer = communicator.LayerCommunicator.__new__(communicator.LayerCommunicator)
+        layer._context = context
+        layer.qkv_latent_func = None
+        layer._communicate_simple_fn = (
+            communicator.CommunicateSimpleFn._scattered_to_tp_attn_full
+        )
+        layer._prepare_attn_local = lambda *args: (local, None)
+        gathered, residual = layer.prepare_attn(None, None, None)
+        assert residual is None
+    gathered_activation, gathered_encoded_scale = gathered[:2]
+    assert isinstance(gathered, communicator._Fp8TransposedScaleInput) == transposed
+
+    expected_activation = torch.cat((local_activation, local_activation), dim=0)
+    assert gathered_activation.dtype == local_activation.dtype
+    assert torch.equal(
+        gathered_activation.view(torch.uint8),
+        expected_activation.view(torch.uint8),
+    )
+    expected_dtypes = [torch.uint8, torch.float32]
+    if with_extra:
+        expected_dtypes.append(torch.bfloat16)
+        assert torch.equal(gathered[2], torch.cat((local[2], local[2])))
+    assert [output_dtype for output_dtype, _, _ in calls] == expected_dtypes
+    assert [input_dtype for _, input_dtype, _ in calls] == expected_dtypes
+    assert torch.equal(calls[1][2], logical_local_scale)
+
+    global_rows = logical_local_scale.shape[0] * 2
+    scale_groups = logical_local_scale.shape[1]
+    logical_gathered_scale = (
+        gathered_encoded_scale.view(scale_groups, global_rows).transpose(0, 1)
+        if transposed
+        else gathered_encoded_scale
+    )
+    assert torch.equal(
+        logical_gathered_scale,
+        torch.cat((logical_local_scale, logical_local_scale), dim=0),
+    )
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.parametrize("with_extra", [False, True])
+def test_fused_qkv_producer_reports_scale_layout(
+    monkeypatch, transposed, with_residual, with_extra
+):
+    monkeypatch.setattr(communicator, "_use_aiter", True)
+    monkeypatch.setattr(communicator, "_is_fused_rms_qkv_quant_supported", True)
+    monkeypatch.setattr(communicator, "_fused_rms_quant_transpose_scale", transposed)
+    monkeypatch.setattr(
+        communicator, "_aiter_fp8_dtype", torch.float8_e4m3fn, raising=False
+    )
+    monkeypatch.setattr(
+        communicator,
+        "get_attn_tp_context",
+        lambda: SimpleNamespace(input_scattered=False, is_dsa=with_extra),
+    )
+    hidden = torch.ones(3, 256, dtype=torch.bfloat16)
+    residual = hidden.clone() if with_residual else None
+    quantized = (hidden.to(torch.float8_e4m3fn), torch.ones(3, 2))
+
+    def fused_quant(*args, **kwargs):
+        assert kwargs["transpose_scale"] == transposed
+        return quantized, hidden if with_extra else None, None, residual
+
+    monkeypatch.setattr(
+        communicator, "fused_rms_fp8_group_quant", fused_quant, raising=False
+    )
+    layer = communicator.LayerCommunicator.__new__(communicator.LayerCommunicator)
+    layer.input_layernorm = SimpleNamespace(
+        weight=torch.ones(256), variance_epsilon=1e-6
+    )
+    result, _ = layer._prepare_attn_local(hidden, residual, None, "fp8")
+    assert isinstance(result, communicator._Fp8TransposedScaleInput) == transposed
+    assert result[0] is quantized[0]
+    assert result[1] is quantized[1]
+    assert len(result) == (3 if with_extra else 2)
+    if with_extra:
+        assert result[2] is hidden
 
 
 def test_prepare_mlp_tbo_splits_collective_from_layernorm(monkeypatch):
@@ -512,3 +663,7 @@ def test_prepare_mlp_tbo_splits_collective_from_layernorm(monkeypatch):
     assert len(reduce_scatter_calls) == 1
     assert torch.equal(output, hidden_states[:2] + 1)
     assert torch.equal(output_residual, residual[:2] + 2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

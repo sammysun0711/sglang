@@ -113,8 +113,21 @@ _is_fused_rms_qkv_quant_supported = _is_gfx95_supported or is_gfx942_supported()
 # `not use_triton and (bpreshuffle_gfx95 or ck_blockscale_bpreshuffle_gfx942)`;
 # on gfx942 the CK-bpreshuffle env forces use_triton=False, so the env flag alone
 # decides.
+# AITER's prequantized-input contract uses transposed scale storage on
+# bpreshuffle paths. The gfx95 wrapper also adapts this storage to a strided
+# view when it selects its internal Triton GEMM.
 _fused_rms_quant_transpose_scale = _use_aiter_bpreshuffle_gfx95 or (
     is_gfx942_supported() and _use_aiter_ck_blockscale_bpreshuffle_gfx942
+)
+_fp8_collective_dtypes = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
 )
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -345,7 +358,11 @@ class AttentionInputs:
 @dataclass
 class _TboAttnCommState:
     hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
-    output_hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    output_hidden_states: Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, ...],
+        "_Fp8TransposedScaleAllGatherBuffers",
+    ]
     residual: Optional[torch.Tensor]
     forward_batch: ForwardBatch
     events: TboCommEvents
@@ -358,6 +375,64 @@ class _TboMlpCommState:
     residual: Optional[torch.Tensor]
     layernorm: torch.nn.Module
     events: TboCommEvents
+
+
+class _Fp8TransposedScaleInput(tuple):
+    """Producer-tagged (FP8 activation, transposed-storage scale[, BF16])."""
+
+    __slots__ = ()
+
+
+@dataclass
+class _Fp8TransposedScaleAllGatherBuffers:
+    """Preallocated FP8 all-gather buffers for transposed scale storage.
+
+    AITER bpreshuffle GEMM consumes the scale tensor in a transposed-storage
+    layout, while an all-gather concatenates rank-local contiguous buffers.
+    Concatenating the encoded local scale buffers directly would interleave
+    rank and scale-group dimensions incorrectly.  Keep row-major staging
+    buffers for communication and restore the encoded global layout before the
+    tuple is consumed by the QKV GEMM.
+    """
+
+    outputs: Tuple[torch.Tensor, ...]
+    local_scale_row_major: torch.Tensor
+    global_scale_row_major: torch.Tensor
+
+
+def _is_fp8_group_quant_tuple(
+    hidden_states: Tuple[torch.Tensor, ...],
+) -> bool:
+    """Check the group-quant contract without inferring scale storage layout."""
+
+    if len(hidden_states) < 2:
+        return False
+    activation, scale = hidden_states[:2]
+    return (
+        isinstance(activation, torch.Tensor)
+        and isinstance(scale, torch.Tensor)
+        and activation.dtype in _fp8_collective_dtypes
+        and scale.dtype == torch.float32
+        and activation.ndim == 2
+        and scale.ndim == 2
+        and activation.shape[0] == scale.shape[0]
+        and scale.shape[1] == (activation.shape[1] + 127) // 128
+    )
+
+
+def _all_gather_tensor_fp8_compatible(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """All-gather one tensor, representing FP8 payloads as NCCL uint8."""
+
+    if isinstance(input, torch.Tensor) and input.dtype in _fp8_collective_dtypes:
+        attn_tp_all_gather_into_tensor(
+            output.view(torch.uint8),
+            input.view(torch.uint8),
+        )
+        return
+    attn_tp_all_gather_into_tensor(output, input)
 
 
 class AttnTpContext:
@@ -693,6 +768,8 @@ class LayerCommunicator:
                                 hidden_states[1],
                                 _unq_bf16,
                             )
+                        if _fused_rms_quant_transpose_scale:
+                            hidden_states = _Fp8TransposedScaleInput(hidden_states)
 
                     elif _use_aiter and (quant_format == "fp8_per_token"):
                         hidden_states = _fused_rmsnorm_fp8_per_token_quant(
@@ -744,6 +821,8 @@ class LayerCommunicator:
                                 hidden_states[1],
                                 _unq_bf16,
                             )
+                        if _fused_rms_quant_transpose_scale:
+                            hidden_states = _Fp8TransposedScaleInput(hidden_states)
                     elif _use_aiter and (quant_format == "fp8_per_token"):
                         if post_residual_addition is not None:
                             residual = residual + post_residual_addition
@@ -1183,7 +1262,11 @@ class CommunicateSimpleFn:
     def _allocate_scattered_to_tp_attn_full_output(
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         context: CommunicateContext,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, ...],
+        _Fp8TransposedScaleAllGatherBuffers,
+    ]:
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
@@ -1200,24 +1283,71 @@ class CommunicateSimpleFn:
                         device=local_hidden_states.device,
                     )
                 gathered_hidden_states.append(output)
-            return tuple(gathered_hidden_states)
+            outputs = tuple(gathered_hidden_states)
+            if isinstance(hidden_states, _Fp8TransposedScaleInput):
+                assert _is_fp8_group_quant_tuple(hidden_states)
+                local_scale = hidden_states[1]
+                with use_symmetric_memory(
+                    get_attention_tp_group(),
+                    disabled=not is_allocation_symmetric(),
+                ):
+                    global_scale_row_major = torch.empty_like(outputs[1])
+                return _Fp8TransposedScaleAllGatherBuffers(
+                    outputs=_Fp8TransposedScaleInput(outputs),
+                    local_scale_row_major=torch.empty_like(local_scale),
+                    global_scale_row_major=global_scale_row_major,
+                )
+            return outputs
 
         return get_local_dp_buffer(get_attention_tp_group())
 
     @staticmethod
     def _scattered_to_tp_attn_full_into(
-        output: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        output: Union[
+            torch.Tensor,
+            Tuple[torch.Tensor, ...],
+            _Fp8TransposedScaleAllGatherBuffers,
+        ],
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         if isinstance(hidden_states, tuple):
+            if isinstance(output, _Fp8TransposedScaleAllGatherBuffers):
+                outputs = output.outputs
+                assert len(outputs) == len(hidden_states)
+                activation, encoded_scale = hidden_states[:2]
+                gathered_activation, gathered_encoded_scale = outputs[:2]
+
+                _all_gather_tensor_fp8_compatible(
+                    gathered_activation,
+                    activation,
+                )
+
+                local_rows, scale_groups = encoded_scale.shape
+                output.local_scale_row_major.copy_(
+                    encoded_scale.view(scale_groups, local_rows).transpose(0, 1)
+                )
+                _all_gather_tensor_fp8_compatible(
+                    output.global_scale_row_major,
+                    output.local_scale_row_major,
+                )
+
+                global_rows = output.global_scale_row_major.shape[0]
+                gathered_encoded_scale.view(scale_groups, global_rows).copy_(
+                    output.global_scale_row_major.transpose(0, 1)
+                )
+
+                for gathered, local in zip(outputs[2:], hidden_states[2:], strict=True):
+                    _all_gather_tensor_fp8_compatible(gathered, local)
+                return outputs
+
             assert isinstance(output, tuple)
             assert len(output) == len(hidden_states)
             for gathered, local in zip(output, hidden_states, strict=True):
-                attn_tp_all_gather_into_tensor(gathered, local)
+                _all_gather_tensor_fp8_compatible(gathered, local)
             return output
 
         assert isinstance(output, torch.Tensor)
-        attn_tp_all_gather_into_tensor(output, hidden_states)
+        _all_gather_tensor_fp8_compatible(output, hidden_states)
         return output
 
 

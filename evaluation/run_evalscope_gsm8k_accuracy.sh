@@ -4,11 +4,11 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # pip install evalscope==1.11.0
 base_url="${BASE_URL:-http://127.0.0.1:30001/v1}"
-model_path="${MODEL_PATH:-/models/MiMo-V2.5/}"
+model_path="${MODEL_PATH:-/models/MiMo-V2.5-Pro/}"
 dataset_dir="${DATASET_DIR:-${script_dir}/evalscope_cache}"
 limit="${LIMIT:-all}"
 eval_batch_size="${EVAL_BATCH_SIZE:-32}"
-max_tokens="${MAX_TOKENS:-1024}"
+max_tokens="${MAX_TOKENS:-8192}"
 seed="${SEED:-12345}"
 flush_cache="${FLUSH_CACHE:-1}"
 run_id="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"

@@ -56,9 +56,7 @@ def test_mimo_fused_rms_moe_quant_selector(
             is_auto=lambda: backend == "auto",
         ),
     )
-    monkeypatch.setattr(
-        mimo_v2, "get_moe_expert_parallel_world_size", lambda: ep_size
-    )
+    monkeypatch.setattr(mimo_v2, "get_moe_expert_parallel_world_size", lambda: ep_size)
     layer = _decoder_stub(weight_dtype)
 
     with mimo_v2.envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.override(enabled):
@@ -135,7 +133,13 @@ def test_fused_moe_norm_adapter_returns_bf16_fp8_scale_and_residual(monkeypatch)
         calls.append(args)
 
     monkeypatch.setattr(
-        communicator, "_aiter_mimo_add_rmsnorm_fp8_group_quant", fake_fused
+        communicator,
+        "_aiter_mimo_add_rmsnorm_fp8_group_quant",
+        fake_fused,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        communicator, "_aiter_fp8_dtype", torch.float8_e4m3fn, raising=False
     )
     layernorm = SimpleNamespace(weight=torch.ones(6144), variance_epsilon=1e-6)
     adapter = communicator._FusedRMSNormFP8GroupQuantForMoe(layernorm)
@@ -169,7 +173,7 @@ def test_prepare_mlp_wraps_layernorm_only_for_supported_contract(monkeypatch):
         captured.append(kwargs["layernorm"]) or ("hidden", "residual")
     )
     monkeypatch.setattr(communicator, "_use_aiter", True)
-    monkeypatch.setattr(communicator, "_is_gfx95_supported", True)
+    monkeypatch.setattr(communicator, "_is_fused_rms_moe_quant_supported", True)
     monkeypatch.setattr(communicator, "get_moe_cp_size", lambda: 1)
 
     layer.prepare_mlp("hidden", "residual", object(), quant_format="fp8_moe")

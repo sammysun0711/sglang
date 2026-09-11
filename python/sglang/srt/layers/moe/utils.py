@@ -253,6 +253,7 @@ SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
+TBO_MIN_EXTEND_TOKENS: Optional[int] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
@@ -268,6 +269,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
+    global TBO_MIN_EXTEND_TOKENS
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
@@ -293,6 +295,7 @@ def initialize_moe_config(server_args: ServerArgs):
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
             )
+    TBO_MIN_EXTEND_TOKENS = server_args.tbo_min_extend_tokens
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
@@ -376,6 +379,13 @@ def is_flashinfer_cutedsl_v1_path() -> bool:
         get_moe_runner_backend().is_flashinfer_cutedsl()
         and get_moe_a2a_backend().is_deepep()
     )
+
+
+def get_tbo_min_extend_tokens() -> int:
+    global TBO_MIN_EXTEND_TOKENS
+    if TBO_MIN_EXTEND_TOKENS is None:
+        TBO_MIN_EXTEND_TOKENS = 2048
+    return TBO_MIN_EXTEND_TOKENS
 
 
 def get_tbo_token_distribution_threshold() -> float:

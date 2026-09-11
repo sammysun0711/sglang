@@ -7,6 +7,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_tbo_min_extend_tokens,
     get_tbo_token_distribution_threshold,
     initialize_moe_config,
     is_tbo_enabled,
@@ -29,6 +30,7 @@ __all__ = [
     "should_use_dp_reduce_scatterv",
     "should_use_flashinfer_cutlass_moe_fp4_allgather",
     "is_tbo_enabled",
+    "get_tbo_min_extend_tokens",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
 ]

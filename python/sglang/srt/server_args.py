@@ -794,6 +794,7 @@ class ServerArgs:
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
+    tbo_min_extend_tokens: int = 2048
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     enable_torch_compile_debug_mode: bool = False
@@ -927,6 +928,13 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        if (
+            isinstance(self.tbo_min_extend_tokens, bool)
+            or not isinstance(self.tbo_min_extend_tokens, int)
+            or self.tbo_min_extend_tokens < 1
+        ):
+            raise ValueError("--tbo-min-extend-tokens must be a positive integer")
 
         self._maybe_download_model_for_runai()
 
@@ -7022,6 +7030,15 @@ class ServerArgs:
             "--enable-single-batch-overlap",
             action="store_true",
             help="Let computation and communication overlap within one micro batch.",
+        )
+        parser.add_argument(
+            "--tbo-min-extend-tokens",
+            type=int,
+            default=ServerArgs.tbo_min_extend_tokens,
+            help="Minimum unpadded token count in the current ordinary EXTEND batch "
+            "to allow two-batch overlap. Smaller batches run without TBO. "
+            "Must be positive; 1 permits single-token splits. Does not change "
+            "decode or speculative target-verification policy.",
         )
         parser.add_argument(
             "--tbo-token-distribution-threshold",

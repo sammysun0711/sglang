@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
 from sglang.srt.layers.attention.dsa import kpool_fp8_index
+from sglang.srt.layers.attention.dsa import kpool_plan
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     _topk_from_pooled_history_logits_unfused,
     topk_from_pooled_history_logits,
@@ -624,6 +625,39 @@ class TestKPoolMqaBackend(CustomTestCase):
 
         self.assertIs(result, marker)
         fused.assert_called_once()
+
+
+class TestKPoolPlanPlatformDispatch(CustomTestCase):
+    def test_update_write_plan_runs_on_hip(self):
+        plan = SimpleNamespace(
+            req=torch.empty(1, dtype=torch.int32),
+            write_start=torch.empty(1, dtype=torch.int32),
+            tail_logical_start=torch.empty(1, dtype=torch.int32),
+            write_loc=torch.empty((1, 1), dtype=torch.int32),
+            pool_seqlens_per_q=torch.empty(1, dtype=torch.int32),
+            seqlens_per_q=torch.empty(1, dtype=torch.int32),
+            effective_n_per_batch=None,
+            pool_schedule_metadata=None,
+        )
+        metadata = SimpleNamespace(kpool_write_plan=plan)
+        with (
+            patch.object(kpool_plan, "is_cuda", return_value=False),
+            patch.object(kpool_plan, "is_hip", return_value=True),
+            patch.object(kpool_plan, "update_kpool_write_plan_cuda_graph") as update,
+        ):
+            kpool_plan.update_kpool_write_plan(
+                metadata,
+                write_start=torch.tensor([32], dtype=torch.int32),
+                req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                real_page_table=torch.zeros((1, 1), dtype=torch.int32),
+                pool_size=4,
+                real_page_size=64,
+                num_draft_tokens=4,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                slots_per_page=16,
+            )
+
+        update.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,9 @@ export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
 export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-30001}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
+export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
+export DECODE_LOG_INTERVAL="${DECODE_LOG_INTERVAL:-1}"
+export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-1.0}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 export PAGE_SIZE="${PAGE_SIZE:-64}"
@@ -23,7 +26,7 @@ export MC_GID_INDEX=3
 export MC_TE_METRIC=1
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=5000
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=5000
-export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=128
+export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS="${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS:-128}"
 export SGLANG_SPEC_NAN_DETECTION=1
 export SGLANG_SPEC_OOB_DETECTION=1
 
@@ -37,6 +40,27 @@ export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${FLYDSL_PA_NUM_PARTITIONS}"
 export SGLANG_SIMULATE_ACC_LEN=3
 export SGLANG_SIMULATE_ACC_METHOD=match-expected
 
+if ! [[ "${MAX_RUNNING_REQUESTS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_RUNNING_REQUESTS must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "${TOKENIZER_WORKER_NUM}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TOKENIZER_WORKER_NUM must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "${DECODE_LOG_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DECODE_LOG_INTERVAL must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS must be a positive integer" >&2
+  exit 2
+fi
+if [[ -n "${SERVER_RANDOM_SEED}" ]] && ! [[ "${SERVER_RANDOM_SEED}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "SERVER_RANDOM_SEED must be a non-negative integer or unset" >&2
+  exit 2
+fi
+
 export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 export LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/peak_output_server_${RUN_ID}}"
 export SERVER_LOG_FILE="${SERVER_LOG_FILE:-decode_server_tp8_flydsl_fake_prefill.log}"
@@ -48,14 +72,23 @@ fi
 mkdir -p "${LOG_DIR}" "$(dirname -- "${SERVER_LOG_PATH}")"
 
 echo "FlyDSL hybrid: full target-verify=FlyDSL, SWA/sink and decode=AITER"
-echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, partitions=${FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, overlap=enabled"
+echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, decode-log-interval=${DECODE_LOG_INTERVAL}, page=${PAGE_SIZE}, partitions=${FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, overlap=enabled"
 echo "MTP acceptance: simulated length 3, match-expected"
 echo "Server log: ${SERVER_LOG_PATH}"
+echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
+
+seed_args=()
+if [[ -n "${SERVER_RANDOM_SEED}" ]]; then
+  seed_args+=(--random-seed "${SERVER_RANDOM_SEED}")
+fi
 
 python3 -u -m sglang.launch_server \
   --model-path "${MODEL}" \
   --tp-size 8 \
+  --tokenizer-worker-num "${TOKENIZER_WORKER_NUM}" \
+  "${seed_args[@]}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
+  --decode-log-interval "${DECODE_LOG_INTERVAL}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
@@ -77,4 +110,3 @@ python3 -u -m sglang.launch_server \
   --speculative-num-draft-tokens 4 \
   --enable-multi-layer-eagle \
   2>&1 | tee "${SERVER_LOG_PATH}"
-

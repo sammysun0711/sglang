@@ -46,7 +46,13 @@ from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
 from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
     _prepare_dflash_draft_block_unchecked,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_pin_memory_available,
+)
 
 _is_npu = is_npu()
 
@@ -1302,12 +1308,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
+            pin_memory = is_pin_memory_available(device)
             ctx_lens = torch.tensor(
-                model_worker_batch.extend_lens, dtype=torch.int32, device=device
-            )
+                model_worker_batch.extend_lens,
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
             draft_seq_lens = torch.tensor(
-                model_worker_batch.prefix_lens, dtype=torch.int32, device=device
-            )
+                model_worker_batch.prefix_lens,
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
 
             if model_worker_batch.out_cache_loc is None:
                 raise RuntimeError(

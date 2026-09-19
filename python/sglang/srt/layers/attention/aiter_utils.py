@@ -1178,13 +1178,13 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
     try:
         flydsl = importlib.import_module("flydsl")
         try:
-            tile_module = importlib.import_module(
-                "aiter.ops.flydsl.kernels.pa_decode_asymmetric"
-            )
+            tile_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
             reduce_module = importlib.import_module(
                 "aiter.ops.flydsl.kernels.pa_decode_reduce"
             )
-            compile_reduce = reduce_module.compile_pa_decode_ps_reduce
+            compile_reduce = getattr(
+                reduce_module, "compile_pa_decode_ps_reduce", None
+            ) or getattr(reduce_module, "compile_pa_decode_sw_reduce")
         except (ImportError, ModuleNotFoundError):
             tile_module = importlib.import_module("kernels.attention.pa_decode_tile")
             reduce_module = importlib.import_module("kernels.attention.pa_decode_swa")

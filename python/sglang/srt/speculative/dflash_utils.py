@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -328,6 +329,17 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
 
 def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     text_config = _get_text_config(config)
+    dflash_config = _get_dflash_config(config)
+    # Older MiMo DFlash checkpoints describe a uniform SWA draft through the
+    # nested DFlash config. Transformers may synthesize an all-full
+    # ``layer_types`` list, so the explicit checkpoint flag takes precedence.
+    if dflash_config.get("use_swa") is True:
+        num_hidden_layers = int(_cfg_get(text_config, "num_hidden_layers", 0))
+        if num_hidden_layers <= 0:
+            raise ValueError(
+                "DFLASH use_swa=true requires a positive num_hidden_layers."
+            )
+        return ["sliding_attention"] * num_hidden_layers
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
     if layer_types is None:
         return None
@@ -347,6 +359,8 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+    if sliding_window is None:
+        sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -423,6 +437,8 @@ class DFlashDraftConfig:
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    attention_sink_bias: bool = False
+    attention_value_scale: Optional[float] = None
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -541,6 +557,30 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    raw_attention_sink_bias = dflash_cfg.get("attention_sink_bias", False)
+    if not isinstance(raw_attention_sink_bias, bool):
+        raise ValueError(
+            "DFLASH dflash_config.attention_sink_bias must be a bool, "
+            f"got {raw_attention_sink_bias!r} "
+            f"(type={type(raw_attention_sink_bias).__name__})."
+        )
+    attention_sink_bias = bool(raw_attention_sink_bias)
+
+    raw_attention_value_scale = dflash_cfg.get("attention_value_scale", None)
+    if raw_attention_value_scale is None:
+        attention_value_scale: Optional[float] = None
+    else:
+        if isinstance(raw_attention_value_scale, bool) or not isinstance(
+            raw_attention_value_scale, (int, float)
+        ):
+            raise ValueError(
+                "DFLASH dflash_config.attention_value_scale must be "
+                "int|float|None, "
+                f"got {raw_attention_value_scale!r} "
+                f"(type={type(raw_attention_value_scale).__name__})."
+            )
+        attention_value_scale = float(raw_attention_value_scale)
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -548,6 +588,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        attention_sink_bias=attention_sink_bias,
+        attention_value_scale=attention_value_scale,
     )
 
 
@@ -614,6 +656,29 @@ def compute_dflash_correct_drafts_and_bonus(
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
     return correct_len, bonus.to(torch.int64)
+
+
+def apply_dflash_simulated_acceptance(
+    *,
+    candidates: torch.Tensor,
+    accept_len: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bonus: torch.Tensor,
+    out_tokens: torch.Tensor,
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    fixed_token_id: int = 100,
+) -> None:
+    """Force DFlash commit length for throughput-only measurements."""
+    forced_commit_len = _sample_simulated_acc_len(
+        simulate_acc_len,
+        simulate_acc_method,
+        int(candidates.shape[1]),
+    )
+    accept_len.fill_(forced_commit_len - 1)
+    commit_lens.fill_(forced_commit_len)
+    bonus.fill_(fixed_token_id)
+    out_tokens.fill_(fixed_token_id)
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -344,6 +345,21 @@ class ModelRunnerKVCacheMixin:
             and envs.SGLANG_USE_AITER.get()
             and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
         ):
+            return None
+
+        dflash_flypa_swa = (
+            self.spec_algorithm.is_dflash()
+            and self.server_args.attention_backend == "aiter"
+            and os.environ.get("SGLANG_AITER_DFLASH_SWA_IMPL", "gluon").strip().lower()
+            == "flydsl"
+            and self.page_size == 64
+            and self.kv_cache_dtype == torch.bfloat16
+        )
+        if dflash_flypa_swa:
+            logger.info_once(
+                "Using AITER SHUFFLE 5D for the qualified DFlash BF16 draft "
+                "FlyPA SWA path."
+            )
             return None
 
         logger.info_once(

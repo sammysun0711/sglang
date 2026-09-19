@@ -15,8 +15,8 @@ import triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
-    scatter_ragged_to_paged_kv_kernel,
     scatter_ragged_to_page_table_kernel,
+    scatter_ragged_to_paged_kv_kernel,
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.utils import (
@@ -64,17 +64,22 @@ except ImportError:
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
     FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS,
-    FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE,
     FLYDSL_MIMO_HEAD_DIM,
     FLYDSL_MIMO_KV_HEADS,
     FLYDSL_MIMO_VALUE_HEAD_DIM,
     can_build_mimo_paged_kv_metadata,
+    flydsl_dflash_swa_enabled,
+    flydsl_target_verify_swa_enabled,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
     forward_target_verify_flydsl_5d,
     forward_target_verify_vectorized_5d,
     get_flydsl_mimo_num_partitions,
     load_flydsl_pa_decode_kernels,
+    prepare_flydsl_dflash_swa,
+    prepare_flydsl_swa_forward_metadata,
+    prepare_flydsl_target_verify_swa,
+    prepare_swa_target_verify,
 )
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -135,6 +140,12 @@ class ForwardMetadata:
     paged_kv_last_page_len: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # Shared FlyPA SWA metadata, populated once per forward batch rather than
+    # rebuilt by every sliding-window layer.
+    flydsl_swa_context_lens: Optional[torch.Tensor] = None
+    flydsl_swa_kv_indptr: Optional[torch.Tensor] = None
+    flydsl_swa_kv_indices: Optional[torch.Tensor] = None
+    flydsl_swa_last_page_lens: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -158,6 +169,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         self.input_dtype = model_runner.model_config.dtype
+        self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
 
         self.page_size = model_runner.server_args.page_size
 
@@ -271,7 +283,7 @@ class AiterAttnBackend(AttentionBackend):
         # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
         # (MLA has its own verify path) and env var for opt-out.
         self._use_unified_verify = (
-            self.use_triton_unified_attention
+            (self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d)
             and not self.use_mla
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
@@ -301,14 +313,66 @@ class AiterAttnBackend(AttentionBackend):
         self._flydsl_pa_decode_tile = None
         self._flydsl_compile_pa_decode_tile = None
         self._flydsl_compile_pa_decode_reduce = None
+        self._flydsl_pa_decode_kv_dtype_parameter = None
+        self._flydsl_pa_decode_reduce_uses_runtime_query_length = False
         self._flydsl_pa_decode_pmax = None
         self._flydsl_pa_decode_psum = None
         self._flydsl_pa_decode_pout = None
         self._flydsl_pa_decode_context_lengths = None
         self._flydsl_pa_decode_workspace_max_bs = 0
         self._flydsl_pa_decode_num_partitions = FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS
+        self._flydsl_pa_decode_query_length = int(self.num_draft_tokens or 4)
         self._flydsl_pa_decode_compiled = False
         self._configure_flydsl_pa_decode(max_bs)
+        self._flydsl_dflash_swa_enabled = (
+            self.kv_cache_is_vectorized_5d
+            and self.is_draft_worker
+            and flydsl_dflash_swa_enabled()
+        )
+        self._flydsl_dflash_swa_window_size = int(
+            model_runner.server_args.speculative_draft_window_size or 0
+        )
+        if self._flydsl_dflash_swa_enabled:
+            prepare_flydsl_dflash_swa(
+                self,
+                max_bs,
+                self._flydsl_pa_decode_query_length,
+                self._flydsl_dflash_swa_window_size,
+            )
+            logger.info(
+                "Enabled FlyDSL DFlash paged SWA: window=%s, page_size=%s, "
+                "draft_kv_dtype=%s",
+                self._flydsl_dflash_swa_window_size,
+                self.page_size,
+                self.kv_cache_dtype,
+            )
+        self._flydsl_target_verify_swa_enabled = (
+            self.kv_cache_is_vectorized_5d
+            and not self.is_draft_worker
+            and self.use_sliding_window_kv_pool
+            and flydsl_target_verify_swa_enabled()
+        )
+        self._flydsl_target_verify_swa_window_size = int(
+            model_runner.sliding_window_size or 0
+        )
+        if self._flydsl_target_verify_swa_enabled:
+            prepare_flydsl_target_verify_swa(
+                self,
+                max_bs,
+                self._flydsl_pa_decode_query_length,
+                self._flydsl_target_verify_swa_window_size,
+            )
+            logger.info(
+                "Enabled FlyDSL target-verify paged SWA: window=%s, "
+                "page_size=%s, kv_dtype=%s",
+                self._flydsl_target_verify_swa_window_size,
+                self.page_size,
+                self.kv_cache_dtype,
+            )
+        if self.kv_cache_is_vectorized_5d and (
+            self.use_sliding_window_kv_pool or self.is_draft_worker
+        ):
+            prepare_swa_target_verify(self, max_bs, self._flydsl_pa_decode_query_length)
 
         self.logits_soft_cap = 0.0
 
@@ -373,7 +437,9 @@ class AiterAttnBackend(AttentionBackend):
         # path even when the target worker explicitly selects FlyDSL.
         self._pa_decode_impl = requested_impl
         self._use_flydsl_pa_decode = (
-            requested_impl == "flydsl" and self.kv_cache_is_vectorized_5d
+            requested_impl == "flydsl"
+            and self.kv_cache_is_vectorized_5d
+            and not getattr(self, "is_draft_worker", False)
         )
         if not self._use_flydsl_pa_decode:
             return
@@ -392,6 +458,11 @@ class AiterAttnBackend(AttentionBackend):
                 "maximum context must not exceed 1,048,576 tokens, got "
                 f"{self.max_context_len}"
             )
+        if self._flydsl_pa_decode_query_length not in (1, 4, 8):
+            incompatibilities.append(
+                "query length must be 1, 4, or 8, got "
+                f"{self._flydsl_pa_decode_query_length}"
+            )
         if (
             self.num_head,
             self.num_kv_head,
@@ -409,8 +480,7 @@ class AiterAttnBackend(AttentionBackend):
             )
         if self.kv_cache_dtype not in (fp8_dtype, torch.bfloat16):
             incompatibilities.append(
-                "KV cache dtype must be FP8 E4M3 or BF16, got "
-                f"{self.kv_cache_dtype}"
+                "KV cache dtype must be FP8 E4M3 or BF16, got " f"{self.kv_cache_dtype}"
             )
         if not (is_gfx942_supported() or is_gfx95_supported()):
             incompatibilities.append(
@@ -426,6 +496,10 @@ class AiterAttnBackend(AttentionBackend):
         self._flydsl_pa_decode_tile = kernels.pa_decode_tile
         self._flydsl_compile_pa_decode_tile = kernels.compile_pa_decode_tile
         self._flydsl_compile_pa_decode_reduce = kernels.compile_pa_decode_reduce
+        self._flydsl_pa_decode_kv_dtype_parameter = kernels.kv_dtype_parameter
+        self._flydsl_pa_decode_reduce_uses_runtime_query_length = (
+            kernels.reduce_uses_runtime_query_length
+        )
         self._ensure_flydsl_pa_decode_workspace(max_bs)
         logger.info(
             "Enabled MiMo FlyDSL PA decode on target worker: full "
@@ -453,7 +527,8 @@ class AiterAttnBackend(AttentionBackend):
             max_bs
             * FLYDSL_MIMO_KV_HEADS
             * self._flydsl_pa_decode_num_partitions
-            * FLYDSL_MIMO_EQUIVALENT_GROUP_SIZE
+            * self._flydsl_pa_decode_query_length
+            * (self.num_head // self.num_kv_head)
         )
         self._flydsl_pa_decode_pmax = torch.empty(
             scalar_numel, dtype=torch.float32, device=self.device
@@ -477,7 +552,7 @@ class AiterAttnBackend(AttentionBackend):
                 "FlyDSL PA decode must be compiled before CUDA graph capture"
             )
 
-        self._flydsl_compile_pa_decode_tile(
+        compile_kwargs = dict(
             head_dim=FLYDSL_MIMO_HEAD_DIM,
             v_head_dim=FLYDSL_MIMO_VALUE_HEAD_DIM,
             query_group_size=16,
@@ -486,18 +561,34 @@ class AiterAttnBackend(AttentionBackend):
             softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
             query_dtype="bf16",
             per_token_kv=False,
-            query_length=4,
+            query_length=self._flydsl_pa_decode_query_length,
             trans_v=True,
-            bf16_kv=self.kv_cache_dtype == torch.bfloat16,
         )
-        self._flydsl_compile_pa_decode_reduce(
+        if self._flydsl_pa_decode_kv_dtype_parameter == "kv_dtype":
+            compile_kwargs["kv_dtype"] = (
+                "bf16" if self.kv_cache_dtype == torch.bfloat16 else "fp8"
+            )
+        elif self._flydsl_pa_decode_kv_dtype_parameter == "bf16_kv":
+            compile_kwargs["bf16_kv"] = self.kv_cache_dtype == torch.bfloat16
+        else:
+            raise RuntimeError("FlyDSL PA decode KV dtype API is not initialized")
+        self._flydsl_compile_pa_decode_tile(**compile_kwargs)
+        reduce_kwargs = dict(
             max_context_partition_num=self._flydsl_pa_decode_num_partitions,
-            query_seq_len=4,
             query_group_size=16,
             head_size=FLYDSL_MIMO_VALUE_HEAD_DIM,
             output_dtype_str="bf16",
             logits_dtype_str="bf16",
         )
+        if self._flydsl_pa_decode_reduce_uses_runtime_query_length:
+            reduce_kwargs.update(
+                sink_dtype_str="f32",
+                use_sinks=False,
+                use_work_plan=False,
+            )
+        else:
+            reduce_kwargs["query_seq_len"] = self._flydsl_pa_decode_query_length
+        self._flydsl_compile_pa_decode_reduce(**reduce_kwargs)
         self._flydsl_pa_decode_compiled = True
 
     def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
@@ -1307,6 +1398,7 @@ class AiterAttnBackend(AttentionBackend):
                     swa_page_table=draft_extend_swa_page_table,
                     swa_out_cache_loc=swa_out_cache_loc,
                 )
+
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
@@ -1565,6 +1657,11 @@ class AiterAttnBackend(AttentionBackend):
                     swa_out_cache_loc=swa_out_cache_loc,
                 )
 
+        if forward_batch.forward_mode.is_target_verify():
+            prepare_flydsl_swa_forward_metadata(
+                self, forward_batch.batch_size, forward_batch.seq_lens
+            )
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -1577,6 +1674,24 @@ class AiterAttnBackend(AttentionBackend):
             # Python wrapper's cache then makes every captured layer call a
             # launch-only operation with caller-owned workspaces.
             self._compile_flydsl_pa_decode()
+        if self._flydsl_dflash_swa_enabled:
+            prepare_flydsl_dflash_swa(
+                self,
+                max_bs,
+                int(self.num_draft_tokens or 4),
+                self._flydsl_dflash_swa_window_size,
+            )
+        if self._flydsl_target_verify_swa_enabled:
+            prepare_flydsl_target_verify_swa(
+                self,
+                max_bs,
+                int(self.num_draft_tokens or 4),
+                self._flydsl_target_verify_swa_window_size,
+            )
+        if self.kv_cache_is_vectorized_5d and (
+            self.use_sliding_window_kv_pool or self.is_draft_worker
+        ):
+            prepare_swa_target_verify(self, max_bs, int(self.num_draft_tokens or 4))
 
         # PR #20978 pads max_bs beyond pool_size for higher cuda-graph
         # coverage. Reallocate indptr buffers so they fit the padded max_bs.
@@ -1630,7 +1745,7 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.use_triton_unified_attention:
+        if self._use_unified_verify:
             # Keep a distinct page-table buffer for unified attention.  Sharing
             # cuda_graph_kv_indices with non-unified token indices makes
             # page-table width ambiguous after the token buffer is expanded.
@@ -2132,6 +2247,9 @@ class AiterAttnBackend(AttentionBackend):
                 )
         else:
             raise ValueError("Invalid forward mode")
+
+        if forward_mode.is_target_verify():
+            prepare_flydsl_swa_forward_metadata(self, bs, seq_lens)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1 if self.num_draft_tokens is None else self.num_draft_tokens
@@ -3068,9 +3186,8 @@ class AiterIndicesUpdaterPrefill:
                 # zero page ids after the valid region because CK may issue a
                 # speculative page-table vector load before applying bounds.
                 max_page_entries = (
-                    (paged_kernel_lens_sum + page_size - 1) // page_size
-                    + max(bs - 1, 0)
-                )
+                    paged_kernel_lens_sum + page_size - 1
+                ) // page_size + max(bs - 1, 0)
                 paged_kv_indices = torch.zeros(
                     max_page_entries + 256,
                     dtype=torch.int32,

@@ -24,7 +24,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -32,7 +35,7 @@ from sglang.srt.speculative.dflash_utils import (
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
@@ -136,12 +139,24 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
         )
 
         self.scaling = head_dim**-0.5
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
+        draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        self.v_scale = draft_config.attention_value_scale
+        self.attention_sink_bias = None
+        if draft_config.attention_sink_bias:
+            self.attention_sink_bias = nn.Parameter(
+                torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
+            )
+            set_weight_attrs(
+                self.attention_sink_bias,
+                {"weight_loader": sharded_weight_loader(0)},
+            )
         self.attn = RadixAttention(
             num_heads=self.num_heads,
             head_dim=head_dim,
@@ -185,7 +200,15 @@ class DFlashAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.v_scale is not None:
+            v = v * self.v_scale
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            sinks=self.attention_sink_bias,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -207,11 +230,14 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-            return k, v
+        else:
+            # Fallback: compute full QKV and discard Q (keeps compatibility
+            # with quantized weights).
+            qkv, _ = self.qkv_proj(hidden_states)
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
-        qkv, _ = self.qkv_proj(hidden_states)
-        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:

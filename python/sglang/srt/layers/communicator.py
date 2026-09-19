@@ -86,8 +86,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_npu,
     is_sm90_supported,
@@ -574,11 +574,13 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_format: str = "",
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
+            quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:

@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import List, Optional
 
@@ -24,6 +25,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
@@ -33,7 +35,11 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    assign_req_to_token_pool_func,
+)
 from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
     _compute_dflash_accept_bonus_triton_unchecked,
 )
@@ -104,8 +110,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Draft runner (separate KV cache + attention backend).
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        if draft_server_args.speculative_draft_kv_cache_dtype is not None:
+            draft_server_args.kv_cache_dtype = (
+                draft_server_args.speculative_draft_kv_cache_dtype
+            )
         draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+        supported_draft_backends = (
+            "flashinfer",
+            "fa3",
+            "fa4",
+            "triton",
+            "aiter",
+            "ascend",
+        )
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
@@ -190,6 +207,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        self._maybe_merge_trained_mask_embedding()
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -228,6 +246,53 @@ class DFlashWorkerV2(BaseSpecWorker):
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+
+    def _maybe_merge_trained_mask_embedding(self) -> None:
+        """Install the checkpoint-trained mask row into the target embedding."""
+        draft_model_path = self.server_args.speculative_draft_model_path
+        if draft_model_path is None:
+            return
+
+        mask_embedding_path = os.path.join(draft_model_path, "mask_embedding.pt")
+        if not os.path.exists(mask_embedding_path):
+            return
+
+        saved = torch.load(
+            mask_embedding_path,
+            map_location=self.device,
+            weights_only=True,
+        )
+        embedding = saved["embedding"]
+        saved_token_id = int(saved["mask_token_id"])
+        if saved_token_id != self._mask_token_id:
+            raise ValueError(
+                "DFLASH mask_embedding.pt token id does not match the resolved "
+                f"mask token: {saved_token_id} != {self._mask_token_id}."
+            )
+
+        target_model = self._target_worker.model_runner.model
+        embedding_module = target_model.get_input_embeddings()
+        token_id = self._mask_token_id
+        shard_indices = getattr(embedding_module, "shard_indices", None)
+        with torch.no_grad():
+            if shard_indices is None:
+                embedding_module.weight[token_id].copy_(
+                    embedding.to(embedding_module.weight.dtype)
+                )
+            else:
+                start = shard_indices.org_vocab_start_index
+                end = shard_indices.org_vocab_end_index
+                if start <= token_id < end:
+                    embedding_module.weight[token_id - start].copy_(
+                        embedding.to(embedding_module.weight.dtype)
+                    )
+
+        if self.tp_rank == 0:
+            logger.info(
+                "Merged trained DFlash mask embedding " "(mask_token_id=%s, source=%s)",
+                token_id,
+                mask_embedding_path,
+            )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
@@ -1630,6 +1695,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+        if SIMULATE_ACC_LEN > 0:
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+            )
+            new_seq_lens = None
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

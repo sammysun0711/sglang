@@ -28,6 +28,7 @@ def _fused_norm_rope_kernel_stacked(
     kv_ptr,  # [total_ctx, n_layers, kv_size * 2]
     k_norm_weight_ptr,  # [n_layers, head_dim]
     eps_ptr,  # [n_layers]
+    value_scale_ptr,  # [n_layers]
     cos_sin_cache_ptr,  # [max_pos, rotary_dim]
     positions_ptr,  # [total_ctx]
     k_out_ptr,  # [n_layers, total_ctx, num_kv_heads, head_dim]
@@ -81,7 +82,8 @@ def _fused_norm_rope_kernel_stacked(
     mask_half = offs < half_rotary_dim
 
     k_raw = tl.load(k_base + offs, mask=mask_hd, other=0.0).to(tl.float32)
-    v_raw = tl.load(v_base + offs, mask=mask_hd, other=0.0)
+    v_raw = tl.load(v_base + offs, mask=mask_hd, other=0.0).to(tl.float32)
+    value_scale = tl.load(value_scale_ptr + layer_id).to(tl.float32)
 
     inv_rms = tl.rsqrt(tl.sum(k_raw * k_raw) / head_dim + eps)
     norm_w = tl.load(
@@ -114,19 +116,18 @@ def _fused_norm_rope_kernel_stacked(
     k_rot_first = k_first * cos_v - k_second * sin_v
     k_rot_second = k_second * cos_v + k_first * sin_v
 
-    tl.store(v_write + offs, v_raw, mask=mask_hd)
-    tl.store(k_write + offs, k_rot_first.to(v_raw.dtype), mask=mask_half)
-    tl.store(
-        k_write + half_rotary_dim + offs, k_rot_second.to(v_raw.dtype), mask=mask_half
-    )
+    tl.store(v_write + offs, v_raw * value_scale, mask=mask_hd)
+    tl.store(k_write + offs, k_rot_first, mask=mask_half)
+    tl.store(k_write + half_rotary_dim + offs, k_rot_second, mask=mask_half)
     mask_pass = (offs >= rotary_dim) & (offs < head_dim)
-    tl.store(k_write + offs, k_normed.to(v_raw.dtype), mask=mask_pass)
+    tl.store(k_write + offs, k_normed, mask=mask_pass)
 
 
 def _fused_norm_rope_stacked(
     kv: torch.Tensor,  # [total_ctx, n_layers, kv_size*2]
     k_norm_weight: torch.Tensor,  # [n_layers, head_dim]
     eps: torch.Tensor,  # [n_layers]
+    value_scales: torch.Tensor,  # [n_layers]
     cos_sin_cache: torch.Tensor,  # [max_pos, rotary_dim]
     positions: torch.Tensor,  # [total_ctx]
     num_kv_heads: int,
@@ -169,6 +170,11 @@ def _fused_norm_rope_stacked(
         raise ValueError(
             "Invalid stacked eps shape for fused KV materialization: "
             f"got {tuple(eps.shape)}, expected {(n_layers,)}."
+        )
+    if value_scales.shape != (n_layers,):
+        raise ValueError(
+            "Invalid value_scales shape for fused KV materialization: "
+            f"got {tuple(value_scales.shape)}, expected {(n_layers,)}."
         )
 
     half_rotary_dim = rotary_dim // 2
@@ -213,6 +219,7 @@ def _fused_norm_rope_stacked(
         kv,
         k_norm_weight,
         eps,
+        value_scales,
         cos_sin_cache,
         positions,
         k_out,
@@ -292,6 +299,7 @@ class FusedKVMaterializeHelper:
         kv_weights = []
         k_norm_weights = []
         eps_values = []
+        value_scales = []
 
         for layer_id, layer in enumerate(layers):
             attn = layer.self_attn
@@ -324,6 +332,7 @@ class FusedKVMaterializeHelper:
             kv_weights.append(kv_weight)
             k_norm_weights.append(attn.k_norm.weight)
             eps_values.append(float(attn.k_norm.variance_epsilon))
+            value_scales.append(1.0 if attn.v_scale is None else float(attn.v_scale))
 
         flat_kv_weight = torch.stack(kv_weights).reshape(
             self.n_layers * self.layer_out_dim, -1
@@ -332,6 +341,9 @@ class FusedKVMaterializeHelper:
         self.k_norm_weights = torch.stack(k_norm_weights).contiguous()
         self.eps_values = torch.tensor(
             eps_values, dtype=torch.float32, device=self.device
+        )
+        self.value_scales = torch.tensor(
+            value_scales, dtype=torch.float32, device=self.device
         )
 
         if self.max_position_hint is not None:
@@ -445,6 +457,7 @@ class FusedKVMaterializeHelper:
             proj_out,
             self.k_norm_weights,
             self.eps_values,
+            self.value_scales,
             cos_sin_cache,
             positions,
             self.num_kv_heads,

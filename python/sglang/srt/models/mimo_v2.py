@@ -32,10 +32,10 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -99,8 +99,8 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -685,7 +685,10 @@ class MiMoV2Attention(nn.Module):
         self.attn.mimo_original_v_head_dim = self.original_v_head_dim
 
         self.attention_sink_bias = (
-            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            torch.nn.Parameter(
+                torch.empty(self.num_heads, dtype=torch.float32),
+                requires_grad=False,
+            )
             if attention_sink_bias
             else None
         )
@@ -944,13 +947,17 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            self._fused_rms_qkv_quant_format,
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+                quant_format=self._fused_rms_qkv_quant_format,
+            )
         )
 
         if _mimo_hidden_num_tokens(hidden_states) != 0:
@@ -1094,6 +1101,7 @@ class MiMoV2Model(nn.Module):
         self.pp_group = get_pp_group()
         self._logged_no_ep_tbo = False
         self._logged_no_ep_tbo_fallback = False
+        self.layers_to_capture: List[int] = []
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1143,8 +1151,7 @@ class MiMoV2Model(nn.Module):
         if forward_batch.tbo_children is None or len(forward_batch.tbo_children) != 2:
             return "the TBO split does not contain exactly two children"
         if any(
-            (child.tbo_padded_len or 0) <= 0
-            for child in forward_batch.tbo_children
+            (child.tbo_padded_len or 0) <= 0 for child in forward_batch.tbo_children
         ):
             return "at least one TBO child is empty"
         if (
@@ -1220,7 +1227,10 @@ class MiMoV2Model(nn.Module):
                     ineligible_reason,
                 )
                 self._logged_no_ep_tbo_fallback = True
+        if self.layers_to_capture:
+            run_tbo = False
 
+        aux_hidden_states: List[torch.Tensor] = []
         if run_tbo:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
@@ -1256,7 +1266,18 @@ class MiMoV2Model(nn.Module):
                     hidden_states,
                     forward_batch,
                     residual,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
                 )
+
+        if (
+            self.pp_group.is_last_rank
+            and self.config.num_hidden_layers in self.layers_to_capture
+        ):
+            aux_hidden_states.append(
+                hidden_states if residual is None else hidden_states + residual
+            )
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
@@ -1277,7 +1298,9 @@ class MiMoV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states, hidden_states_before_norm
+        if not aux_hidden_states:
+            return hidden_states, hidden_states_before_norm
+        return hidden_states, hidden_states_before_norm, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -1383,6 +1406,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
+        self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
@@ -1540,7 +1564,16 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             not self.config.encoder_only
         ), "forward() should not be called in encoder_only mode"
 
-        if self._is_multimodal:
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif self._is_multimodal:
             hidden_states, hidden_states_before_norm = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
@@ -1565,6 +1598,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 self.lm_head,
                 forward_batch,
                 hidden_states_before_norm=hidden_states_before_norm,
+                aux_hidden_states=aux_hidden_states,
             )
         else:
             return hidden_states
@@ -1576,6 +1610,19 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     @property
     def end_layer(self):
         return self.model.end_layer if self.model is not None else 0
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # DFlash layer ids describe outputs after target layer k. The model
+        # captures that tensor immediately before layer k + 1.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

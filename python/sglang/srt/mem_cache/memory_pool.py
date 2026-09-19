@@ -1436,6 +1436,21 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
+        if self.kv_cache_layout == "vectorized_5d":
+            from sglang.srt.layers.attention.utils import (
+                launch_reshape_and_cache_shuffle_5d_prefix_valid,
+            )
+
+            launch_reshape_and_cache_shuffle_5d_prefix_valid(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                loc_2d,
+                commit_lens,
+            )
+            return
+
         if not (_is_cuda or _is_hip):
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
@@ -1473,6 +1488,23 @@ class MHATokenToKVPool(KVCache):
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
+        if self.kv_cache_layout == "vectorized_5d":
+            if tgt_loc.numel() == 0:
+                return
+            from sglang.srt.layers.attention.utils import (
+                launch_gather_shuffle_5d_to_linear,
+                launch_reshape_and_cache_shuffle_5d,
+            )
+
+            for k_buffer, v_buffer in zip(self.k_buffer, self.v_buffer):
+                cache_k, cache_v = launch_gather_shuffle_5d_to_linear(
+                    k_buffer, v_buffer, src_loc
+                )
+                launch_reshape_and_cache_shuffle_5d(
+                    cache_k, cache_v, k_buffer, v_buffer, tgt_loc
+                )
+            return
 
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)

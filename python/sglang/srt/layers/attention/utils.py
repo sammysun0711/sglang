@@ -476,9 +476,10 @@ def launch_reshape_and_cache_shuffle_5d(
     """
     num_tokens, num_heads, key_head_size = key.shape
     value_tokens, value_heads, value_head_size = value.shape
-    assert (value_tokens, value_heads) == (num_tokens, num_heads), (
-        "K/V must share token and head dimensions"
-    )
+    assert (value_tokens, value_heads) == (
+        num_tokens,
+        num_heads,
+    ), "K/V must share token and head dimensions"
     assert key_cache.dim() == 5 and value_cache.dim() == 5
     num_blocks, kc_H, kc_D_over_X, block_size, X = key_cache.shape
     assert kc_H == num_heads and kc_D_over_X * X == key_head_size
@@ -516,6 +517,140 @@ def launch_reshape_and_cache_shuffle_5d(
         KEY_BLOCK_D=KEY_BLOCK_D,
         VALUE_BLOCK_D=VALUE_BLOCK_D,
         HAS_SWA=(swa_slot_mapping is not None),
+    )
+
+
+@triton.jit
+def reshape_and_cache_shuffle_5d_prefix_valid(
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    commit_lens_ptr,
+    key_stride_token,
+    value_stride_token,
+    num_heads,
+    key_head_size,
+    value_head_size,
+    rows_per_request,
+    page_size,
+    X: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    KEY_BLOCK_D: tl.constexpr,
+    VALUE_BLOCK_D: tl.constexpr,
+):
+    """Commit valid request prefixes into a SHUFFLE-5D KV cache."""
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+    request_idx = token_idx // rows_per_request
+    row_idx = token_idx % rows_per_request
+    if row_idx >= tl.load(commit_lens_ptr + request_idx):
+        return
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx < 0:
+        return
+
+    block_idx = slot_idx // page_size
+    slot_in_page = slot_idx % page_size
+    page_outer = slot_in_page // X
+    page_inner = slot_in_page % X
+
+    head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    head_mask = head_idx < num_heads
+    key_d = tl.arange(0, KEY_BLOCK_D)
+    key_d_mask = key_d < key_head_size
+    key_d_outer = key_d // X
+    key_d_inner = key_d % X
+    value_d = tl.arange(0, VALUE_BLOCK_D)
+    value_d_mask = value_d < value_head_size
+
+    key_src_mask = head_mask[:, None] & key_d_mask[None, :]
+    key_src = (
+        token_idx * key_stride_token
+        + head_idx[:, None] * key_head_size
+        + key_d[None, :]
+    )
+    k = tl.load(key_ptr + key_src, mask=key_src_mask)
+    value_src_mask = head_mask[:, None] & value_d_mask[None, :]
+    value_src = (
+        token_idx * value_stride_token
+        + head_idx[:, None] * value_head_size
+        + value_d[None, :]
+    )
+    v = tl.load(value_ptr + value_src, mask=value_src_mask)
+
+    key_layer_stride = num_heads * key_head_size * page_size
+    key_head_stride = key_head_size * page_size
+    key_dst = (
+        block_idx * key_layer_stride
+        + head_idx[:, None] * key_head_stride
+        + key_d_outer[None, :] * page_size * X
+        + slot_in_page * X
+        + key_d_inner[None, :]
+    )
+    tl.store(key_cache_ptr + key_dst, k, mask=key_src_mask)
+
+    value_layer_stride = num_heads * value_head_size * page_size
+    value_head_stride = value_head_size * page_size
+    value_dst = (
+        block_idx * value_layer_stride
+        + head_idx[:, None] * value_head_stride
+        + page_outer * value_head_size * X
+        + value_d[None, :] * X
+        + page_inner
+    )
+    tl.store(value_cache_ptr + value_dst, v, mask=value_src_mask)
+
+
+def launch_reshape_and_cache_shuffle_5d_prefix_valid(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+):
+    """Write only ``row < commit_lens[request]`` into SHUFFLE-5D cache."""
+    num_tokens, num_heads, key_head_size = key.shape
+    value_tokens, value_heads, value_head_size = value.shape
+    assert (value_tokens, value_heads) == (num_tokens, num_heads)
+    assert slot_mapping_2d.dim() == 2 and slot_mapping_2d.numel() == num_tokens
+    assert commit_lens.shape == (slot_mapping_2d.shape[0],)
+    assert key_cache.dim() == 5 and value_cache.dim() == 5
+
+    num_blocks, key_heads, key_dim_over_x, page_size, x = key_cache.shape
+    value_blocks, value_cache_heads, page_over_x, value_dim, value_x = value_cache.shape
+    assert key_heads == num_heads and key_dim_over_x * x == key_head_size
+    assert (
+        value_blocks == num_blocks
+        and value_cache_heads == num_heads
+        and page_over_x * x == page_size
+        and value_dim == value_head_size
+        and value_x == x
+    )
+
+    head_block = min(4, triton.next_power_of_2(num_heads))
+    grid = (num_tokens, triton.cdiv(num_heads, head_block))
+    reshape_and_cache_shuffle_5d_prefix_valid[grid](
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping_2d,
+        commit_lens,
+        key.stride(0),
+        value.stride(0),
+        num_heads,
+        key_head_size,
+        value_head_size,
+        slot_mapping_2d.shape[1],
+        page_size,
+        X=x,
+        HEAD_BLOCK=head_block,
+        KEY_BLOCK_D=triton.next_power_of_2(key_head_size),
+        VALUE_BLOCK_D=triton.next_power_of_2(value_head_size),
     )
 
 

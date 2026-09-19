@@ -145,6 +145,8 @@ class DFlashDraftInputV2(SpecInput):
         bs = batch.batch_size()
         if bs == 0:
             return
+
+        batch.maybe_evict_swa()
         self._ensure_prepare_length_buffers(bs, batch.device)
         assert self._prepare_committed_kv_lens_cpu_buf is not None
         assert self._prepare_planning_kv_lens_cpu_buf is not None
@@ -267,6 +269,7 @@ class DFlashDraftInputV2(SpecInput):
         # reclaim any DFLASH over-allocation if the request finishes later.
         for i, req in enumerate(batch.reqs):
             req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
+            req.decode_batch_idx += 1
 
         # Preserve the lagging committed CPU view on the batch and carry the
         # tighter host-side planning bound separately from the full reserved

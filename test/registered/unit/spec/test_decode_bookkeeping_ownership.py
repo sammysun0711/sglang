@@ -69,6 +69,16 @@ _OWNER_SITES = {
         "DFlashDraftInputV2.prepare_for_decode",
         "kv_allocated_len",
     ): 1,
+    (
+        "speculative/dflash_info_v2.py",
+        "DFlashDraftInputV2.prepare_for_decode",
+        "decode_batch_idx",
+    ): 1,
+    (
+        "speculative/dflash_info_v2.py",
+        "DFlashDraftInputV2.prepare_for_decode",
+        "evict",
+    ): 1,
     # disaggregation decode prealloc
     (
         "disaggregation/decode.py",

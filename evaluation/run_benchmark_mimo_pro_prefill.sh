@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prefill-only client benchmark. 
-# Required server settings: CHUNKED_PREFILL_SIZE=65536 DISABLE_RADIX_CACHE=1;
+# Prefill-only client benchmark.
+# Milestone server settings: CHUNKED_PREFILL_SIZE=32768 DISABLE_RADIX_CACHE=1;
 # run the same client matrix against separately launched TBO-off/on servers.
 # --flush-cache below does not disable the server's radix cache.
 #
@@ -12,6 +12,9 @@ set -euo pipefail
 # overrides counts for inputs <=8K. PROMPT_WAVES/MIN_NUM_PROMPTS are sweep-only.
 benchmark_preset="${BENCHMARK_PRESET:-customer}"
 dry_run="${DRY_RUN:-0}"
+model="${MODEL:-/models/MiMo-V2.5-Pro}"
+host="${HOST:-0.0.0.0}"
+port="${PORT:-30001}"
 case "${benchmark_preset}" in
   customer)
     default_tokens="4096 8192 16384 32768 65536 131072 262144 524288 786432 1048000"
@@ -127,7 +130,7 @@ done
 
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 if [[ "${benchmark_preset}" == "customer" ]]; then
-  echo "Required server settings: chunked_prefill_size=65536, disable_radix_cache=True"
+  echo "Required milestone server settings: chunked_prefill_size=32768, disable_radix_cache=True"
   echo "Run separately for TBO off/on; record SGLANG_TBO_MIM_SEQ_LEN (current launcher default 2000; 8000 excludes 4K requests)."
   if [[ -n "${PROMPT_WAVES:-}${MIN_NUM_PROMPTS:-}" ]]; then
     echo "PROMPT_WAVES/MIN_NUM_PROMPTS apply only to BENCHMARK_PRESET=sweep; using customer prompt counts."
@@ -149,9 +152,9 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
 
     benchmark_cmd=(python3 -m sglang.bench_serving \
         --backend sglang \
-        --model /models/MiMo-V2.5-Pro/ \
-        --host 0.0.0.0 \
-        --port 30001 \
+        --model "${model}" \
+        --host "${host}" \
+        --port "${port}" \
         --dataset-name random \
         --random-input-len "${input_tokens}" \
         --random-output-len "${output_tokens}" \

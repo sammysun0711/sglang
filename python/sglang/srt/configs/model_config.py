@@ -47,6 +47,12 @@ MIMO_V2_MODEL_ARCHS = (
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
 
+def _quant_config_to_dict(quant_config):
+    if quant_config is not None and not isinstance(quant_config, dict):
+        return quant_config.to_dict()
+    return quant_config
+
+
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
     if layout is None:
@@ -98,6 +104,16 @@ def _hf_attr(config, name):
     if isinstance(config, dict):
         return config.get(name)
     return getattr(config, name, None)
+
+
+def is_mimo_v2_mxfp4(config) -> bool:
+    quantization_config = _quant_config_to_dict(_hf_attr(config, "quantization_config"))
+    return (
+        _hf_arch(config) in MIMO_V2_MODEL_ARCHS
+        and isinstance(quantization_config, dict)
+        and str(quantization_config.get("quant_method") or "").lower() == "fp8"
+        and str(quantization_config.get("store_dtype") or "").lower() == "mxfp4"
+    )
 
 
 def is_deepseek_dsa(config) -> bool:
@@ -251,11 +267,23 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
-        # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
-        # FP8 expert tensor layout.
-        self.is_fp4_experts: bool = False
-        if is_deepseek_v4(self.hf_config):
+        quantization_config = (
+            _quant_config_to_dict(getattr(self.hf_config, "quantization_config", None))
+            or {}
+        )
+        routed_experts_quant_method = quantization_config.get(
+            "routed_experts_quant_method"
+        )
+        self.is_fp4_experts: bool = (
+            routed_experts_quant_method == "mxfp4"
+            or is_mimo_v2_mxfp4(self.hf_config)
+        )
+        if self.is_fp4_experts:
+            logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+
+        # DSV4 expert layout: env (default True = mxfp4) applies only when the
+        # checkpoint does not declare its routed-expert storage explicitly.
+        if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if not envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
                 from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts

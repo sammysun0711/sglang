@@ -59,6 +59,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     hidden_pad: int = 0
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
+    is_fp4_experts: bool = False
     fused_moe_kwargs: Optional[dict[str, Any]] = None
 
 
@@ -129,6 +130,23 @@ def _aiter_fused_moe_supports_transposed_a1_scale() -> bool:
     return "a1_scale_is_transposed" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_opus_stage2_output_dtype() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "opus_stage2_output_dtype" in inspect.signature(fused_moe).parameters
+
+
+def _aiter_mxfp4_stage2_output_dtype() -> str:
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return "auto"
+    return getattr(server_args, "aiter_mxfp4_stage2_output_dtype", "auto")
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -168,6 +186,28 @@ class AiterRunnerCore(MoeRunnerCore):
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
+        if quant_info.is_fp4_experts:
+            output_dtype = extra.get(
+                "opus_stage2_output_dtype", _aiter_mxfp4_stage2_output_dtype()
+            )
+            if output_dtype not in ("auto", "fp8", "bf16"):
+                raise ValueError(
+                    "AITER MXFP4 stage-2 output dtype must be 'auto', 'fp8', "
+                    f"or 'bf16', got {output_dtype!r}"
+                )
+            if output_dtype == "auto":
+                extra.pop("opus_stage2_output_dtype", None)
+            elif quant_info.expert_mask is not None:
+                extra.pop("opus_stage2_output_dtype", None)
+            elif _aiter_fused_moe_supports_opus_stage2_output_dtype():
+                extra["opus_stage2_output_dtype"] = output_dtype
+            elif output_dtype == "bf16":
+                raise NotImplementedError(
+                    "--aiter-mxfp4-stage2-output-dtype=bf16 requires an AITER "
+                    "build whose fused_moe API supports opus_stage2_output_dtype"
+                )
+            else:
+                extra.pop("opus_stage2_output_dtype", None)
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
@@ -179,8 +219,9 @@ class AiterRunnerCore(MoeRunnerCore):
                     "fused_moe build with a1_scale_is_transposed support"
                 )
             extra["a1_scale_is_transposed"] = True
-        if quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
+        if quant_info.swiglu_limit > 0 or quant_info.is_fp4_experts:
+            # Native MXFP4 weights use the configured gate/up shuffle regardless
+            # of whether the activation has a clamp.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
             # lives elsewhere / is absent.
@@ -196,7 +237,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
-            extra["swiglu_limit"] = quant_info.swiglu_limit
+            if quant_info.swiglu_limit > 0:
+                extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
 

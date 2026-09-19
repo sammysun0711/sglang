@@ -17,6 +17,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 
+@pytest.fixture(autouse=True)
+def _clear_aiter_signature_caches():
+    yield
+    aiter_runner._aiter_fused_moe_supports_no_combine.cache_clear()
+    aiter_runner._aiter_fused_moe_supports_transposed_a1_scale.cache_clear()
+    aiter_runner._aiter_fused_moe_supports_opus_stage2_output_dtype.cache_clear()
+
+
 def _runner_input():
     topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
     return AiterRunnerInput(
@@ -113,6 +121,50 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+def test_aiter_runner_forwards_gate_layout_for_native_mxfp4(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(is_fp4_experts=True),
+        running_state={},
+    )
+
+    assert captured["gate_mode"] == "INTERLEAVE"
+    assert "swiglu_limit" not in captured
+
+
+@pytest.mark.parametrize("output_dtype", ["auto", "fp8", "bf16"])
+def test_aiter_runner_selects_mxfp4_stage2_output(monkeypatch, output_dtype):
+    captured = {}
+
+    def fused_moe(*, opus_stage2_output_dtype="auto", **kwargs):
+        captured.update(kwargs)
+        captured["opus_stage2_output_dtype"] = opus_stage2_output_dtype
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    monkeypatch.setattr(
+        aiter_runner, "_aiter_mxfp4_stage2_output_dtype", lambda: output_dtype
+    )
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(is_fp4_experts=True),
+        running_state={},
+    )
+
+    assert captured["opus_stage2_output_dtype"] == output_dtype
 
 
 if __name__ == "__main__":

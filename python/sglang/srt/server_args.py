@@ -658,6 +658,7 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    aiter_mxfp4_stage2_output_dtype: Literal["auto", "fp8", "bf16"] = "auto"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     flashinfer_allreduce_fusion_backend: Optional[
@@ -6298,6 +6299,17 @@ class ServerArgs:
             choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
+        )
+        parser.add_argument(
+            "--aiter-mxfp4-stage2-output-dtype",
+            type=str,
+            choices=["auto", "fp8", "bf16"],
+            default=ServerArgs.aiter_mxfp4_stage2_output_dtype,
+            help=(
+                "Choose the AITER OPUS MXFP4 stage-2 route-output dtype. "
+                "Auto preserves AITER's tuned selection; FP8 is faster; BF16 "
+                "improves numerical agreement before route reduction."
+            ),
         )
         parser.add_argument(
             "--flashinfer-allreduce-fusion-backend",

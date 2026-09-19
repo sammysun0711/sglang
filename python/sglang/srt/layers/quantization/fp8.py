@@ -140,6 +140,7 @@ if _use_aiter:
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+MXFP4_BLOCK_SIZE = 32
 
 logger = logging.getLogger(__name__)
 
@@ -156,11 +157,17 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        store_dtype: str = "fp8",
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
+        if store_dtype not in ("fp8", "mxfp4"):
+            raise ValueError(f"Unsupported FP8 checkpoint store_dtype={store_dtype!r}")
+        if store_dtype == "mxfp4" and not is_checkpoint_fp8_serialized:
+            raise ValueError("store_dtype='mxfp4' requires an FP8-serialized checkpoint")
+        self.store_dtype = store_dtype
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -238,6 +245,7 @@ class Fp8Config(QuantizationConfig):
                 normalized.append(f"model.{base}")
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        store_dtype = cls.get_from_keys_or(config, ["store_dtype"], "fp8")
         if use_mxfp8 and weight_block_size is not None:
             logger.warning(
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
@@ -250,6 +258,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            store_dtype=store_dtype,
         )
 
     def get_quant_method(
@@ -943,12 +952,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHTS
         if self.is_fp4_expert:
+            fp4_storage_dtype = (
+                torch.uint8
+                if getattr(self.quant_config, "store_dtype", "fp8") == "mxfp4"
+                else torch.int8
+            )
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
                     2 * intermediate_size_per_partition,
                     hidden_size // 2,
-                    dtype=torch.int8,
+                    dtype=fp4_storage_dtype,
                 ),
                 requires_grad=False,
             )
@@ -957,7 +971,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition // 2,
-                    dtype=torch.int8,
+                    dtype=fp4_storage_dtype,
                 ),
                 requires_grad=False,
             )
@@ -1035,7 +1049,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHT_SCALES
         if self.is_fp4_expert:
             fp4_block_k = 32
-            fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+            fp4_scale_dtype = (
+                torch.uint8
+                if getattr(self.quant_config, "store_dtype", "fp8") == "mxfp4"
+                else torch.float8_e8m0fnu if _use_aiter else torch.float32
+            )
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
@@ -1165,6 +1183,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
+
+            if getattr(self.quant_config, "store_dtype", "fp8") == "mxfp4":
+                layer.w13_weight_scale_inv.data = layer.w13_weight_scale_inv.data.view(
+                    torch.float8_e8m0fnu
+                )
+                layer.w2_weight_scale_inv.data = layer.w2_weight_scale_inv.data.view(
+                    torch.float8_e8m0fnu
+                )
 
             # CK FP4 MoE kernel requires K_packed divisible by 128
             # (i.e., K_logical divisible by 256).
@@ -2160,6 +2186,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            is_fp4_experts=self.is_fp4_expert,
         )
 
 

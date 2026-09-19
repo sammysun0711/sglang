@@ -3168,7 +3168,7 @@ def test_flydsl_pa_decode_loader_rejects_legacy_compile_api(monkeypatch):
 
     modules = {
         "flydsl": SimpleNamespace(__version__="0.3.2", __file__="test-runtime"),
-        "aiter.ops.flydsl.kernels.pa_decode_asymmetric": SimpleNamespace(
+        "aiter.ops.flydsl.pa_decode": SimpleNamespace(
             __file__="legacy-pa-decode-tile",
             pa_decode_tile=lambda **kwargs: None,
             compile_pa_decode_tile=legacy_compile_pa_decode_tile,
@@ -3189,19 +3189,19 @@ def test_flydsl_pa_decode_loader_rejects_legacy_compile_api(monkeypatch):
         aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
 
 
-def test_flydsl_pa_decode_loader_accepts_runtime_032_kv_dtype_api(monkeypatch):
+def test_flydsl_pa_decode_loader_accepts_optimized_tile_api(monkeypatch):
     def compile_pa_decode_tile(*, v_head_dim, kv_dtype):
         pass
 
     modules = {
         "flydsl": SimpleNamespace(__version__="0.3.2", __file__="test-runtime"),
-        "aiter.ops.flydsl.kernels.pa_decode_asymmetric": SimpleNamespace(
+        "aiter.ops.flydsl.pa_decode": SimpleNamespace(
             __file__="pa-decode-tile-032",
             pa_decode_tile=lambda **kwargs: None,
             compile_pa_decode_tile=compile_pa_decode_tile,
         ),
         "aiter.ops.flydsl.kernels.pa_decode_reduce": SimpleNamespace(
-            compile_pa_decode_ps_reduce=lambda **kwargs: None
+            compile_pa_decode_ps_reduce=lambda *, query_seq_len, **kwargs: None
         ),
     }
     monkeypatch.setattr(
@@ -3212,7 +3212,7 @@ def test_flydsl_pa_decode_loader_accepts_runtime_032_kv_dtype_api(monkeypatch):
     try:
         kernels = aiter_utils.load_flydsl_pa_decode_kernels()
         assert kernels.kv_dtype_parameter == "kv_dtype"
-        assert kernels.reduce_uses_runtime_query_length
+        assert not kernels.reduce_uses_runtime_query_length
     finally:
         aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
 

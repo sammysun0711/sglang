@@ -1718,7 +1718,7 @@ def test_gfx942_fp8_flypa_prefill_skips_ck(monkeypatch):
     assert captured["q"].dtype == fp8_dtype
 
 
-def test_gfx950_fp8_below_flydsl_size_falls_back_to_flypa(monkeypatch):
+def test_gfx950_fp8_uses_aiter_flydsl_at_small_sizes(monkeypatch):
     captured, k_buf, _, _ = _run_flypa_prefill_case(
         monkeypatch,
         gfx942=False,
@@ -1727,11 +1727,12 @@ def test_gfx950_fp8_below_flydsl_size_falls_back_to_flypa(monkeypatch):
         kv_dtype=fp8_dtype,
         flydsl_env=True,
     )
-    assert captured["selected"] == "flypa"
+    assert captured["selected"] == "flydsl"
     assert captured["k"].data_ptr() == k_buf.data_ptr()
+    assert "gather_slot_ids" not in captured
 
 
-def test_gfx950_bf16_flypa_prefill_is_enabled(monkeypatch):
+def test_gfx950_bf16_prefill_skips_local_flypa(monkeypatch):
     captured, _, _, _ = _run_flypa_prefill_case(
         monkeypatch,
         gfx942=False,
@@ -1739,7 +1740,8 @@ def test_gfx950_bf16_flypa_prefill_is_enabled(monkeypatch):
         flypa_env=True,
         kv_dtype=torch.bfloat16,
     )
-    assert captured["selected"] == "flypa"
+    assert captured["selected"] == "ck"
+    assert "gather_slot_ids" in captured
 
 
 def test_gfx950_flypa_env_keeps_fresh_asm_shortcut(monkeypatch):

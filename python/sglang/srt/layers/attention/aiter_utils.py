@@ -73,8 +73,6 @@ FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS = 8
 FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS = (8, 16, 24, 32)
 FLYDSL_MIMO_NUM_PARTITIONS_ENV = "SGLANG_FLYDSL_PA_NUM_PARTITIONS"
 FLYDSL_MIMO_PREFILL_ENV = "SGLANG_FLYDSL_MIMO_PREFILL"
-FLYDSL_MIMO_PREFILL_MIN_Q = 4096
-FLYDSL_MIMO_PREFILL_MIN_KV = 8192
 FLYPA_MIMO_PREFILL_ENV = "SGLANG_FLYPA_MIMO_PREFILL"
 
 CK_MIMO_PREFILL_QUERY_HEADS = 16
@@ -1292,6 +1290,11 @@ def can_use_mimo_flypa_prefill(
         return False
     if not is_mimo_flypa_arch():
         return False
+    # gfx950 uses the native AITER paths: BF16 goes through the ASM paths above
+    # (or the AITER fallback below), while eligible FP8 uses PR #5556's paged
+    # FlyDSL kernel. The local FlyPA kernel remains a gfx942 compatibility path.
+    if is_gfx950():
+        return False
     if (
         is_swa_layer
         or sinks is not None
@@ -1429,9 +1432,8 @@ def can_use_mimo_flydsl_fp8_prefill(
 ) -> bool:
     """Return whether gfx950 FlyDSL paged FP8 can consume this cached extend.
 
-    Size-gated (``max_q >= 4096``, ``max_kv >= 8192``) and FP8-only. Tried
-    before FlyPA so both env flags can stay on without FlyPA stealing the
-    gfx950 dual-wave kernel.
+    FP8-only and tried before all fallback paths so the local FlyPA kernel
+    cannot intercept supported gfx950 shapes.
     """
     if not get_bool_env_var(FLYDSL_MIMO_PREFILL_ENV, "false"):
         return False
@@ -1457,13 +1459,9 @@ def can_use_mimo_flydsl_fp8_prefill(
         or getattr(layer, "mimo_original_v_head_dim", None) != 128
     ):
         return False
-    max_q = getattr(metadata, "max_q_len", None)
-    max_kv = getattr(metadata, "max_kv_len", None)
     if (
-        max_q is None
-        or max_kv is None
-        or int(max_q) < FLYDSL_MIMO_PREFILL_MIN_Q
-        or int(max_kv) < FLYDSL_MIMO_PREFILL_MIN_KV
+        getattr(metadata, "max_q_len", None) is None
+        or getattr(metadata, "max_kv_len", None) is None
     ):
         return False
     expected_k_tail = (

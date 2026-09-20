@@ -37,6 +37,9 @@ esac
 
 read -r -a TOKEN_LIST <<< "${TOKEN_LIST_OVERRIDE:-${default_tokens}}"
 output_tokens=1
+# extra-request-body replaces sampling_params, so preserve the sampling defaults.
+# Keep special-token text visible so the client can record TTFT for those outputs.
+extra_request_body="{\"sampling_params\":{\"temperature\":0.0,\"max_new_tokens\":${output_tokens},\"ignore_eos\":true,\"skip_special_tokens\":false}}"
 small_input_concurrency_list="${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_small_concurrency}}}"
 short_concurrency_list="${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_short_concurrency}}"
 long_concurrency_list="${LONG_CONCURRENCY_LIST_OVERRIDE:-${default_long_concurrency}}"
@@ -134,12 +137,11 @@ if [[ "${benchmark_preset}" == "customer" ]]; then
     echo "PROMPT_WAVES/MIN_NUM_PROMPTS apply only to BENCHMARK_PRESET=sweep; using customer prompt counts."
   fi
 fi
+results_csv="${LOG_DIR}/results.csv"
 if [[ "${dry_run}" == "0" ]]; then
   mkdir -p "$LOG_DIR"
+  echo "input_tokens,max_concurrency,num_prompts,mean_ttft_ms,input_throughput" > "${results_csv}"
 fi
-
-results_csv="${LOG_DIR}/results.csv"
-echo "input_tokens,max_concurrency,num_prompts,mean_ttft_ms,input_throughput" > "${results_csv}"
 
 for input_tokens in "${TOKEN_LIST[@]}"; do
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
@@ -147,7 +149,6 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
 
     json_file="${LOG_DIR}/benchmark_${input_tokens}_con${concurrency}.jsonl"
-    : > "${json_file}"
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${warmup_requests}"
@@ -167,19 +168,21 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --seed 12345 \
         --num-prompts "${num_prompts}" \
         --warmup-requests "${warmup_requests}" \
-        --max-concurrency "${concurrency}") \
+        --max-concurrency "${concurrency}" \
         --tokenize-prompt \
-        --output-file "${json_file}"
+        --extra-request-body "${extra_request_body}" \
+        --output-file "${json_file}")
     printf 'Command:'
     printf ' %q' "${benchmark_cmd[@]}"
     printf '\n'
     if [[ "${dry_run}" == "0" ]]; then
+      : > "${json_file}"
       "${benchmark_cmd[@]}" 2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"
+      jq -r --argjson input "${input_tokens}" --argjson concurrency "${concurrency}" \
+        --argjson prompts "${num_prompts}" \
+        '[$input, $concurrency, $prompts, .mean_ttft_ms, .input_throughput] | @csv' \
+        "${json_file}" >> "${results_csv}"
     fi
-    jq -r --argjson input "${input_tokens}" --argjson concurrency "${concurrency}" \
-      --argjson prompts "${num_prompts}" \
-      '[$input, $concurrency, $prompts, .mean_ttft_ms, .input_throughput] | @csv' \
-      "${json_file}" >> "${results_csv}"
     echo -e "============================================================\n"
   done
 done
@@ -188,5 +191,5 @@ if [[ "${dry_run}" == "1" ]]; then
   echo "Dry run complete; no benchmark requests sent."
 else
   echo "All lengths and concurrency tests completed!"
+  echo "Results: ${results_csv}"
 fi
-echo "Results: ${results_csv}"

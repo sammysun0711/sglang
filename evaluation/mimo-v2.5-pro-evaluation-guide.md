@@ -93,6 +93,9 @@ Run the server first, then run either client in another terminal:
 ```bash
 # launch server
 ./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+# use below command to launch server when run accuracy client
+# ENABLE_FAKE_EP_DISPATCH=0 ./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+
 # run accuracy client
 ./run_evalscope_gsm8k_accuracy.sh
 # run benchmark client

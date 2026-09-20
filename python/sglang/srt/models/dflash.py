@@ -150,8 +150,16 @@ class DFlashAttention(nn.Module):
         self.v_scale = draft_config.attention_value_scale
         self.attention_sink_bias = None
         if draft_config.attention_sink_bias:
+            # MiMo-V2.5 was validated with FP32 sinks. MiMo-V2.6 advertises
+            # its BF16 router dtype and keeps the checkpoint/model dtype here.
+            sink_dtype = (
+                torch.float32
+                if _is_npu or getattr(config, "moe_router_dtype", None) is None
+                else None
+            )
             self.attention_sink_bias = nn.Parameter(
-                torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
+                torch.empty(self.num_heads, dtype=sink_dtype),
+                requires_grad=False,
             )
             set_weight_attrs(
                 self.attention_sink_bias,

@@ -20,80 +20,51 @@ rm -rf /sgl-workspace/sglang /sgl-workspace/aiter
 ### Install sglang
 ```bash
 cd /root/workspace
-git clone https://github.com/sammysun0711/sglang -b mimo-opt
+git clone https://github.com/sammysun0711/sglang -b 
 cd sglang && pip install --upgrade pip && cd sgl-kernel && python3 setup_rocm.py install
 cd ..  && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && pip install -e "python[all_hip]"
 cd ..
 ```
 ### Install AITER & pyhip dependency
 ```bash
-git clone https://github.com/sammysun0711/aiter -b mimo-opt
+git clone https://github.com/sammysun0711/aiter -b integration/mimo-fp4-dflash
 cd aiter
 git submodule update --init 3rdparty/composable_kernel
-git -C 3rdparty/composable_kernel apply < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch
 pip install -e .
 cd ..
 ```
 
 ### Install FlyDSL
-FlyDSL installation should be after AITER installation, since it will update FlyDSL 0.2.4 runtime and FlyDSL FA & PA decode kernels.
+Install FlyDSL runtime version that compatible with aiter  
 ```bash
-git clone https://github.com/sammysun0711/FlyDSL -b mimo-opt
-cd FlyDSL/wheels && python3 -m pip install --no-deps --force-reinstall flydsl-0.2.4-*.whl mimo_flydsl_kernels-0.1.3-*.whl
-cd ../..
+pip install flydsl==0.3.2
 ```
 
-## 3. Run optimized single node prefill benchmark
-### Launch server
-```bash
-cd /root/workspace/sglang/evaluation
-./launch_tp8_noep_aiter_mtp_accuracy.sh
-```
-### Run prefill benchmark
-```bash
-./run_benchmark_mimo_pro_prefill.sh
-```
-
-## 4. Run optimized single node decode benchmark with fake prefill
-### Launch server
-```bash
-cd /root/workspace/sglang/evaluation
-./launch_tp8_noep_aiter_mtp_decode_fake_prefill.sh
-```
-
-### Run decode benchmark
-```bash
-./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh
-```
-
-### Run decode throughput analysis
-```python
-python3 analyze_server_output_throughput.py <path-to-server-log>
-```
-
-## 5. Run baseline single node prefill benchmark
+## 3. Run baseline single node prefill benchmark
 Baseline prefill keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache 
 
 ### Launch server
 ```bash
-cd /root/workspace/sglang/evaluation
-./launch_tp8_noep_aiter_mtp_accuracy_baseline.sh
+cd /root/workspace/sglang/evaluation/mimo_dflash_scripts
+./launch_tp8_noep_aiter_dflash_accuracy_baseline.sh
 ```
 ### Run prefill benchmark
 ```bash
+cd /root/workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
-## 6. Run baseline single node decode benchmark with fake prefill
+## 4. Run baseline single node decode benchmark with fake prefill
 Baseline fake-prefill decode keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache
 
 ### Launch server
 ```bash
-cd /root/workspace/sglang/evaluation
+cd /root/workspace/sglang/evaluation/mimo_dflash_scripts
 ./launch_tp8_noep_aiter_mtp_decode_fake_prefill_baseline.sh
 ```
 
 ### Run decode benchmark
 ```bash
+cd /root/workspace/sglang/evaluation
 ./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh
 ```
 
@@ -102,7 +73,7 @@ cd /root/workspace/sglang/evaluation
 python3 analyze_server_output_throughput.py <path-to-server-log>
 ```
 
-## 7. Profiling & Analysis
+## 5. Profiling & Analysis
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sglang_profile.sh
@@ -120,10 +91,3 @@ Follow up customer's swe-bench accuracy verification guide.
 
 ## 10. H200 performance evaluation
 Follow up customer's shared performance data
-
-## 11. Run prefill/decode disaggregated deployment
-Please refer to the [PD disaggregated guide](mimo_pd_scripts/mimo-v2.5-pro-pd-disaggregated-guide.md).
-
-## 12. Run mxfp4 model with dflash: 
-Please refer to [MiMO-v2.5-Pro MXFP4 dflash guide](mimo_pd_scripts/mimo_dflash_scripts/mimo-v2.5-pro-dflash-evaluation-guide.md).
-

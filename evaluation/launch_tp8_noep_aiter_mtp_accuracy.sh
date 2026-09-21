@@ -98,6 +98,8 @@ export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
+export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
@@ -107,6 +109,14 @@ export SGLANG_TBO_MIM_SEQ_LEN="${SGLANG_TBO_MIM_SEQ_LEN:-2000}"
 
 if ! [[ "${SGLANG_TBO_MIM_SEQ_LEN}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SGLANG_TBO_MIM_SEQ_LEN must be a positive integer, observed '${SGLANG_TBO_MIM_SEQ_LEN}'" >&2
+  exit 2
+fi
+if ! [[ "${TOKENIZER_WORKER_NUM}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TOKENIZER_WORKER_NUM must be a positive integer, observed '${TOKENIZER_WORKER_NUM}'" >&2
+  exit 2
+fi
+if [[ -n "${SERVER_RANDOM_SEED}" ]] && ! [[ "${SERVER_RANDOM_SEED}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "SERVER_RANDOM_SEED must be a non-negative integer or unset" >&2
   exit 2
 fi
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT="${SGLANG_MIMO_FUSED_RMS_MOE_QUANT:-1}"
@@ -184,6 +194,7 @@ echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, chu
 echo "AITER root/configs: ${AITER_ROOT}; fmoe=$(basename -- "${AITER_CONFIG_FMOE}"); gemm=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}"); bpreshuffle=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}")"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "Speculative decoding: algorithm=${SPECULATIVE_ALGORITHM}, attention-mode=${SPECULATIVE_ATTENTION_MODE}, ${speculative_summary}"
+echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
 
 mkdir -p ${LOG_DIR}
 
@@ -217,9 +228,16 @@ fi
 echo "Radix cache: ${radix_cache_status}"
 echo "HIP non-greedy EAGLE verifier: ${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY}"
 
+seed_args=()
+if [[ -n "${SERVER_RANDOM_SEED}" ]]; then
+  seed_args+=(--random-seed "${SERVER_RANDOM_SEED}")
+fi
+
 python3 -u -m sglang.launch_server \
   --model-path "${MODEL}" \
   --tp-size 8 \
+  --tokenizer-worker-num "${TOKENIZER_WORKER_NUM}" \
+  "${seed_args[@]}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --host "${HOST}" \
   --port "${PORT}" \

@@ -12,20 +12,10 @@ export SGLANG_SPEC_NAN_DETECTION=1
 export SGLANG_SPEC_OOB_DETECTION=1
 export SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY="${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY:-1}"
 export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
-# Accuracy baseline keeps quick-reduce disabled by default. Ablation runners can
-# opt in explicitly without changing the default accuracy-safe behavior.
-if [[ "${SGLANG_ABLATION_ENABLE_QUICK_REDUCE:-0}" == "1" ]]; then
-  export ROCM_QUICK_REDUCE_QUANTIZATION="${ROCM_QUICK_REDUCE_QUANTIZATION:-INT8}"
-  echo "ROCM_QUICK_REDUCE_QUANTIZATION enabled for ablation: ${ROCM_QUICK_REDUCE_QUANTIZATION}"
-elif [[ -v ROCM_QUICK_REDUCE_QUANTIZATION ]]; then
-  echo "ROCM_QUICK_REDUCE_QUANTIZATION was set to '${ROCM_QUICK_REDUCE_QUANTIZATION}', unsetting for accuracy"
-  unset ROCM_QUICK_REDUCE_QUANTIZATION
-else
-  echo "ROCM_QUICK_REDUCE_QUANTIZATION is unset"
-fi
-# Accuracy baseline keeps mixed router and FlyDSL prefill disabled by default;
-# ablation runners may override these with explicit environment settings.
-export SGLANG_MIMO_MIXED_ROUTER="${SGLANG_MIMO_MIXED_ROUTER:-0}"
+# Baseline contract: never inherit the lossy Quick Reduce path or mixed-router
+# optimization from the caller. Ablations must use a separate launcher.
+unset ROCM_QUICK_REDUCE_QUANTIZATION
+export SGLANG_MIMO_MIXED_ROUTER=0
 
 export SGLANG_FLYPA_MIMO_PREFILL="${SGLANG_FLYPA_MIMO_PREFILL:-1}"
 export SGLANG_FLYDSL_MIMO_PREFILL="${SGLANG_FLYDSL_MIMO_PREFILL:-1}"
@@ -44,7 +34,7 @@ export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
-export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
+export KV_CACHE_DTYPE=bf16
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
 export ENABLE_TWO_BATCH_OVERLAP="${ENABLE_TWO_BATCH_OVERLAP:-0}"
 export SGLANG_TBO_MIM_SEQ_LEN="${SGLANG_TBO_MIM_SEQ_LEN:-2000}"

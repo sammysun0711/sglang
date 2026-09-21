@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
+
 from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.batch_overlap.operations import YieldOperation
 from sglang.srt.batch_overlap.operations_strategy import (
@@ -491,6 +493,203 @@ def test_mimo_no_ep_tbo_gate_accepts_only_ordinary_prefill():
 
     speculative_extend = _make_forward_batch(spec_info=object())
     assert "speculative" in _no_ep_tbo_reason(speculative_extend)
+
+
+def test_tbo_aux_capture_merge_restores_parent_order_and_trims_padding():
+    parent = SimpleNamespace(
+        tbo_children=[
+            SimpleNamespace(tbo_parent_token_range=(0, 3)),
+            SimpleNamespace(tbo_parent_token_range=(3, 5)),
+        ]
+    )
+    capture_a = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    capture_b = torch.arange(12, dtype=torch.float32).reshape(4, 3) + 100
+    sinks = [
+        two_batch_overlap.TboAuxCaptureSink({1}, [capture_a]),
+        two_batch_overlap.TboAuxCaptureSink({1}, [capture_b]),
+    ]
+
+    merged = two_batch_overlap._merge_tbo_aux_captures(sinks, parent, 5)
+
+    assert len(merged) == 1
+    torch.testing.assert_close(merged[0][:3], capture_a[:3])
+    torch.testing.assert_close(merged[0][3:], capture_b[:2])
+
+
+def test_tbo_aux_capture_merge_rejects_child_layer_mismatch():
+    parent = SimpleNamespace(
+        tbo_children=[
+            SimpleNamespace(tbo_parent_token_range=(0, 2)),
+            SimpleNamespace(tbo_parent_token_range=(2, 4)),
+        ]
+    )
+    sinks = [
+        two_batch_overlap.TboAuxCaptureSink({1}, [torch.zeros(2, 3)]),
+        two_batch_overlap.TboAuxCaptureSink({1}),
+    ]
+
+    with pytest.raises(AssertionError, match="different auxiliary layer counts"):
+        two_batch_overlap._merge_tbo_aux_captures(sinks, parent, 4)
+
+
+def test_tbo_filter_only_threads_capture_sink_when_present():
+    child = SimpleNamespace(tbo_parent_token_range=(0, 2), tbo_padded_len=2)
+    inputs = dict(
+        hidden_states=torch.zeros(4, 3),
+        residual=torch.zeros(4, 3),
+        positions=torch.arange(4),
+        output_forward_batch=child,
+        tbo_subbatch_index=0,
+    )
+
+    assert "aux_capture_sink" not in two_batch_overlap._model_forward_filter_inputs(
+        **inputs
+    )
+
+    sink = two_batch_overlap.TboAuxCaptureSink({1})
+    filtered = two_batch_overlap._model_forward_filter_inputs(
+        **inputs, aux_capture_sink=sink
+    )
+    assert filtered["aux_capture_sink"] is sink
+
+
+def test_mimo_tbo_capture_selects_requested_layer_and_preserves_sink():
+    captured = []
+
+    class FakeState(SimpleNamespace):
+        def update(self, values):
+            self.__dict__.update(values)
+
+    class FakeCommunicator:
+        def prepare_attn_and_capture_last_layer_outputs(
+            self,
+            hidden_states,
+            residual,
+            forward_batch,
+            captured_last_layer_outputs,
+            quant_format,
+        ):
+            if captured_last_layer_outputs is not None:
+                captured_last_layer_outputs.append(hidden_states.clone())
+            return hidden_states, residual
+
+    layer = SimpleNamespace(
+        layer_id=16,
+        layer_communicator=FakeCommunicator(),
+        _fused_rms_qkv_quant_format="fp8",
+    )
+    state = FakeState()
+    sink = two_batch_overlap.TboAuxCaptureSink({16}, captured)
+    hidden_states = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    forward_batch = object()
+
+    mimo_v2.MiMoV2DecoderLayer.op_comm_prepare_attn(
+        layer,
+        state,
+        positions=torch.arange(2),
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        residual=None,
+        tbo_subbatch_index=1,
+        aux_capture_sink=sink,
+    )
+
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0], hidden_states)
+    assert state.aux_capture_sink is sink
+
+    layer.layer_id = 17
+    state = FakeState()
+    mimo_v2.MiMoV2DecoderLayer.op_comm_prepare_attn(
+        layer,
+        state,
+        positions=torch.arange(2),
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        residual=None,
+        tbo_subbatch_index=1,
+        aux_capture_sink=sink,
+    )
+    assert len(captured) == 1
+
+
+def test_mimo_model_threads_dflash_capture_through_tbo(monkeypatch):
+    class FakeFirstLayer:
+        layer_scatter_modes = SimpleNamespace(layer_output_mode=object())
+
+        def __call__(self, _positions, hidden_states, _forward_batch, residual):
+            return hidden_states + 1, residual
+
+    class FakeNorm:
+        def __call__(self, hidden_states, residual=None):
+            assert residual is None
+            return hidden_states
+
+    model = object.__new__(mimo_v2.MiMoV2Model)
+    torch.nn.Module.__init__(model)
+    model.pp_group = SimpleNamespace(
+        is_first_rank=True,
+        is_last_rank=True,
+        world_size=1,
+    )
+    model.config = SimpleNamespace(num_hidden_layers=3)
+    model.layers = [FakeFirstLayer(), object(), object()]
+    model.layers_to_capture = [1, 3]
+    model.start_layer = 0
+    model.end_layer = 3
+    model.norm = FakeNorm()
+    model._logged_no_ep_tbo = False
+    model._logged_no_ep_tbo_fallback = False
+
+    observed = {}
+
+    def fake_model_forward_maybe_tbo(**kwargs):
+        observed.update(kwargs)
+        kwargs["captured_last_layer_outputs"].append(kwargs["hidden_states"].clone())
+        return kwargs["hidden_states"] + 2, kwargs["residual"]
+
+    forward_batch = SimpleNamespace(
+        can_run_tbo=True,
+        tbo_children=[
+            SimpleNamespace(tbo_padded_len=4),
+            SimpleNamespace(tbo_padded_len=4),
+        ],
+        return_hidden_states_before_norm=False,
+    )
+    input_embeds = torch.zeros((2, 4), dtype=torch.bfloat16)
+
+    with (
+        patch.object(
+            mimo_v2,
+            "get_moe_a2a_backend",
+            return_value=SimpleNamespace(is_none=lambda: True),
+        ),
+        patch.object(
+            mimo_v2.MiMoV2Model,
+            "_no_ep_tbo_ineligible_reason",
+            return_value=None,
+        ),
+        patch.object(
+            mimo_v2,
+            "model_forward_maybe_tbo",
+            side_effect=fake_model_forward_maybe_tbo,
+        ),
+    ):
+        hidden_states, hidden_before_norm, captures = model.forward(
+            input_ids=torch.zeros(2, dtype=torch.int64),
+            positions=torch.arange(2),
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+
+    assert observed["enable_tbo"]
+    assert observed["layers_to_capture"] == [1, 3]
+    assert observed["captured_last_layer_outputs"] is captures
+    assert hidden_before_norm is None
+    torch.testing.assert_close(hidden_states, torch.full_like(input_embeds, 3))
+    assert len(captures) == 2
+    torch.testing.assert_close(captures[0], torch.full_like(input_embeds, 1))
+    torch.testing.assert_close(captures[1], torch.full_like(input_embeds, 3))
 
 
 def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import (
+    TboAuxCaptureSink,
     launch_tbo_tp_all_reduce,
     model_forward_maybe_tbo,
     wait_tbo_tp_all_reduce,
@@ -1017,13 +1018,20 @@ class MiMoV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: Optional[int] = None,
+        aux_capture_sink: Optional[TboAuxCaptureSink] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
                 residual,
                 forward_batch,
-                self._fused_rms_qkv_quant_format,
+                captured_last_layer_outputs=(
+                    aux_capture_sink.captures
+                    if aux_capture_sink is not None
+                    and self.layer_id in aux_capture_sink.layer_ids
+                    else None
+                ),
+                quant_format=self._fused_rms_qkv_quant_format,
             )
         )
         state.update(
@@ -1031,6 +1039,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 positions=positions,
                 tbo_subbatch_index=tbo_subbatch_index,
+                aux_capture_sink=aux_capture_sink,
             )
         )
 
@@ -1074,6 +1083,7 @@ class MiMoV2DecoderLayer(nn.Module):
             residual=residual,
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
+            aux_capture_sink=state.aux_capture_sink,
         )
 
         state.clear(
@@ -1081,6 +1091,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 "positions",
                 "forward_batch",
                 "tbo_subbatch_index",
+                "aux_capture_sink",
             }
         )
         return output
@@ -1227,9 +1238,6 @@ class MiMoV2Model(nn.Module):
                     ineligible_reason,
                 )
                 self._logged_no_ep_tbo_fallback = True
-        if self.layers_to_capture:
-            run_tbo = False
-
         aux_hidden_states: List[torch.Tensor] = []
         if run_tbo:
             tbo_start_layer = self.start_layer
@@ -1257,6 +1265,8 @@ class MiMoV2Model(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
+                captured_last_layer_outputs=aux_hidden_states,
+                layers_to_capture=self.layers_to_capture,
             )
         else:
             for i in range(self.start_layer, self.end_layer):

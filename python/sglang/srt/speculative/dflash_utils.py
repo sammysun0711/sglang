@@ -14,13 +14,14 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+_DFLASH_USE_HIP_TORCH_VERIFY = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -34,7 +35,23 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda() or is_musa():
+if is_hip():
+    try:
+        from sglang.srt.speculative.eagle_utils import (
+            _renorm_target_probs_torch,
+            _tree_speculative_sampling_target_only_topk1_torch,
+        )
+
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
+        tree_speculative_sampling_target_only = None
+        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+        _DFLASH_USE_HIP_TORCH_VERIFY = True
+    except Exception:
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
+        tree_speculative_sampling_target_only = None
+elif is_cuda() or is_musa():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -54,7 +71,10 @@ else:
 
 
 def is_dflash_sampling_verify_available() -> bool:
-    return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+    return _DFLASH_SAMPLING_VERIFY_AVAILABLE and (
+        not _DFLASH_USE_HIP_TORCH_VERIFY
+        or envs.SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY.get()
+    )
 
 
 def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
@@ -701,7 +721,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
       - When a candidate is rejected at a level, the final token is sampled from
         `relu(q - p)` where `p` has only the rejected candidate mass.
     """
-    if not _DFLASH_SAMPLING_VERIFY_AVAILABLE:
+    if not is_dflash_sampling_verify_available():
         raise RuntimeError(
             "DFLASH non-greedy verification is unavailable on this build/device."
         )
@@ -778,7 +798,18 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
-    if use_sparse_topk and need_top_k:
+    if _DFLASH_USE_HIP_TORCH_VERIFY:
+        target_probs = _renorm_target_probs_torch(
+            F.softmax(scaled_logits, dim=-1),
+            torch.repeat_interleave(
+                sampling_info.top_ks, draft_token_num, dim=0
+            ),
+            torch.repeat_interleave(
+                sampling_info.top_ps, draft_token_num, dim=0
+            ),
+        )
+        sparse_topk_applied = True
+    elif use_sparse_topk and need_top_k:
         repeated_top_ks = torch.repeat_interleave(
             sampling_info.top_ks, draft_token_num, dim=0
         ).to(dtype=torch.int64)
@@ -844,23 +875,39 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates_i64 = (
         candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
     )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+    if _DFLASH_USE_HIP_TORCH_VERIFY:
+        _tree_speculative_sampling_target_only_topk1_torch(
+            predict=predicts,
+            accept_index=accept_index,
+            num_correct_drafts=accept_token_num,
+            candidates=candidates_i64,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+        )
+    else:
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)

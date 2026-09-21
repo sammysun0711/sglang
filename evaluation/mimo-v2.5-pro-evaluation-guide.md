@@ -84,22 +84,73 @@ cd /root/workspace/sglang/evaluation
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-## 6. Run TP8/EP8 MORI + TBO accuracy and prefill benchmark
+## 6. Compare TP8/EP8 MORI no-TBO baseline and fully optimized TBO
 
-Run the server first, then run either client in another terminal:
+### EP8 + MORI MANUAL, no TBO (baseline)
 
-> Install EvalScope: `pip install evalscope==1.11.0`
+Launch the baseline server:
 
 ```bash
-# launch server
+CHUNKED_PREFILL_SIZE=65536 \
+ENABLE_FAKE_EP_DISPATCH=1 \
+MORI_EP_LAUNCH_CONFIG_MODE=MANUAL \
+ENABLE_TBO=0 \
+SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN=0 \
+SGLANG_MIMO_FUSED_RMS_QKV_QUANT=0 \
+AITER_BYPASS_TUNE_CONFIG=1 \
+AITER_ONLINE_TUNE=0 \
+LOG_DIR=./logs/ep8_mori_manual_no_tbo/server \
 ./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
-# use below command to launch server when run accuracy client
-# ENABLE_FAKE_EP_DISPATCH=0 ./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+```
 
-# run accuracy client
-./run_evalscope_gsm8k_accuracy.sh
-# run benchmark client
+`ENABLE_TBO=0` also disables attention communication overlap. In `MANUAL` mode,
+the MORI tuning JSON is inactive. `AITER_BYPASS_TUNE_CONFIG=1` bypasses FMoE tuned
+configurations for this server, while `AITER_ONLINE_TUNE=0` prevents online tuning.
+
+Run the prefill benchmark in another terminal:
+
+```bash
+LOG_DIR=./logs/ep8_mori_manual_no_tbo/benchmark \
 ./run_benchmark_mimo_pro_prefill.sh
+```
+
+### EP8 + MORI AUTO, fully optimized TBO
+
+Launch the optimized server after stopping the baseline server:
+
+```bash
+CHUNKED_PREFILL_SIZE=65536 \
+ENABLE_FAKE_EP_DISPATCH=1 \
+MORI_EP_LAUNCH_CONFIG_MODE=AUTO \
+ENABLE_TBO=1 \
+SGLANG_MIMO_TBO_ATTN_COMM=1 \
+SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN=1 \
+SGLANG_MIMO_FUSED_RMS_QKV_QUANT=1 \
+AITER_BYPASS_TUNE_CONFIG=0 \
+AITER_ONLINE_TUNE=0 \
+LOG_DIR=./logs/ep8_mori_auto_tbo_opt/server \
+./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+```
+
+These optimization switches match the launcher's defaults; they are explicit here
+to make the comparison reproducible. Run the same prefill benchmark in another terminal:
+
+```bash
+LOG_DIR=./logs/ep8_mori_auto_tbo_opt/benchmark \
+./run_benchmark_mimo_pro_prefill.sh
+```
+
+Compare `results.csv` in the two benchmark log directories at matching input
+lengths and concurrency levels.
+
+### Accuracy testing for either configuration
+
+Install EvalScope with `pip install evalscope==1.11.0`. Restart the desired server
+using its command above, changing `ENABLE_FAKE_EP_DISPATCH=1` to
+`ENABLE_FAKE_EP_DISPATCH=0`, then run the accuracy client in another terminal:
+
+```bash
+./run_evalscope_gsm8k_accuracy.sh
 ```
 
 ## 7. Run baseline single node decode benchmark with fake prefill

@@ -36,6 +36,8 @@ export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-30001}"
 export SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-EAGLE}"
 SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM^^}"
+export SPECULATIVE_ATTENTION_MODE="${SPECULATIVE_ATTENTION_MODE:-prefill}"
+export DECODE_ATTENTION_BACKEND="${DECODE_ATTENTION_BACKEND:-}"
 export SPECULATIVE_DRAFT_MODEL="${SPECULATIVE_DRAFT_MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash/dflash}"
 export SPECULATIVE_DRAFT_ATTENTION_BACKEND="${SPECULATIVE_DRAFT_ATTENTION_BACKEND:-aiter}"
 export SPECULATIVE_DRAFT_KV_CACHE_DTYPE="${SPECULATIVE_DRAFT_KV_CACHE_DTYPE:-bf16}"
@@ -107,7 +109,6 @@ if ! [[ "${SGLANG_TBO_MIM_SEQ_LEN}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SGLANG_TBO_MIM_SEQ_LEN must be a positive integer, observed '${SGLANG_TBO_MIM_SEQ_LEN}'" >&2
   exit 2
 fi
-
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT="${SGLANG_MIMO_FUSED_RMS_MOE_QUANT:-1}"
 export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-1}"
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM="${SGLANG_AITER_MIMO_FRESH_BF16_ASM:-1}"
@@ -134,6 +135,7 @@ case "${SPECULATIVE_ALGORITHM}" in
       --speculative-num-steps 3
       --speculative-eagle-topk 1
       --speculative-num-draft-tokens "${SPECULATIVE_NUM_DRAFT_TOKENS}"
+      --speculative-attention-mode "${SPECULATIVE_ATTENTION_MODE}"
       --enable-multi-layer-eagle
     )
     ;;
@@ -172,11 +174,16 @@ if [[ -n "${KV_CACHE_DTYPE}" && "${KV_CACHE_DTYPE}" != "auto" ]]; then
   kv_cache_args+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
 fi
 
+decode_attention_args=()
+if [[ -n "${DECODE_ATTENTION_BACKEND}" ]]; then
+  decode_attention_args+=(--decode-attention-backend "${DECODE_ATTENTION_BACKEND}")
+fi
+
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, full-target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}"
 echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, moe-runner=${MOE_RUNNER_BACKEND}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-disabled}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap=enabled, overlap-plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}"
 echo "AITER root/configs: ${AITER_ROOT}; fmoe=$(basename -- "${AITER_CONFIG_FMOE}"); gemm=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}"); bpreshuffle=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}")"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
-echo "Speculative decoding: algorithm=${SPECULATIVE_ALGORITHM}, ${speculative_summary}"
+echo "Speculative decoding: algorithm=${SPECULATIVE_ALGORITHM}, attention-mode=${SPECULATIVE_ATTENTION_MODE}, ${speculative_summary}"
 
 mkdir -p ${LOG_DIR}
 
@@ -225,6 +232,7 @@ python3 -u -m sglang.launch_server \
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
   --max-prefill-tokens 1048576 \
   --attention-backend aiter \
+  "${decode_attention_args[@]}" \
   --moe-runner-backend "${MOE_RUNNER_BACKEND}" \
   --aiter-mxfp4-stage2-output-dtype "${AITER_MXFP4_STAGE2_OUTPUT_DTYPE}" \
   "${kv_cache_args[@]}" \

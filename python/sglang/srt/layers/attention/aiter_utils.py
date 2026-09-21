@@ -1356,6 +1356,154 @@ def can_use_mimo_flypa_prefill(
     return True
 
 
+def can_use_mimo_flypa_swa_prefill(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    window_size,
+    sinks,
+    is_swa_layer: bool,
+    sub_pool,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> bool:
+    """Return whether native FlyPA can replace CK for cached BF16 MiMo SWA."""
+    lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    logical_tokens = 0 if lengths is None else sum(int(length) for length in lengths)
+    expected_k_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_HEAD_DIM // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+        CK_MIMO_PREFILL_PAGE_SIZE,
+        MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+    )
+    expected_v_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_PAGE_SIZE // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+        CK_MIMO_PREFILL_VALUE_HEAD_DIM,
+        MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+    )
+    return (
+        get_bool_env_var(FLYPA_MIMO_PREFILL_ENV, "false")
+        and is_gfx950()
+        and is_swa_layer
+        and lengths is not None
+        and len(lengths) > 0
+        and all(int(length) > 0 for length in lengths)
+        and q.shape[0] == logical_tokens
+        and isinstance(sinks, torch.Tensor)
+        and sinks.device == q.device
+        and sinks.dtype == torch.float32
+        and sinks.shape == (CK_MIMO_PREFILL_QUERY_HEADS,)
+        and sinks.is_contiguous()
+        and int(window_size[0]) > 0
+        and backend.input_dtype == torch.bfloat16
+        and backend.kv_cache_dtype == torch.bfloat16
+        and sub_pool.dtype == torch.bfloat16
+        and sub_pool.store_dtype == torch.bfloat16
+        and backend.page_size == CK_MIMO_PREFILL_PAGE_SIZE
+        and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
+        and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.qk_head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim == CK_MIMO_PREFILL_VALUE_HEAD_DIM
+        and getattr(layer, "mimo_original_v_head_dim", None)
+        == MIMO_FRESH_BF16_ASM_V_HEAD_DIM
+        and q.dtype == torch.bfloat16
+        and q.shape[-1] == layer.tp_q_head_num * layer.head_dim
+        and q.stride(-1) == 1
+        and float(backend.logits_soft_cap) == 0.0
+        and k_buf.ndim == 5
+        and v_buf.ndim == 5
+        and tuple(k_buf.shape[1:]) == expected_k_tail
+        and tuple(v_buf.shape[1:]) == expected_v_tail
+        and all(
+            getattr(metadata, name, None) is not None
+            for name in (
+                "paged_kv_indptr",
+                "paged_kv_indices",
+                "paged_kv_last_page_len",
+            )
+        )
+        and hasattr(backend.token_to_kv_pool, "translate_loc_from_full_to_swa")
+    )
+
+
+def run_mimo_flypa_swa_prefill(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    bs0: int,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+    sinks: torch.Tensor,
+    output_token_count: int,
+) -> torch.Tensor:
+    """Run cached BF16 MiMo SWA directly on the SHUFFLE-5D cache."""
+    from aiter.ops.flydsl import flydsl_paged_attention_swa_bf16
+
+    if not getattr(backend, "_logged_mimo_flypa_swa_prefill", False):
+        logger.info(
+            "Using FlyPA for cached MiMo BF16 SWA prefill "
+            "(window=%d, max_q=%d, max_kv=%d).",
+            int(layer.sliding_window_size),
+            int(metadata.max_q_len),
+            int(metadata.max_kv_len),
+        )
+        backend._logged_mimo_flypa_swa_prefill = True
+
+    paged_swa_kv_indices = getattr(metadata, "paged_swa_kv_indices", None)
+    if paged_swa_kv_indices is None:
+        full_page_starts = metadata.paged_kv_indices.to(torch.int64)
+        full_page_starts.mul_(backend.page_size)
+        paged_swa_kv_indices = (
+            backend.token_to_kv_pool.translate_loc_from_full_to_swa(full_page_starts)
+            .div(backend.page_size, rounding_mode="floor")
+            .to(torch.int32)
+        )
+        metadata.paged_swa_kv_indices = paged_swa_kv_indices
+
+    output_storage, output = _allocate_mimo_asm_output(
+        q,
+        q.shape[0],
+        output_token_count,
+        layer.tp_q_head_num,
+        layer.v_head_dim,
+    )
+    unit_scale = getattr(backend, "_mimo_flypa_prefill_unit_scale", None)
+    if unit_scale is None:
+        unit_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+        backend._mimo_flypa_prefill_unit_scale = unit_scale
+
+    result = flydsl_paged_attention_swa_bf16(
+        q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        k_buf,
+        v_buf,
+        backend.qo_indptr[:bs0],
+        metadata.paged_kv_indptr[:bs0],
+        paged_swa_kv_indices,
+        int(metadata.max_q_len),
+        int(metadata.max_kv_len),
+        window_left=int(layer.sliding_window_size),
+        kv_last_page_lens=metadata.paged_kv_last_page_len,
+        q_descale=unit_scale,
+        k_descale=unit_scale,
+        v_descale=unit_scale,
+        out=output,
+        sink_ptr=sinks,
+        softmax_scale=layer.scaling,
+        stream=(
+            torch.cuda.current_stream(q.device) if q.device.type == "cuda" else None
+        ),
+    )
+    if result.data_ptr() != output.data_ptr():
+        raise RuntimeError("MiMo cached BF16 SWA FlyPA ignored its output buffer")
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
 def run_mimo_flypa_prefill(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -1791,9 +1939,34 @@ def forward_extend_vectorized_5d(
         CK_MIMO_PREFILL_VALUE_HEAD_DIM,
         16,
     )
-    # gfx950 cached BF16 full-attn prefers varlen ASM over FlyPA.
-    # gfx950 FP8 prefers FlyDSL paged over FlyPA when size gates pass.
-    # gfx942 never qualifies for either (is_gfx950() is false).
+    # gfx950 cached BF16 full-attn prefers varlen ASM. Cached BF16 SWA can
+    # instead consume the 5D cache directly through the native FlyPA kernel.
+    # gfx950 FP8 prefers the dedicated FlyDSL paged kernel when it qualifies.
+    if can_use_mimo_flypa_swa_prefill(
+        backend,
+        asm_q,
+        layer,
+        forward_batch,
+        window_size,
+        sinks,
+        is_swa_layer,
+        sub_pool,
+        k_buf,
+        v_buf,
+        metadata,
+    ):
+        return run_mimo_flypa_swa_prefill(
+            backend,
+            asm_q,
+            layer,
+            bs0,
+            k_buf,
+            v_buf,
+            metadata,
+            sinks,
+            physical_q_tokens,
+        )
+
     if can_use_mimo_chunk_bf16_varlen_asm(
         backend,
         asm_q,

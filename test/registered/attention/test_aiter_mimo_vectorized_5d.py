@@ -438,6 +438,53 @@ def test_fused_dflash_kv_materialization_forwards_layer_value_scales(monkeypatch
     ]
 
 
+def test_dflash_trims_trailing_target_hidden_padding_before_kv_materialization(
+    monkeypatch, caplog
+):
+    worker = object.__new__(DFlashWorkerV2)
+    worker.model_runner = SimpleNamespace(device=torch.device("cpu"))
+    worker._use_fused_kv_materialize = True
+    worker._fused_kv_helper = object()
+    worker._logged_padding_trim = False
+
+    captured = {}
+
+    def project_target_hidden(target_hidden):
+        captured["project_input"] = target_hidden.clone()
+        return target_hidden
+
+    def append_target_hidden_fused(**kwargs):
+        captured["fused_ctx_hidden"] = kwargs["ctx_hidden"].clone()
+        captured["fused_positions"] = kwargs["ctx_positions"].clone()
+        captured["fused_cache_loc"] = kwargs["ctx_cache_loc"].clone()
+
+    worker.draft_model = SimpleNamespace(
+        project_target_hidden=project_target_hidden,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_append_target_hidden_fused",
+        append_target_hidden_fused,
+    )
+
+    target_hidden = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
+    cache_loc = torch.arange(4, dtype=torch.int64)
+    positions = torch.arange(4, dtype=torch.int64)
+
+    worker._append_target_hidden_to_draft_kv_by_loc(
+        target_hidden=target_hidden,
+        cache_loc=cache_loc,
+        positions=positions,
+    )
+
+    torch.testing.assert_close(captured["project_input"], target_hidden[:4])
+    torch.testing.assert_close(captured["fused_ctx_hidden"], target_hidden[:4])
+    torch.testing.assert_close(captured["fused_positions"], positions)
+    torch.testing.assert_close(captured["fused_cache_loc"], cache_loc)
+    assert worker._logged_padding_trim
+    assert "trailing padding row(s)" in caplog.text
+
+
 def test_dflash_merges_trained_mask_embedding_into_local_vocab_shard(tmp_path):
     mask_token_id = 7
     trained_embedding = torch.arange(4, dtype=torch.bfloat16)
@@ -1203,6 +1250,116 @@ def test_tbo_ragged_cached_bf16_batch_uses_gfx950_varlen_asm(monkeypatch):
     assert captured["min_q"] == 17
     assert torch.equal(captured["slot_ids"], backend.forward_metadata.kv_indices)
     assert torch.all(output[:logical_tokens] == 13.0)
+    assert torch.count_nonzero(output[logical_tokens:]) == 0
+
+
+def test_cached_bf16_swa_uses_flypa_with_translated_pages(monkeypatch):
+    logical_tokens = 257
+    physical_tokens = 264
+    page_size = 64
+    num_pages = 9
+    k_buf = torch.zeros((num_pages + 1, 1, 24, page_size, 8), dtype=torch.bfloat16)
+    v_buf = torch.zeros((num_pages + 1, 1, 8, 128, 8), dtype=torch.bfloat16)
+    sub_pool = SimpleNamespace(
+        dtype=torch.bfloat16,
+        store_dtype=torch.bfloat16,
+        start_layer=0,
+        k_buffer=[k_buf],
+        v_buffer=[v_buf],
+    )
+    parent_pool = SimpleNamespace(
+        layers_mapping={0: (0, True)},
+        swa_kv_pool=sub_pool,
+        full_kv_pool=SimpleNamespace(),
+        translate_loc_from_full_to_swa=lambda loc: loc + page_size,
+    )
+    metadata = SimpleNamespace(
+        swa_page_table=torch.arange(513, dtype=torch.int32),
+        kv_indices=torch.arange(513, dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 513], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, num_pages], dtype=torch.int32),
+        paged_kv_indices=torch.arange(num_pages, dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([1], dtype=torch.int32),
+        max_q_len=logical_tokens,
+        max_kv_len=513,
+    )
+    backend = SimpleNamespace(
+        input_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=page_size,
+        logits_soft_cap=0.0,
+        token_to_kv_pool=parent_pool,
+        forward_metadata=metadata,
+        qo_indptr=torch.tensor([0, logical_tokens], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        sliding_window_size=128,
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        head_dim=192,
+        scaling=192**-0.5,
+        mimo_original_v_head_dim=128,
+    )
+    forward_batch = SimpleNamespace(
+        extend_prefix_lens_cpu=[256],
+        extend_seq_lens_cpu=[logical_tokens],
+        seq_lens_cpu=torch.tensor([513], dtype=torch.int32),
+        seq_lens_sum=513,
+    )
+    q = torch.zeros((physical_tokens, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((physical_tokens, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((physical_tokens, 1, 128), dtype=torch.bfloat16)
+    sinks = torch.zeros(16, dtype=torch.float32)
+    captured = {}
+
+    def fake_flypa(*args, **kwargs):
+        captured["args"] = args
+        captured.update(kwargs)
+        kwargs["out"].fill_(17.0)
+        return kwargs["out"]
+
+    def reject_gather(*args, **kwargs):
+        raise AssertionError("cached BF16 SWA FlyPA must consume the 5D cache")
+
+    def reject_ck(*args, **kwargs):
+        raise AssertionError("cached BF16 SWA FlyPA must not use CK prefill")
+
+    import aiter.ops.flydsl as flydsl_ops
+
+    monkeypatch.setenv("SGLANG_FLYPA_MIMO_PREFILL", "1")
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setattr(flydsl_ops, "flydsl_paged_attention_swa_bf16", fake_flypa)
+    monkeypatch.setattr(
+        aiter_utils, "launch_gather_shuffle_5d_to_linear", reject_gather
+    )
+    monkeypatch.setattr(aiter_utils, "mha_batch_prefill_func", reject_ck)
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=2,
+        window_size=(128, -1),
+        sinks=sinks,
+    ).view(physical_tokens, 16, 128)
+
+    args = captured["args"]
+    assert args[0].shape == (logical_tokens, 16, 192)
+    assert args[1].data_ptr() == k_buf.data_ptr()
+    assert args[2].data_ptr() == v_buf.data_ptr()
+    assert args[5].tolist() == list(range(1, num_pages + 1))
+    assert captured["window_left"] == 128
+    assert captured["sink_ptr"] is sinks
+    assert captured["out"].shape == (logical_tokens, 16, 128)
+    assert torch.all(output[:logical_tokens] == 17.0)
     assert torch.count_nonzero(output[logical_tokens:]) == 0
 
 

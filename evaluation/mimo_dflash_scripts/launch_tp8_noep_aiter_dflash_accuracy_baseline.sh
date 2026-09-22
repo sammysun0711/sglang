@@ -33,6 +33,7 @@ export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-fp8}"
 export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-30001}"
 export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"
+export MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-}"
 
 export SPECULATIVE_ALGORITHM=DFLASH
 export SPECULATIVE_DRAFT_MODEL="${SPECULATIVE_DRAFT_MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash/dflash}"
@@ -151,6 +152,11 @@ if [[ -n "${DECODE_ATTENTION_BACKEND}" ]]; then
   decode_attention_args+=(--decode-attention-backend "${DECODE_ATTENTION_BACKEND}")
 fi
 
+mm_attention_args=()
+if [[ -n "${MM_ATTENTION_BACKEND}" ]]; then
+  mm_attention_args+=(--mm-attention-backend "${MM_ATTENTION_BACKEND}")
+fi
+
 custom_all_reduce_args=()
 custom_all_reduce_status=enabled
 if [[ "${DISABLE_CUSTOM_ALL_REDUCE:-0}" == "1" ]]; then
@@ -174,6 +180,7 @@ echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, full-targe
 echo "Configuration: model=${MODEL}, target-format=${MIMO_TARGET_WEIGHT_FORMAT}, max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, chunked-prefill=${CHUNKED_PREFILL_SIZE}, moe-runner=${MOE_RUNNER_BACKEND}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=disabled, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap-plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}"
 echo "AITER root/configs: ${AITER_ROOT}; fmoe=$(basename -- "${AITER_CONFIG_FMOE}"); gemm=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}"); bpreshuffle=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}")"
 echo "DFlash: draft-tokens=${SPECULATIVE_NUM_DRAFT_TOKENS}, draft-model=${SPECULATIVE_DRAFT_MODEL}, draft-attention=${SPECULATIVE_DRAFT_ATTENTION_BACKEND}, draft-kv=${SPECULATIVE_DRAFT_KV_CACHE_DTYPE}, draft-window=${SPECULATIVE_DRAFT_WINDOW_SIZE}"
+echo "Multimodal attention: ${MM_ATTENTION_BACKEND:-auto}"
 echo "Custom all-reduce: ${custom_all_reduce_status}; radix cache: ${radix_cache_status}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
@@ -196,6 +203,7 @@ python3 -u -m sglang.launch_server \
   --max-prefill-tokens "${MAX_PREFILL_TOKENS}" \
   --attention-backend aiter \
   "${decode_attention_args[@]}" \
+  "${mm_attention_args[@]}" \
   --moe-runner-backend "${MOE_RUNNER_BACKEND}" \
   --aiter-mxfp4-stage2-output-dtype "${AITER_MXFP4_STAGE2_OUTPUT_DTYPE}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \

@@ -44,6 +44,7 @@ export SPECULATIVE_DRAFT_KV_CACHE_DTYPE="${SPECULATIVE_DRAFT_KV_CACHE_DTYPE:-bf1
 export SPECULATIVE_DRAFT_WINDOW_SIZE="${SPECULATIVE_DRAFT_WINDOW_SIZE:-1024}"
 export PAGE_SIZE="${PAGE_SIZE:-64}"
 export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"
+export MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-}"
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bf16}"
 export ENABLE_PREFILL_QUICK_REDUCE="${ENABLE_PREFILL_QUICK_REDUCE:-0}"
 
@@ -189,9 +190,15 @@ if [[ -n "${DECODE_ATTENTION_BACKEND}" ]]; then
   decode_attention_args+=(--decode-attention-backend "${DECODE_ATTENTION_BACKEND}")
 fi
 
+mm_attention_args=()
+if [[ -n "${MM_ATTENTION_BACKEND}" ]]; then
+  mm_attention_args+=(--mm-attention-backend "${MM_ATTENTION_BACKEND}")
+fi
+
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, full-target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}"
 echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=${PAGE_SIZE}, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, moe-runner=${MOE_RUNNER_BACKEND}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-disabled}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap=enabled, overlap-plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}"
 echo "AITER root/configs: ${AITER_ROOT}; fmoe=$(basename -- "${AITER_CONFIG_FMOE}"); gemm=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}"); bpreshuffle=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}")"
+echo "Multimodal attention: ${MM_ATTENTION_BACKEND:-auto}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "Speculative decoding: algorithm=${SPECULATIVE_ALGORITHM}, attention-mode=${SPECULATIVE_ATTENTION_MODE}, ${speculative_summary}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
@@ -251,6 +258,7 @@ python3 -u -m sglang.launch_server \
   --max-prefill-tokens 1048576 \
   --attention-backend aiter \
   "${decode_attention_args[@]}" \
+  "${mm_attention_args[@]}" \
   --moe-runner-backend "${MOE_RUNNER_BACKEND}" \
   --aiter-mxfp4-stage2-output-dtype "${AITER_MXFP4_STAGE2_OUTPUT_DTYPE}" \
   "${kv_cache_args[@]}" \

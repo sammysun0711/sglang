@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AiterQuantType(str, Enum):
@@ -131,6 +135,13 @@ def _aiter_fused_moe_supports_transposed_a1_scale() -> bool:
 
 
 @functools.cache
+def _aiter_fused_moe_supports_ep_route_convention() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "ep_has_fake_route" in inspect.signature(fused_moe).parameters
+
+
+@functools.cache
 def _aiter_fused_moe_supports_opus_stage2_output_dtype() -> bool:
     from aiter.fused_moe import fused_moe
 
@@ -145,6 +156,20 @@ def _aiter_mxfp4_stage2_output_dtype() -> str:
     except ValueError:
         return "auto"
     return getattr(server_args, "aiter_mxfp4_stage2_output_dtype", "auto")
+
+
+@functools.cache
+def _log_aiter_mxfp4_ep_output_dtype(output_dtype: str) -> None:
+    if output_dtype == "bf16":
+        logger.info(
+            "AITER MXFP4 EP retains native final-BF16 output before combine; "
+            "the OPUS route-output selector applies only to non-EP kernels."
+        )
+    else:
+        logger.warning(
+            "AITER MXFP4 EP does not support FP8 route output; retaining "
+            "native final-BF16 output before combine."
+        )
 
 
 class AiterRunnerCore(MoeRunnerCore):
@@ -186,6 +211,7 @@ class AiterRunnerCore(MoeRunnerCore):
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
+        expert_mask = quant_info.expert_mask
         if quant_info.is_fp4_experts:
             output_dtype = extra.get(
                 "opus_stage2_output_dtype", _aiter_mxfp4_stage2_output_dtype()
@@ -197,7 +223,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 )
             if output_dtype == "auto":
                 extra.pop("opus_stage2_output_dtype", None)
-            elif quant_info.expert_mask is not None:
+            elif expert_mask is not None:
+                _log_aiter_mxfp4_ep_output_dtype(output_dtype)
                 extra.pop("opus_stage2_output_dtype", None)
             elif _aiter_fused_moe_supports_opus_stage2_output_dtype():
                 extra["opus_stage2_output_dtype"] = output_dtype
@@ -242,12 +269,36 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
 
+        topk_ids = runner_input.topk_ids
+        topk_weights = runner_input.topk_weights
+        routed_only_ep = (
+            expert_mask is not None
+            and self.config.top_k is not None
+            and topk_ids.shape[-1] == self.config.top_k
+        )
+        if routed_only_ep and _aiter_fused_moe_supports_ep_route_convention():
+            extra["ep_has_fake_route"] = False
+        elif routed_only_ep:
+            fake_expert_id = expert_mask.numel()
+            expert_mask = torch.cat((expert_mask, expert_mask.new_zeros(1)))
+            topk_ids = torch.cat(
+                (
+                    topk_ids,
+                    topk_ids.new_full((*topk_ids.shape[:-1], 1), fake_expert_id),
+                ),
+                dim=-1,
+            )
+            topk_weights = torch.cat(
+                (topk_weights, topk_weights.new_zeros((*topk_weights.shape[:-1], 1))),
+                dim=-1,
+            )
+
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,
             w2=quant_info.w2_weight,
-            topk_weight=runner_input.topk_weights,
-            topk_ids=runner_input.topk_ids,
+            topk_weight=topk_weights,
+            topk_ids=topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
             activation=_aiter_activation(self.config.activation),
             w1_scale=quant_info.w13_scale,
@@ -256,7 +307,7 @@ class AiterRunnerCore(MoeRunnerCore):
             a2_scale=quant_info.a2_scale,
             bias1=quant_info.b13,
             bias2=quant_info.b2,
-            expert_mask=quant_info.expert_mask,
+            expert_mask=expert_mask,
             doweight_stage1=quant_info.doweight_stage1,
             hidden_pad=quant_info.hidden_pad,
             intermediate_pad=quant_info.intermediate_pad,
@@ -403,20 +454,37 @@ def _pre_permute_deepep_to_aiter(
         # AITER fused_moe Clamped-SwiGLU is dispatched with
         # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
         # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
-        swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
-            "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
+        interleaved_mxfp4 = (
+            quant_info.is_fp4_experts or quant_info.swiglu_limit > 0
+        ) and get_bool_env_var("SGLANG_USE_AITER_MOE_GU_ITLV", "true")
+
+        is_mx_fp8_dispatch = (
+            a1_scale is not None
+            and a1_scale.dtype == torch.float8_e8m0fnu
+            and not is_fp4_dispatch
         )
 
-        if is_w4a4 and a1_scale is not None and not is_fp4_dispatch:
+        if (
+            is_w4a4
+            and a1_scale is not None
+            and not is_fp4_dispatch
+            and not is_mx_fp8_dispatch
+            and not quant_info.is_fp4_experts
+        ):
             # W4A4 weights with FP8 dispatch: dequant FP8->BF16 first; the
             # FP4 per_1x32 path needs BF16 input.
             hidden_states = upscale(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )
             a1_scale = None
-        elif is_w4a4 and is_fp4_dispatch and a1_scale is not None and swiglu_interleave:
-            # W4A4 weights + FP4 dispatch on the clamped-SwiGLU/INTERLEAVE
-            # path: AITER expects a bf16/fp8 activation here, not fp4x2.
+        elif (
+            is_w4a4
+            and is_fp4_dispatch
+            and a1_scale is not None
+            and interleaved_mxfp4
+        ):
+            # FP4 weights + FP4 dispatch on an INTERLEAVE A8W4 path: AITER
+            # expects a bf16/fp8 activation here, not fp4x2.
             # Dequant FP4->BF16 and let fused_moe re-quantize internally.
             hidden_states = upscale_mxfp4(
                 hidden_states, a1_scale, num_local_tokens, output_dtype

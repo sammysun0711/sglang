@@ -22,6 +22,7 @@ def _clear_aiter_signature_caches():
     yield
     aiter_runner._aiter_fused_moe_supports_no_combine.cache_clear()
     aiter_runner._aiter_fused_moe_supports_transposed_a1_scale.cache_clear()
+    aiter_runner._aiter_fused_moe_supports_ep_route_convention.cache_clear()
     aiter_runner._aiter_fused_moe_supports_opus_stage2_output_dtype.cache_clear()
 
 
@@ -165,6 +166,55 @@ def test_aiter_runner_selects_mxfp4_stage2_output(monkeypatch, output_dtype):
     )
 
     assert captured["opus_stage2_output_dtype"] == output_dtype
+
+
+def test_aiter_runner_keeps_native_bf16_output_for_ep(monkeypatch):
+    captured = {}
+
+    def fused_moe(*, opus_stage2_output_dtype="auto", ep_has_fake_route=True, **kwargs):
+        captured.update(kwargs)
+        captured["opus_stage2_output_dtype"] = opus_stage2_output_dtype
+        captured["ep_has_fake_route"] = ep_has_fake_route
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    monkeypatch.setattr(
+        aiter_runner, "_aiter_mxfp4_stage2_output_dtype", lambda: "bf16"
+    )
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", top_k=2))
+    expert_mask = torch.tensor([1, 1, 0], dtype=torch.int32)
+
+    runner.run(
+        _runner_input(),
+        _quant_info(is_fp4_experts=True, expert_mask=expert_mask),
+        running_state={},
+    )
+
+    assert captured["opus_stage2_output_dtype"] == "auto"
+    assert captured["ep_has_fake_route"] is False
+
+
+def test_aiter_runner_adds_ep_tuning_sentinel_for_legacy_aiter(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", top_k=2))
+    expert_mask = torch.tensor([1, 1, 0], dtype=torch.int32)
+
+    runner.run(
+        _runner_input(),
+        _quant_info(expert_mask=expert_mask),
+        running_state={},
+    )
+
+    assert captured["topk_ids"].shape[-1] == 3
+    assert captured["topk_ids"][0, -1].item() == expert_mask.numel()
+    assert captured["topk_weight"][0, -1].item() == 0
+    assert captured["expert_mask"].tolist() == [1, 1, 0, 0]
 
 
 if __name__ == "__main__":

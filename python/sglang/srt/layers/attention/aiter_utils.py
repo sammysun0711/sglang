@@ -2558,6 +2558,14 @@ def _split_swa_target_verify_queries() -> bool:
     ).strip().lower() in ("1", "true")
 
 
+def _split_target_verify_queries(is_swa_layer: bool) -> bool:
+    if os.environ.get(
+        "SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1", "0"
+    ).strip().lower() in ("1", "true"):
+        return True
+    return is_swa_layer and _split_swa_target_verify_queries()
+
+
 def _ensure_swa_target_verify_workspace(
     backend: AiterAttnBackend,
     *,
@@ -2567,19 +2575,23 @@ def _ensure_swa_target_verify_workspace(
     num_kv_heads: int,
     value_head_dim: int,
     max_blocks_per_sequence: int,
+    max_partitions: int = 1,
     device: torch.device,
     output_dtype: torch.dtype,
     context_dtype: torch.dtype,
 ) -> None:
-    """Keep expanded qlen-1 SWA metadata pointer-stable for graph replay."""
+    """Keep expanded qlen-1 verification metadata pointer-stable for replay."""
     if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
         raise ValueError(
-            "SWA target verification requires Q heads to be divisible by KV heads"
+            "Target verification requires Q heads to be divisible by KV heads"
         )
 
     capacity_bs = int(getattr(backend, "_swa_target_verify_workspace_bs", 0))
     capacity_q = int(getattr(backend, "_swa_target_verify_workspace_q", 0))
     capacity_blocks = int(getattr(backend, "_swa_target_verify_workspace_blocks", 0))
+    capacity_partitions = int(
+        getattr(backend, "_swa_target_verify_workspace_partitions", 0)
+    )
     signature = getattr(backend, "_swa_target_verify_workspace_signature", None)
     requested_signature = (
         num_q_heads,
@@ -2594,6 +2606,7 @@ def _ensure_swa_target_verify_workspace(
         and capacity_bs >= max_batch_size
         and capacity_q >= query_length
         and capacity_blocks >= max_blocks_per_sequence
+        and capacity_partitions >= max_partitions
     ):
         return
     if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -2604,9 +2617,12 @@ def _ensure_swa_target_verify_workspace(
     capacity_bs = max(max_batch_size, capacity_bs)
     capacity_q = max(query_length, capacity_q)
     capacity_blocks = max(max_blocks_per_sequence, capacity_blocks)
+    capacity_partitions = max(max_partitions, capacity_partitions)
     max_rows = capacity_bs * capacity_q
     query_group_size = num_q_heads // num_kv_heads
-    scalar_numel = max_rows * num_kv_heads * query_group_size
+    scalar_numel = (
+        max_rows * num_kv_heads * capacity_partitions * query_group_size
+    )
 
     backend._swa_target_verify_offsets = torch.arange(
         1, capacity_q + 1, dtype=context_dtype, device=device
@@ -2629,6 +2645,7 @@ def _ensure_swa_target_verify_workspace(
     backend._swa_target_verify_workspace_bs = capacity_bs
     backend._swa_target_verify_workspace_q = capacity_q
     backend._swa_target_verify_workspace_blocks = capacity_blocks
+    backend._swa_target_verify_workspace_partitions = capacity_partitions
     backend._swa_target_verify_workspace_signature = requested_signature
 
 
@@ -2669,10 +2686,10 @@ def forward_target_verify_vectorized_5d(
     """Run top-k-1 target verification directly on a SHUFFLE 5D KV pool.
 
     ``TARGET_VERIFY`` has a fixed query length per request. For qlen up to four,
-    ``pa_decode_gluon`` consumes the causal multi-token block directly. For
-    qlen eight SWA, each query row is exposed as an independent qlen-1 request
-    with its own causal context length, keeping the Gluon equivalent group at
-    16 instead of 128.
+    ``pa_decode_gluon`` consumes the causal multi-token block directly. The
+    opt-in qlen-1 fallback exposes each query row as an independent request with
+    its own causal context length, keeping the Gluon equivalent group within
+    its supported limit for qlen eight.
 
     This helper deliberately validates the complete Gluon contract before
     allocating workspaces.  Falling through to the legacy unified-attention
@@ -2687,11 +2704,11 @@ def forward_target_verify_vectorized_5d(
     is_swa_layer = (
         layer.sliding_window_size is not None and layer.sliding_window_size > -1
     )
-    split_swa_queries = (
-        is_swa_layer and query_length > 1 and _split_swa_target_verify_queries()
+    split_verify_queries = query_length > 1 and _split_target_verify_queries(
+        is_swa_layer
     )
     use_flydsl_swa = _use_flydsl_swa(backend, q, layer, sinks)
-    max_query_length = 8 if split_swa_queries or use_flydsl_swa else 4
+    max_query_length = 8 if split_verify_queries or use_flydsl_swa else 4
     if not 1 <= query_length <= max_query_length:
         raise ValueError(
             "vectorized-5D TARGET_VERIFY query length exceeds the selected path; "
@@ -2705,7 +2722,7 @@ def forward_target_verify_vectorized_5d(
 
     query_group_size = num_q_heads // num_kv_heads
     equivalent_group_size = query_length * query_group_size
-    if not split_swa_queries and not use_flydsl_swa and equivalent_group_size > 64:
+    if not split_verify_queries and not use_flydsl_swa and equivalent_group_size > 64:
         raise ValueError(
             "vectorized-5D TARGET_VERIFY exceeds pa_decode_gluon's equivalent "
             f"query-group limit: {query_length} * {query_group_size} = "
@@ -2809,7 +2826,7 @@ def forward_target_verify_vectorized_5d(
     kernel_batch_size = batch_size
     kernel_query_length = query_length
     kernel_query_group_size = equivalent_group_size
-    if split_swa_queries:
+    if split_verify_queries:
         _ensure_swa_target_verify_workspace(
             backend,
             max_batch_size=batch_size,
@@ -2818,6 +2835,7 @@ def forward_target_verify_vectorized_5d(
             num_kv_heads=num_kv_heads,
             value_head_dim=layer.v_head_dim,
             max_blocks_per_sequence=block_tables.shape[1],
+            max_partitions=max_part_num,
             device=q.device,
             output_dtype=q_view.dtype,
             context_dtype=forward_batch.seq_lens.dtype,
@@ -2845,7 +2863,7 @@ def forward_target_verify_vectorized_5d(
         max_part_num,
         kernel_query_group_size,
     )
-    if split_swa_queries:
+    if split_verify_queries:
         scalar_numel = (
             kernel_batch_size * num_kv_heads * max_part_num * kernel_query_group_size
         )

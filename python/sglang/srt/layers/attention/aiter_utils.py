@@ -94,6 +94,10 @@ MIMO_FRESH_BF16_SWA_VARLEN_ENV = "SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN"
 MIMO_FRESH_BF16_SWA_VARLEN_ENABLED = get_bool_env_var(
     MIMO_FRESH_BF16_SWA_VARLEN_ENV, "false"
 )
+MIMO_CACHED_BF16_SWA_VARLEN_ENV = "SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN"
+MIMO_CACHED_BF16_SWA_VARLEN_ENABLED = get_bool_env_var(
+    MIMO_CACHED_BF16_SWA_VARLEN_ENV, "false"
+)
 MIMO_FRESH_BF16_SWA_WINDOW_SIZE = 128
 
 
@@ -595,6 +599,205 @@ def mimo_chunk_bf16_varlen_asm(
     return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
+def _mimo_cached_swa_varlen_layout(
+    prefix_lengths: list[int],
+    extend_lengths: list[int],
+    window_size: int,
+) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Describe the compact KV stream for cached SWA varlen attention.
+
+    The returned ranges index the request-major full KV slot table.  Each
+    request keeps at most ``window_size`` cached prefix tokens followed by the
+    complete current chunk.  With bottom-right causal masking, query ``i`` is
+    therefore aligned to ``tail_prefix + i`` and observes exactly the same
+    absolute window as it would in the untrimmed sequence.
+    """
+    if len(prefix_lengths) != len(extend_lengths):
+        raise ValueError("prefix and extend length arrays must have equal length")
+    if window_size < 0:
+        raise ValueError(f"SWA window must be non-negative, got {window_size}")
+
+    ranges = []
+    kv_lengths = []
+    kv_indptr = [0]
+    full_offset = 0
+    for prefix_len, extend_len in zip(prefix_lengths, extend_lengths):
+        prefix_len = int(prefix_len)
+        extend_len = int(extend_len)
+        if prefix_len < 0 or extend_len <= 0:
+            raise ValueError(
+                "cached SWA requires non-negative prefixes and positive extends; "
+                f"got prefix={prefix_len}, extend={extend_len}"
+            )
+        tail_prefix = min(prefix_len, window_size)
+        seq_len = prefix_len + extend_len
+        ranges.append((full_offset + prefix_len - tail_prefix, full_offset + seq_len))
+        compact_len = tail_prefix + extend_len
+        kv_lengths.append(compact_len)
+        kv_indptr.append(kv_indptr[-1] + compact_len)
+        full_offset += seq_len
+
+    return ranges, kv_lengths, kv_indptr
+
+
+def can_use_mimo_cached_bf16_swa_varlen(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    window_size,
+    sinks,
+    is_swa_layer: bool,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+) -> bool:
+    """Check the tested MiMo SWA shape and the cache inputs consumed by varlen."""
+    if not (
+        MIMO_CACHED_BF16_SWA_VARLEN_ENABLED
+        and is_swa_layer
+        and flash_attn_varlen_func is not None
+        and is_gfx950()
+    ):
+        return False
+
+    extend_lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    prefix_lengths = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if not (
+        extend_lengths is not None
+        and prefix_lengths is not None
+        and seq_lens_cpu is not None
+        and len(extend_lengths) > 0
+        and len(extend_lengths) == len(prefix_lengths) == len(seq_lens_cpu)
+    ):
+        return False
+
+    total_q = sum(extend_lengths)
+    total_kv = sum(prefix_lengths) + total_q
+    expected_k_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_HEAD_DIM // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+        CK_MIMO_PREFILL_PAGE_SIZE,
+        MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+    )
+    expected_v_tail = (
+        CK_MIMO_PREFILL_KV_HEADS,
+        CK_MIMO_PREFILL_PAGE_SIZE // MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+        CK_MIMO_PREFILL_VALUE_HEAD_DIM,
+        MIMO_BF16_KV_CACHE_INNER_PACK_ELEMS,
+    )
+    return (
+        any(prefix_lengths)
+        and all(
+            prefix_len >= 0
+            and extend_len > MIMO_FRESH_BF16_SWA_WINDOW_SIZE
+            and int(seq_len) == prefix_len + extend_len
+            for seq_len, prefix_len, extend_len in zip(
+                seq_lens_cpu, prefix_lengths, extend_lengths
+            )
+        )
+        # K/V come from the cache, not the current chunk's input tensors.
+        and q.dtype == k_buf.dtype == v_buf.dtype == torch.bfloat16
+        and q.device == k_buf.device == v_buf.device
+        and backend.input_dtype == torch.bfloat16
+        and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
+        and layer.tp_k_head_num == layer.tp_v_head_num == CK_MIMO_PREFILL_KV_HEADS
+        and layer.qk_head_dim == layer.head_dim == CK_MIMO_PREFILL_HEAD_DIM
+        and layer.v_head_dim
+        == getattr(layer, "mimo_original_v_head_dim", None)
+        == CK_MIMO_PREFILL_VALUE_HEAD_DIM
+        and q.shape == (total_q, layer.tp_q_head_num * layer.qk_head_dim)
+        and layer.sliding_window_size == MIMO_FRESH_BF16_SWA_WINDOW_SIZE
+        and tuple(window_size) == (MIMO_FRESH_BF16_SWA_WINDOW_SIZE, -1)
+        and isinstance(sinks, torch.Tensor)
+        and sinks.device == q.device
+        and sinks.shape == (layer.tp_q_head_num,)
+        and sinks.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and sinks.stride(-1) == 1
+        and float(backend.logits_soft_cap) == 0.0
+        and metadata.swa_page_table is not None
+        and metadata.swa_page_table.ndim == 1
+        and metadata.swa_page_table.dtype == torch.int32
+        and metadata.swa_page_table.device == q.device
+        and metadata.swa_page_table.numel() >= total_kv
+        and backend.qo_indptr.dtype == torch.int32
+        and backend.qo_indptr.device == q.device
+        and backend.qo_indptr.numel() >= len(extend_lengths) + 1
+        and k_buf.shape[1:] == expected_k_tail
+        and v_buf.shape == (k_buf.shape[0], *expected_v_tail)
+    )
+
+
+def mimo_cached_bf16_swa_varlen(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    metadata,
+    sinks: torch.Tensor,
+    output_token_count: int | None = None,
+) -> torch.Tensor:
+    """Run cached MiMo SWA after compacting KV to prefix-tail + chunk."""
+    prefix_lengths = [int(length) for length in forward_batch.extend_prefix_lens_cpu]
+    extend_lengths = [int(length) for length in forward_batch.extend_seq_lens_cpu]
+    batch_size = len(extend_lengths)
+    slot_ids = getattr(metadata, "mimo_swa_kv_indices", None)
+    cu_seqlens_k = getattr(metadata, "mimo_swa_kv_indptr", None)
+    max_kv_len = getattr(metadata, "mimo_swa_max_kv_len", None)
+    if slot_ids is None or cu_seqlens_k is None or max_kv_len is None:
+        ranges, kv_lengths, kv_indptr = _mimo_cached_swa_varlen_layout(
+            prefix_lengths,
+            extend_lengths,
+            MIMO_FRESH_BF16_SWA_WINDOW_SIZE,
+        )
+        slot_parts = [metadata.swa_page_table[start:end] for start, end in ranges]
+        slot_ids = slot_parts[0] if len(slot_parts) == 1 else torch.cat(slot_parts)
+        cu_seqlens_k = torch.tensor(
+            kv_indptr,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        max_kv_len = max(kv_lengths)
+        metadata.mimo_swa_kv_indices = slot_ids
+        metadata.mimo_swa_kv_indptr = cu_seqlens_k
+        metadata.mimo_swa_max_kv_len = max_kv_len
+
+    k_compact, v_compact = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
+    q_varlen = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+    k_varlen = k_compact.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+    v_varlen = v_compact.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+    logical_tokens = q.shape[0]
+    output_storage, output = _allocate_mimo_asm_output(
+        q,
+        logical_tokens,
+        logical_tokens if output_token_count is None else output_token_count,
+        layer.tp_q_head_num,
+        layer.v_head_dim,
+    )
+    sink_ptr = sinks if sinks.dtype == torch.float32 else sinks.float()
+    result = flash_attn_varlen_func(
+        q_varlen,
+        k_varlen,
+        v_varlen,
+        backend.qo_indptr[: batch_size + 1],
+        cu_seqlens_k,
+        max(extend_lengths),
+        max_kv_len,
+        min_seqlen_q=0,
+        softmax_scale=layer.scaling,
+        causal=True,
+        window_size=(MIMO_FRESH_BF16_SWA_WINDOW_SIZE, 0, 0),
+        sink_ptr=sink_ptr,
+        out=output,
+    )
+    if result.data_ptr() != output.data_ptr():
+        raise RuntimeError("gfx950 MiMo cached SWA varlen ignored its output buffer")
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
 def can_use_mimo_fresh_bf16_swa_varlen(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -647,8 +850,7 @@ def can_use_mimo_fresh_bf16_swa_varlen(
         and k.stride(-1) == 1
         and v.stride(-1) == 1
         and layer.sliding_window_size == MIMO_FRESH_BF16_SWA_WINDOW_SIZE
-        and tuple(window_size)
-        == (MIMO_FRESH_BF16_SWA_WINDOW_SIZE, -1)
+        and tuple(window_size) == (MIMO_FRESH_BF16_SWA_WINDOW_SIZE, -1)
         and valid_sinks
         and float(backend.logits_soft_cap) == 0.0
     )
@@ -663,6 +865,7 @@ def mimo_fresh_bf16_swa_varlen(
     forward_batch: ForwardBatch,
     window_size,
     sinks: torch.Tensor,
+    output_token_count: int | None = None,
 ) -> torch.Tensor:
     """Run native-D128 CK varlen SWA with a native V128 ABI."""
     lengths = forward_batch.extend_seq_lens_cpu
@@ -671,7 +874,14 @@ def mimo_fresh_bf16_swa_varlen(
     k_varlen = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
     v_varlen = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-    output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+    logical_tokens = q.shape[0]
+    output_storage, output = _allocate_mimo_asm_output(
+        q,
+        logical_tokens,
+        logical_tokens if output_token_count is None else output_token_count,
+        layer.tp_q_head_num,
+        layer.v_head_dim,
+    )
     cu_seqlens = backend.qo_indptr[: batch_size + 1]
     sink_ptr = sinks if sinks.dtype == torch.float32 else sinks.float()
     result = flash_attn_varlen_func(
@@ -693,7 +903,7 @@ def mimo_fresh_bf16_swa_varlen(
     )
     if result.data_ptr() != output.data_ptr():
         raise RuntimeError("gfx950 MiMo fresh SWA varlen ignored its output buffer")
-    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 def quantize_query_per_tensor_fp8(
@@ -1223,8 +1433,10 @@ def forward_extend_vectorized_5d(
        ``(k, v)`` directly. No descales needed since no data is read
        from the (possibly fp8) cache.
 
-    2. gfx950 cached BF16 varlen ASM: gather prefix+chunk and reuse the same
-       D192/V128 ASM as fresh prefill. This stays ahead of FlyPA on gfx950.
+    2. gfx950 cached BF16 varlen kernels: full-attention layers gather
+       prefix+chunk and reuse the D192/V128 ASM. SWA layers gather only the
+       last 128 cached prefix tokens plus the current chunk, then reuse the
+       native-D128 CK varlen SWA path with bottom-right causal alignment.
 
     3. Direct paged FlyDSL / FlyPA / CK: gfx950 FP8 SHUFFLE-5D prefers the
        size-gated FlyDSL paged kernel over FlyPA. FlyPA is the gfx942 (and
@@ -1239,15 +1451,19 @@ def forward_extend_vectorized_5d(
        raw fp8 with the per-tensor descales — aiter's LINEAR-mode kernel
        supports fp8 K/V/Q natively, so no host-side dequant is needed.
 
-    The optimized paths are deliberately narrow. SWA/sink, unsupported dtypes,
-    other head shapes, and missing metadata retain the established fallback.
+    The optimized paths are deliberately narrow. Unsupported dtypes, head
+    shapes, windows/sinks, and missing metadata retain the established fallback.
 
     Returns the ``(T, H_q * D_v)`` attention output, ready to be
     returned from ``AiterAttnBackend.forward_extend``.
     """
     asm_q, asm_k, asm_v = q, k, v
     asm_output_kwargs = {}
-    if MIMO_FRESH_BF16_ASM_ENABLED and is_gfx950():
+    if (
+        MIMO_FRESH_BF16_ASM_ENABLED
+        or MIMO_FRESH_BF16_SWA_VARLEN_ENABLED
+        or MIMO_CACHED_BF16_SWA_VARLEN_ENABLED
+    ) and is_gfx950():
         asm_q, asm_k, asm_v, physical_q_tokens = _mimo_logical_qkv_views(
             q, k, v, forward_batch
         )
@@ -1309,11 +1525,12 @@ def forward_extend_vectorized_5d(
                 **asm_output_kwargs,
             )
 
+        # SWA varlen uses the same logical (unpadded) views as the ASM paths.
         if can_use_mimo_fresh_bf16_swa_varlen(
             backend,
-            q,
-            k,
-            v,
+            asm_q,
+            asm_k,
+            asm_v,
             layer,
             forward_batch,
             window_size,
@@ -1321,13 +1538,14 @@ def forward_extend_vectorized_5d(
         ):
             return mimo_fresh_bf16_swa_varlen(
                 backend,
-                q,
-                k,
-                v,
+                asm_q,
+                asm_k,
+                asm_v,
                 layer,
                 forward_batch,
                 window_size,
                 sinks,
+                **asm_output_kwargs,
             )
 
         # Q and K are head-aligned views whose last dimension is contiguous.
@@ -1426,6 +1644,30 @@ def forward_extend_vectorized_5d(
             k_buf,
             v_buf,
             metadata,
+            **asm_output_kwargs,
+        )
+
+    if can_use_mimo_cached_bf16_swa_varlen(
+        backend,
+        asm_q,
+        layer,
+        forward_batch,
+        window_size,
+        sinks,
+        is_swa_layer,
+        k_buf,
+        v_buf,
+        metadata,
+    ):
+        return mimo_cached_bf16_swa_varlen(
+            backend,
+            asm_q,
+            layer,
+            forward_batch,
+            k_buf,
+            v_buf,
+            metadata,
+            sinks,
             **asm_output_kwargs,
         )
 

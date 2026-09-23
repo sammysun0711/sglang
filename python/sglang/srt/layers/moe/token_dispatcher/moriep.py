@@ -5,7 +5,10 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import (
+    _ExpertDistributionRecorderNoop,
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -35,6 +38,7 @@ from functools import lru_cache
 
 import torch
 
+from sglang.srt.batch_overlap.comm_stream import TboCommStreamPool
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -56,7 +60,15 @@ logger = logging.getLogger(__name__)
 
 def _should_record_expert_distribution() -> bool:
     recorder = get_global_expert_distribution_recorder()
-    return recorder.recording or torch.get_device_module().is_current_stream_capturing()
+    if recorder.recording:
+        return True
+    # While capturing, only bake in the count kernel if a recorder is actually
+    # configured (non-Noop); otherwise it would replay as dead work every decode
+    # step. Configured recorders still bake it in, so start_record() works after
+    # capture.
+    if torch.get_device_module().is_current_stream_capturing():
+        return not isinstance(recorder, _ExpertDistributionRecorderNoop)
+    return False
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
@@ -338,28 +350,6 @@ def init_mori_op(
     return mori_op
 
 
-class CommStreamPool:
-    _streams = {}  # key -> torch.cuda.Stream
-
-    @classmethod
-    def _make_key(cls, group):
-        return (torch.cuda.current_device(), id(group))
-
-    @classmethod
-    def get_stream_from_pool(cls, group) -> torch.cuda.Stream:
-        key = cls._make_key(group)
-        stream = cls._streams.get(key)
-        if stream is None:
-            stream = torch.cuda.Stream(priority=0)
-            cls._streams[key] = stream
-        return stream
-
-    @classmethod
-    def clear_group(cls, group):
-        key = (torch.cuda.current_device(), id(group))
-        cls._streams.pop(key, None)
-
-
 class _MoriEPDispatcherImplBase:
     def __init__(
         self,
@@ -527,7 +517,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
-            self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+            self._comm_stream = TboCommStreamPool.get_stream_from_pool(self.group)
 
     def _capture_event_if_async(self) -> Optional[torch.cuda.Event]:
         assert self.enable_dual_stream, "dual stream must be enabled"
@@ -648,10 +638,15 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream  # comm stream
 
-            for t in (hidden_states, topk_weights, topk_ids):
-                t.record_stream(comm_stream)
-            if scale is not None:
-                scale.record_stream(comm_stream)
+            # Deliberately no `record_stream(comm_stream)`: it would hold every
+            # dispatch/combine block in the allocator's deferred-free list until
+            # the comm event retires, and with `async_finish` the compute stream
+            # never blocks, so `reserved` churns until ROCr runs out of scratch
+            # (HSA_STATUS_ERROR_OUT_OF_RESOURCES) -- the failure the non-EP DP
+            # TBO path already hit, see `_TBO_PERSIST_BUF` in dp_attention.py.
+            # Dropping it outright (rather than a keep-alive as in DeepseekV4
+            # op_combine_a) is safe because dispatch_b / combine_b wait_event on
+            # the compute stream in the same call, with no TBO yield between.
 
             with torch.cuda.stream(comm_stream):
                 # if (previous_event) stream_wait(comm_stream, previous_event)
@@ -689,14 +684,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     compute_stream.wait_stream(comm_stream)
 
-            for t in (
-                packed_recv_hidden,
-                recv_topk_weights,
-                recv_scales,
-                recv_topk_ids,
-            ):
-                if t is not None:
-                    t.record_stream(comm_stream)
         else:
 
             (
@@ -762,8 +749,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream
 
-            for t in (hidden_states, topk_ids, topk_weights):
-                t.record_stream(comm_stream)
+            # No `record_stream(comm_stream)` -- see `_dispatch_core`.
 
             with torch.cuda.stream(comm_stream):
                 if previous_event is not None:
@@ -785,8 +771,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     done_event.record(comm_stream)
                 else:
                     compute_stream.wait_stream(comm_stream)
-
-            combined_hidden_states.record_stream(comm_stream)
 
         else:
             combined_hidden_states = self.mori_op.combine(

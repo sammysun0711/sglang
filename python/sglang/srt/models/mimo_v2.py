@@ -32,10 +32,10 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -64,6 +64,8 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import aiter_w8a8_block_fp8_linear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -99,8 +101,8 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -390,6 +392,7 @@ class MiMoV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
@@ -410,6 +413,7 @@ class MiMoV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
 
@@ -534,8 +538,14 @@ class MiMoV2MoE(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
+            hidden_states = state.pop("hidden_states_mlp_input")
+            if get_moe_a2a_backend().is_mori():
+                # TBO may scatter the attention-side child across TP ranks
+                # before EP dispatch. Trim MORI's padded combine output to the
+                # actual dispatch input, not the larger pre-scatter layer input.
+                state.num_tokens = _mimo_hidden_num_tokens(hidden_states)
             self.experts.dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
+                hidden_states=hidden_states,
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
@@ -569,7 +579,10 @@ class MiMoV2MoE(nn.Module):
             )
 
     def op_output(self, state):
-        state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
+        final_hidden_states = state.pop("hidden_states_after_combine")
+        if get_moe_a2a_backend().is_mori():
+            final_hidden_states = final_hidden_states[: state.pop("num_tokens")]
+        state.hidden_states_mlp_output = final_hidden_states
 
 
 class MiMoV2Attention(nn.Module):
@@ -904,7 +917,20 @@ class MiMoV2DecoderLayer(nn.Module):
             is_gfx95_supported() or is_gfx942_supported()
         ):
             return ""
-        weight = getattr(getattr(self.self_attn, "qkv_proj", None), "weight", None)
+        qkv_proj = getattr(self.self_attn, "qkv_proj", None)
+        quant_method = getattr(qkv_proj, "quant_method", None)
+        # The fused producer emits per-1x128 FP8 with AITER's scale layout.
+        # Check the selected consumer before replacing its BF16 input.
+        if (
+            not isinstance(quant_method, Fp8LinearMethod)
+            or not quant_method.block_quant
+            or quant_method.use_mxfp8
+            or quant_method.use_marlin
+            or quant_method.quant_config.weight_block_size != [128, 128]
+            or quant_method.w8a8_block_fp8_linear is not aiter_w8a8_block_fp8_linear
+        ):
+            return ""
+        weight = getattr(qkv_proj, "weight", None)
         # gfx942 rewrites FP8 weights to e4m3fnuz at load time
         # (Fp8LinearMethod.process_weights_after_loading_block_quant), so both
         # FP8 element types have to be accepted here.  The fused kernel takes
@@ -1027,6 +1053,35 @@ class MiMoV2DecoderLayer(nn.Module):
             )
         )
 
+    def op_comm_prepare_attn_a(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        state.attn_comm_state = self.layer_communicator.prepare_attn_tbo_a(
+            hidden_states,
+            residual,
+            forward_batch,
+            self._fused_rms_qkv_quant_format,
+            tbo_subbatch_index=tbo_subbatch_index or 0,
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_comm_prepare_attn_b(self, state):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn_tbo_b(state.pop("attn_comm_state"))
+        )
+
     def op_comm_prepare_mlp(self, state):
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
             self.layer_communicator.prepare_mlp(
@@ -1052,6 +1107,19 @@ class MiMoV2DecoderLayer(nn.Module):
                 state.pop("residual_after_input_ln"),
                 quant_format=self._prefill_moe_quant_format(state.forward_batch),
             )
+        )
+
+    def op_comm_prepare_mlp_a(self, state):
+        state.mlp_comm_state = self.layer_communicator.prepare_mlp_tbo_a(
+            state.pop("hidden_states_after_attn"),
+            state.pop("residual_after_input_ln"),
+            quant_format=self._prefill_moe_quant_format(state.forward_batch),
+            tbo_subbatch_index=state.get("tbo_subbatch_index") or 0,
+        )
+
+    def op_comm_prepare_mlp_b(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp_tbo_b(state.pop("mlp_comm_state"))
         )
 
     def op_comm_postprocess_layer(self, state):
@@ -1143,8 +1211,7 @@ class MiMoV2Model(nn.Module):
         if forward_batch.tbo_children is None or len(forward_batch.tbo_children) != 2:
             return "the TBO split does not contain exactly two children"
         if any(
-            (child.tbo_padded_len or 0) <= 0
-            for child in forward_batch.tbo_children
+            (child.tbo_padded_len or 0) <= 0 for child in forward_batch.tbo_children
         ):
             return "at least one TBO child is empty"
         if (

@@ -5,12 +5,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
+
 from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.batch_overlap.operations import YieldOperation
 from sglang.srt.batch_overlap.operations_strategy import (
     _compute_moe_mimov2_layer_operations_strategy_tbo,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -25,6 +28,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.models import mimo_v2
+from sglang.srt.server_args import ServerArgs
 
 
 class _Ops:
@@ -451,6 +455,18 @@ class _FakeNoEpBackend:
         return True
 
 
+class _FakeA2ABackend:
+    @staticmethod
+    def is_none():
+        return False
+
+
+class _FakeDeepEpMode:
+    @staticmethod
+    def resolve(_is_extend_in_batch):
+        return SimpleNamespace(is_low_latency=lambda: False)
+
+
 def _make_forward_batch(forward_mode=ForwardMode.EXTEND, spec_info=None):
     children = [
         SimpleNamespace(tbo_padded_len=2048, forward_mode=forward_mode),
@@ -654,6 +670,252 @@ def test_tbo_split_preparer_rejects_unsupported_no_a2a_batch(forward_mode, spec_
 
     assert not can_run_tbo
     assert local_forward_mode == forward_mode.value
+    assert preparer.local_tbo_split_seq_index is None
+
+
+@pytest.mark.parametrize(
+    (
+        "minimum_tokens",
+        "distribution_threshold",
+        "extend_lens",
+        "expected",
+        "expected_split_seq_index",
+    ),
+    [
+        (1, 0.48, [0], False, None),
+        (1, 0.48, [1], True, 0),
+        (1, 0.48, [2], True, 0),
+        (2048, 0.48, [1], False, None),
+        (2048, 0.48, [2], False, None),
+        (2048, 0.48, [2047], False, None),
+        (2048, 0.48, [2048], True, 0),
+        (2048, 0.48, [2049], True, 0),
+        (2048, 0.48, [1023, 1024], False, None),
+        (2048, 0.48, [1024, 1024], True, 1),
+        (2048, 0.48, [1, 2047], True, 1),
+        (32768, 0.48, [16384], False, None),
+        (32768, 0.48, [16384, 16384], True, 1),
+        (1, 0.0, [8192], False, None),
+        (2048, 0.0, [1024, 1024], True, 1),
+        (2048, 0.0, [1, 8191], True, 1),
+    ],
+)
+def test_a2a_extend_tbo_uses_current_forward_token_threshold(
+    minimum_tokens,
+    distribution_threshold,
+    extend_lens,
+    expected,
+    expected_split_seq_index,
+):
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        spec_info=None,
+        extend_num_tokens=sum(extend_lens),
+        extend_lens=extend_lens,
+        is_extend_in_batch=True,
+        reqs=[SimpleNamespace(origin_input_ids=range(1048576)) for _ in extend_lens],
+    )
+    preparer = two_batch_overlap.TboDPAttentionPreparer()
+
+    with (
+        patch.object(two_batch_overlap, "is_tbo_enabled", return_value=True),
+        patch.object(
+            two_batch_overlap,
+            "get_moe_a2a_backend",
+            return_value=_FakeA2ABackend(),
+        ),
+        patch.object(
+            two_batch_overlap,
+            "get_deepep_mode",
+            return_value=_FakeDeepEpMode(),
+        ),
+        patch.object(
+            two_batch_overlap,
+            "get_tbo_min_extend_tokens",
+            return_value=minimum_tokens,
+        ),
+        patch.object(
+            two_batch_overlap,
+            "get_tbo_token_distribution_threshold",
+            return_value=distribution_threshold,
+        ),
+        patch.object(
+            two_batch_overlap,
+            "_split_extend_seqs",
+            wraps=two_batch_overlap._split_extend_seqs,
+        ) as split,
+    ):
+        can_run_tbo, local_forward_mode = preparer.prepare_all_gather(batch)
+        assert split.call_count == int(expected)
+        if expected and sum(extend_lens) == 1:
+            assert (
+                two_batch_overlap.compute_split_token_index(
+                    preparer.local_tbo_split_seq_index,
+                    ForwardMode.EXTEND,
+                    extend_lens,
+                    None,
+                )
+                == 0
+            )
+
+    assert can_run_tbo is expected
+    assert local_forward_mode == ForwardMode.EXTEND.value
+    assert preparer.local_tbo_split_seq_index == expected_split_seq_index
+
+
+@pytest.mark.parametrize("minimum_tokens", [1, 2048, 32768])
+def test_tbo_min_extend_tokens_is_initialized_from_server_args(minimum_tokens):
+    server_args = ServerArgs(model_path="dummy", tbo_min_extend_tokens=minimum_tokens)
+    with patch.dict(moe_utils.__dict__):
+        moe_utils.TBO_MIN_EXTEND_TOKENS = None
+        assert moe_utils.get_tbo_min_extend_tokens() == ServerArgs.tbo_min_extend_tokens
+        moe_utils.initialize_moe_config(server_args)
+        assert two_batch_overlap.get_tbo_min_extend_tokens() == minimum_tokens
+
+
+@pytest.mark.parametrize(
+    ("forward_mode", "num_tokens", "extend_lens", "spec_info"),
+    [
+        (ForwardMode.DECODE, 1, None, None),
+        (
+            ForwardMode.TARGET_VERIFY,
+            4,
+            None,
+            SimpleNamespace(draft_token_num=4),
+        ),
+        (ForwardMode.MIXED, 1, [1], None),
+        (ForwardMode.IDLE, 0, None, None),
+        (ForwardMode.PREBUILT, 0, None, None),
+    ],
+)
+def test_a2a_tbo_preserves_non_extend_single_request_behavior(
+    forward_mode, num_tokens, extend_lens, spec_info
+):
+    batch = SimpleNamespace(
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        extend_num_tokens=num_tokens,
+        extend_lens=extend_lens,
+        is_extend_in_batch=forward_mode.is_extend(),
+        batch_size=lambda: 1,
+    )
+    preparer = two_batch_overlap.TboDPAttentionPreparer()
+
+    with (
+        patch.object(two_batch_overlap, "is_tbo_enabled", return_value=True),
+        patch.object(
+            two_batch_overlap,
+            "get_tbo_min_extend_tokens",
+            side_effect=AssertionError(
+                "non-EXTEND must not consult the token threshold"
+            ),
+        ),
+        patch.object(
+            two_batch_overlap,
+            "get_moe_a2a_backend",
+            return_value=_FakeA2ABackend(),
+        ),
+        patch.object(
+            two_batch_overlap,
+            "get_deepep_mode",
+            return_value=_FakeDeepEpMode(),
+        ),
+        patch.object(
+            two_batch_overlap,
+            "get_tbo_token_distribution_threshold",
+            return_value=0.48,
+        ),
+    ):
+        can_run_tbo, local_forward_mode = preparer.prepare_all_gather(batch)
+
+    assert can_run_tbo
+    assert local_forward_mode == forward_mode.value
+    assert preparer.local_tbo_split_seq_index == 0
+
+
+def test_a2a_tbo_keeps_idle_rank_neutral():
+    preparer = two_batch_overlap.TboDPAttentionPreparer()
+
+    with (
+        patch.object(two_batch_overlap, "is_tbo_enabled", return_value=True),
+        patch.object(
+            two_batch_overlap,
+            "get_moe_a2a_backend",
+            return_value=_FakeA2ABackend(),
+        ),
+        patch.object(
+            two_batch_overlap,
+            "get_deepep_mode",
+            return_value=_FakeDeepEpMode(),
+        ),
+    ):
+        can_run_tbo, local_forward_mode = preparer.prepare_all_gather(None)
+
+    assert can_run_tbo
+    assert local_forward_mode == ForwardMode.IDLE.value
+    assert preparer.local_tbo_split_seq_index == 0
+
+
+@pytest.mark.parametrize(
+    ("rank_tokens", "expected"),
+    [
+        ([2048, 2047], False),
+        ([2048, 2048], True),
+        ([2048, None], True),
+        ([1, None], False),
+    ],
+)
+def test_tbo_min_extend_tokens_participates_in_rank_agreement(rank_tokens, expected):
+    preparers = [two_batch_overlap.TboDPAttentionPreparer() for _ in rank_tokens]
+    with (
+        patch.object(two_batch_overlap, "is_tbo_enabled", return_value=True),
+        patch.object(
+            two_batch_overlap, "get_moe_a2a_backend", return_value=_FakeA2ABackend()
+        ),
+        patch.object(
+            two_batch_overlap, "get_deepep_mode", return_value=_FakeDeepEpMode()
+        ),
+        patch.object(two_batch_overlap, "get_tbo_min_extend_tokens", return_value=2048),
+        patch.object(
+            two_batch_overlap, "get_tbo_token_distribution_threshold", return_value=0.48
+        ),
+    ):
+        flags = []
+        for preparer, tokens in zip(preparers, rank_tokens):
+            batch = (
+                SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    spec_info=None,
+                    extend_num_tokens=tokens,
+                    extend_lens=[tokens],
+                    is_extend_in_batch=True,
+                )
+                if tokens is not None
+                else None
+            )
+            flags.append(preparer.prepare_all_gather(batch))
+
+    partial_global_info = torch.tensor(flags, dtype=torch.int64, device="cpu")
+    for preparer in preparers:
+        split_index, mode = preparer.compute_output(partial_global_info)
+        assert (split_index is not None) is expected
+        assert mode == (ForwardMode.EXTEND if expected else None)
+
+
+def test_tbo_disabled_does_not_consult_extend_threshold():
+    preparer = two_batch_overlap.TboDPAttentionPreparer()
+    batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+    with (
+        patch.object(two_batch_overlap, "is_tbo_enabled", return_value=False),
+        patch.object(
+            two_batch_overlap,
+            "get_tbo_min_extend_tokens",
+            side_effect=AssertionError("disabled TBO must not consult the threshold"),
+        ),
+    ):
+        can_run_tbo, mode = preparer.prepare_all_gather(batch)
+    assert not can_run_tbo
+    assert mode == ForwardMode.EXTEND.value
     assert preparer.local_tbo_split_seq_index is None
 
 

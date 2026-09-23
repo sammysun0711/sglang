@@ -37,6 +37,9 @@ esac
 
 read -r -a TOKEN_LIST <<< "${TOKEN_LIST_OVERRIDE:-${default_tokens}}"
 output_tokens=1
+# extra-request-body replaces sampling_params, so preserve the sampling defaults.
+# Keep special-token text visible so the client can record TTFT for those outputs.
+extra_request_body="{\"sampling_params\":{\"temperature\":0.0,\"max_new_tokens\":${output_tokens},\"ignore_eos\":true,\"skip_special_tokens\":false}}"
 small_input_concurrency_list="${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_small_concurrency}}}"
 short_concurrency_list="${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_short_concurrency}}"
 long_concurrency_list="${LONG_CONCURRENCY_LIST_OVERRIDE:-${default_long_concurrency}}"
@@ -44,6 +47,7 @@ warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
 small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-${default_small_num_prompts}}"
 prompt_waves="${PROMPT_WAVES:-4}"
 min_num_prompts="${MIN_NUM_PROMPTS:-32}"
+model_path="${MODEL_PATH:-/models/MiMo-V2.5-Pro/}"
 LOG_DIR="${LOG_DIR:-./logs/benchmark_tp8_prefill}"
 
 require_positive_integer() {
@@ -133,14 +137,18 @@ if [[ "${benchmark_preset}" == "customer" ]]; then
     echo "PROMPT_WAVES/MIN_NUM_PROMPTS apply only to BENCHMARK_PRESET=sweep; using customer prompt counts."
   fi
 fi
+results_csv="${LOG_DIR}/results.csv"
 if [[ "${dry_run}" == "0" ]]; then
   mkdir -p "$LOG_DIR"
+  echo "input_tokens,max_concurrency,num_prompts,mean_ttft_ms,input_throughput" > "${results_csv}"
 fi
 
 for input_tokens in "${TOKEN_LIST[@]}"; do
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
+
+    json_file="${LOG_DIR}/benchmark_${input_tokens}_con${concurrency}.jsonl"
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${warmup_requests}"
@@ -149,7 +157,7 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
 
     benchmark_cmd=(python3 -m sglang.bench_serving \
         --backend sglang \
-        --model /models/MiMo-V2.5-Pro/ \
+        --model "${model_path}" \
         --host 0.0.0.0 \
         --port 30001 \
         --dataset-name random \
@@ -160,12 +168,20 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --seed 12345 \
         --num-prompts "${num_prompts}" \
         --warmup-requests "${warmup_requests}" \
-        --max-concurrency "${concurrency}")
+        --max-concurrency "${concurrency}" \
+        --tokenize-prompt \
+        --extra-request-body "${extra_request_body}" \
+        --output-file "${json_file}")
     printf 'Command:'
     printf ' %q' "${benchmark_cmd[@]}"
     printf '\n'
     if [[ "${dry_run}" == "0" ]]; then
+      : > "${json_file}"
       "${benchmark_cmd[@]}" 2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"
+      jq -r --argjson input "${input_tokens}" --argjson concurrency "${concurrency}" \
+        --argjson prompts "${num_prompts}" \
+        '[$input, $concurrency, $prompts, .mean_ttft_ms, .input_throughput] | @csv' \
+        "${json_file}" >> "${results_csv}"
     fi
     echo -e "============================================================\n"
   done
@@ -175,4 +191,5 @@ if [[ "${dry_run}" == "1" ]]; then
   echo "Dry run complete; no benchmark requests sent."
 else
   echo "All lengths and concurrency tests completed!"
+  echo "Results: ${results_csv}"
 fi

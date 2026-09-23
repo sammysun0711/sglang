@@ -1786,10 +1786,6 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
-
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
@@ -1802,6 +1798,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

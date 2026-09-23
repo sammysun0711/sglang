@@ -24,6 +24,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_tbo_min_extend_tokens,
     get_tbo_token_distribution_threshold,
     is_tbo_enabled,
 )
@@ -204,7 +205,6 @@ def get_token_num_per_seq(
         return None
 
 
-# TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
     forward_mode: ForwardMode,
     num_tokens: int,
@@ -213,6 +213,12 @@ def compute_split_seq_index(
 ) -> Optional[int]:
     if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
+        if forward_mode == ForwardMode.EXTEND:
+            if num_tokens < get_tbo_min_extend_tokens():
+                return None
+            # Disabling within-sequence splitting requires at least two sequences.
+            if len(extend_lens) < 2 and get_tbo_token_distribution_threshold() == 0:
+                return None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
@@ -446,7 +452,9 @@ def compute_split_indices_for_cuda_graph_replay(
 
 class TboCudaGraphRunnerPlugin:
     def __init__(self):
-        self._tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
+        self._tbo_children_num_token_non_padded = torch.zeros(
+            (2,), dtype=torch.int32, device=get_global_server_args().device
+        )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not is_tbo_enabled():

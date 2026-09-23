@@ -83,7 +83,77 @@ cd /root/workspace/sglang/evaluation
 ```bash
 ./run_benchmark_mimo_pro_prefill.sh
 ```
-## 6. Run baseline single node decode benchmark with fake prefill
+
+## 6. Compare TP8/EP8 MORI no-TBO baseline and fully optimized TBO
+
+### EP8 + MORI MANUAL, no TBO (baseline)
+
+Launch the baseline server:
+
+```bash
+CHUNKED_PREFILL_SIZE=65536 \
+ENABLE_FAKE_EP_DISPATCH=1 \
+MORI_EP_LAUNCH_CONFIG_MODE=MANUAL \
+ENABLE_TBO=0 \
+SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN=0 \
+SGLANG_MIMO_FUSED_RMS_QKV_QUANT=0 \
+AITER_BYPASS_TUNE_CONFIG=1 \
+AITER_ONLINE_TUNE=0 \
+LOG_DIR=./logs/ep8_mori_manual_no_tbo/server \
+./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+```
+
+`ENABLE_TBO=0` also disables attention communication overlap. In `MANUAL` mode,
+the MORI tuning JSON is inactive. `AITER_BYPASS_TUNE_CONFIG=1` bypasses FMoE tuned
+configurations for this server, while `AITER_ONLINE_TUNE=0` prevents online tuning.
+
+Run the prefill benchmark in another terminal:
+
+```bash
+LOG_DIR=./logs/ep8_mori_manual_no_tbo/benchmark \
+./run_benchmark_mimo_pro_prefill.sh
+```
+
+### EP8 + MORI AUTO, fully optimized TBO
+
+Launch the optimized server after stopping the baseline server:
+
+```bash
+CHUNKED_PREFILL_SIZE=65536 \
+ENABLE_FAKE_EP_DISPATCH=1 \
+MORI_EP_LAUNCH_CONFIG_MODE=AUTO \
+ENABLE_TBO=1 \
+SGLANG_MIMO_TBO_ATTN_COMM=1 \
+SGLANG_AITER_MIMO_CACHED_BF16_SWA_VARLEN=1 \
+SGLANG_MIMO_FUSED_RMS_QKV_QUANT=1 \
+AITER_BYPASS_TUNE_CONFIG=0 \
+AITER_ONLINE_TUNE=0 \
+LOG_DIR=./logs/ep8_mori_auto_tbo_opt/server \
+./launch_tp8_ep8_aiter_mori_tbo_mtp_accuracy_baseline.sh
+```
+
+These optimization switches match the launcher's defaults; they are explicit here
+to make the comparison reproducible. Run the same prefill benchmark in another terminal:
+
+```bash
+LOG_DIR=./logs/ep8_mori_auto_tbo_opt/benchmark \
+./run_benchmark_mimo_pro_prefill.sh
+```
+
+Compare `results.csv` in the two benchmark log directories at matching input
+lengths and concurrency levels.
+
+### Accuracy testing for either configuration
+
+Install EvalScope with `pip install evalscope==1.11.0`. Restart the desired server
+using its command above, changing `ENABLE_FAKE_EP_DISPATCH=1` to
+`ENABLE_FAKE_EP_DISPATCH=0`, then run the accuracy client in another terminal:
+
+```bash
+./run_evalscope_gsm8k_accuracy.sh
+```
+
+## 7. Run baseline single node decode benchmark with fake prefill
 Baseline fake-prefill decode keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache
 
 ### Launch server
@@ -102,23 +172,23 @@ cd /root/workspace/sglang/evaluation
 python3 analyze_server_output_throughput.py <path-to-server-log>
 ```
 
-## 7. Profiling & Analysis
+## 8. Profiling & Analysis
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sglang_profile.sh
 ```
 
 
-## 8. Run real-MTP ShareGPT dataset accuracy gate
+## 9. Run real-MTP ShareGPT dataset accuracy gate
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sharegpt_mtp_accuracy_test.sh
 ```
 
-## 9. Run swe-bench & accuracy benchmark test
+## 10. Run swe-bench & accuracy benchmark test
 Follow up customer's swe-bench accuracy verification guide.
 
-## 10. H200 performance evaluation
+## 11. H200 performance evaluation
 Follow up customer's shared performance data
 
 ## 11. Run prefill/decode disaggregated deployment

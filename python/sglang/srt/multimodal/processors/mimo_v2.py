@@ -485,6 +485,11 @@ class MiMoProcessor:
 
     @staticmethod
     def has_audio_track(path_or_data) -> bool:
+        if AudioDecoder is None:
+            raise ValueError(
+                "torchcodec is required to detect audio tracks in video inputs; "
+                "install torchcodec and its FFmpeg dependencies."
+            )
         # In-process probe via torchcodec for bytes/path; ffprobe range
         # request for HTTP URLs so we do not pre-download the blob here.
         if isinstance(path_or_data, str) and path_or_data.startswith(

@@ -160,6 +160,12 @@ class DFlashDraftInputV2(SpecInput):
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
         cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu
+        cur_allocated_seq_lens = (
+            cur_allocated_seq_lens_cpu.tolist()
+            if cur_allocated_seq_lens_cpu is not None
+            else None
+        )
+        reserved_lens = [0] * bs
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_global_server_args().speculative_num_draft_tokens)
@@ -178,14 +184,13 @@ class DFlashDraftInputV2(SpecInput):
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
-            if cur_allocated_seq_lens_cpu is not None and i < len(
-                cur_allocated_seq_lens_cpu
-            ):
-                cur_alloc_len = int(cur_allocated_seq_lens_cpu[i])
+            if cur_allocated_seq_lens is not None and i < len(cur_allocated_seq_lens):
+                cur_alloc_len = cur_allocated_seq_lens[i]
             else:
                 cur_alloc_len = int(req.kv_allocated_len)
             planning_len = committed_len + block_size
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            reserved_lens[i] = reserved_len
             top_k = int(req.sampling_params.top_k)
 
             committed_kv_lens_cpu_t[i] = committed_len
@@ -267,8 +272,8 @@ class DFlashDraftInputV2(SpecInput):
 
         # This request-side high-water mark is what release_kv_cache() uses to
         # reclaim any DFLASH over-allocation if the request finishes later.
-        for i, req in enumerate(batch.reqs):
-            req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
+        for req, reserved_len in zip(batch.reqs, reserved_lens):
+            req.kv_allocated_len = max(req.kv_allocated_len, reserved_len)
             req.decode_batch_idx += 1
 
         # Preserve the lagging committed CPU view on the batch and carry the

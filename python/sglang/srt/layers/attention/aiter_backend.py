@@ -1835,10 +1835,22 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         swa_page_table = None
+        use_unified_target_verify = (
+            forward_mode.is_target_verify()
+            and not self.use_mla
+            and self._use_unified_verify
+        )
+        # Unified target verification uses a fixed-width 2D page table and
+        # therefore does not consume the dynamic scalar max_kv_len. Avoid the
+        # otherwise unnecessary reduction and scalar extraction in this path.
         max_kv_len = (
-            seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
-            else torch.max(seq_lens).item()
+            None
+            if use_unified_target_verify
+            else (
+                seq_lens_cpu.max().item()
+                if seq_lens_cpu is not None
+                else torch.max(seq_lens).item()
+            )
         )
 
         if forward_mode.is_decode_or_idle():
@@ -1973,44 +1985,49 @@ class AiterAttnBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if self.use_mla:
-                kv_lens = seq_lens + self.num_draft_tokens
-            else:
-                kv_lens = seq_lens
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
-            if seq_lens_sum is not None:
-                kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
-                )
-                assert_buffer_fits(
-                    kv_indices_used,
-                    kv_indices.numel(),
-                    "aiter target_verify kv_indices",
-                    bs=bs,
-                    seq_lens_sum=seq_lens_sum,
-                )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = self.num_draft_tokens
+
+            # Unified target verification consumes a 2D page table built directly
+            # from req_to_token below. Avoid constructing the legacy flat
+            # kv_indptr/kv_indices representation first: it is never read by the
+            # unified path and scales with the complete KV history.
+            use_unified_verify = use_unified_target_verify
+            if not use_unified_verify:
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * self.num_draft_tokens,
+                    step=self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                kv_lens = seq_lens + self.num_draft_tokens if self.use_mla else seq_lens
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                # seq_lens_sum is None at capture (dummy seq_lens); only check
+                # on replay.
+                if seq_lens_sum is not None:
+                    kv_indices_used = seq_lens_sum + (
+                        self.num_draft_tokens * bs if self.use_mla else 0
+                    )
+                    assert_buffer_fits(
+                        kv_indices_used,
+                        kv_indices.numel(),
+                        "aiter target_verify kv_indices",
+                        bs=bs,
+                        seq_lens_sum=seq_lens_sum,
+                    )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
 
             if self.use_mla:
                 if _use_mla_ps_kernel:
@@ -2056,7 +2073,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
-                if self._use_unified_verify:
+                if use_unified_verify:
                     max_num_blocks_per_seq = (
                         self.max_context_len + self.page_size - 1
                     ) // self.page_size

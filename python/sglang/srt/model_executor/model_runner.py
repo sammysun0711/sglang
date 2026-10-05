@@ -3388,7 +3388,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # replay_prepare time. Move timing into the prefill cuda graph
             # runner to capture only the model.forward part.
             ctx = (
-                self.device_timer.wrap(metadata={"category": "extend"})
+                self.device_timer.wrap(
+                    metadata={
+                        "category": "extend",
+                        "forward_iter": forward_batch.forward_iter,
+                    }
+                )
                 if self.device_timer
                 else contextlib.nullcontext()
             )
@@ -3408,7 +3413,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend.init_forward_metadata(forward_batch)
 
         ctx = (
-            self.device_timer.wrap(metadata={"category": "extend"})
+            self.device_timer.wrap(
+                metadata={
+                    "category": "extend",
+                    "forward_iter": forward_batch.forward_iter,
+                }
+            )
             if self.device_timer
             else contextlib.nullcontext()
         )

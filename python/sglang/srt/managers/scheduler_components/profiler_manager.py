@@ -69,6 +69,9 @@ class SchedulerProfilerManager:
         self.profiler_decode_ct: Optional[int] = None
         self.profiler_target_prefill_ct: Optional[int] = None
         self.profiler_target_decode_ct: Optional[int] = None
+        self.profiler_active_stage: Optional[ForwardMode] = None
+        self.profiler_completed_stages: set[ForwardMode] = set()
+        self.profile_stages: set[str] = set()
 
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
@@ -114,6 +117,8 @@ class SchedulerProfilerManager:
 
         self.profile_by_stage = profile_by_stage
         self.merge_profiles = merge_profiles
+        self.profile_stages = set(profile_stages or ("prefill", "decode"))
+        self.profiler_completed_stages.clear()
 
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -132,8 +137,13 @@ class SchedulerProfilerManager:
 
         if num_steps:
             if self.profile_by_stage:
-                self.profiler_prefill_ct = 0
-                self.profiler_decode_ct = 0
+                # In stage mode, start_step is a relative number of batches to
+                # skip within each selected stage. This is needed for chunked
+                # prefill, where profiling the first N batches never observes
+                # attention at the requested late-context KV length.
+                stage_start_step = max(0, int(start_step or 0))
+                self.profiler_prefill_ct = -stage_start_step
+                self.profiler_decode_ct = -stage_start_step
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = num_steps
             elif start_step:
@@ -361,6 +371,7 @@ class SchedulerProfilerManager:
         self.torch_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
+        self.profiler_active_stage = None
 
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
@@ -371,22 +382,41 @@ class SchedulerProfilerManager:
 
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
+                stage = ForwardMode.EXTEND
+                if self.profile_in_progress and self.profiler_active_stage != stage:
+                    self.profiler_completed_stages.add(self.profiler_active_stage)
+                    self._stop_profile(stage=self.profiler_active_stage)
+                if (
+                    "prefill" not in self.profile_stages
+                    or stage in self.profiler_completed_stages
+                ):
+                    return
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
+                    self.profiler_active_stage = stage
                 self.profiler_prefill_ct += 1
                 if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
+                        self.profiler_completed_stages.add(stage)
             elif batch.forward_mode.is_decode():
+                stage = ForwardMode.DECODE
+                if self.profile_in_progress and self.profiler_active_stage != stage:
+                    self.profiler_completed_stages.add(self.profiler_active_stage)
+                    self._stop_profile(stage=self.profiler_active_stage)
+                if (
+                    "decode" not in self.profile_stages
+                    or stage in self.profiler_completed_stages
+                ):
+                    return
                 if self.profiler_decode_ct == 0:
-                    if self.profile_in_progress:
-                        # force trace flush
-                        self._stop_profile(stage=ForwardMode.EXTEND)
                     self._start_profile(batch.forward_mode)
+                    self.profiler_active_stage = stage
                 self.profiler_decode_ct += 1
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
+                        self.profiler_completed_stages.add(stage)
             elif batch.forward_mode.is_idle():
                 pass
             else:

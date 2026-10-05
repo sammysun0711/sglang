@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import tempfile
 import time
@@ -8,6 +9,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -42,6 +45,7 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+MIMO_PREFILL_ANALYSIS_LOG = envs.SGLANG_MIMO_PREFILL_ANALYSIS_LOG.get()
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
@@ -157,16 +161,32 @@ class SchedulerMetricsReporter:
         self.fwd_occupancy = float("nan")
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
+        self.prefill_analysis_enabled = (
+            MIMO_PREFILL_ANALYSIS_LOG and self.is_stats_logging_rank
+        )
+        self._prefill_analysis_records: Dict[int, Dict[str, Any]] = {}
+        self._prefill_analysis_orphan_gpu: Dict[int, Tuple[float, int]] = {}
+        self._prefill_analysis_last_launch_start: Optional[float] = None
+        self._prefill_analysis_last_launch_end: Optional[float] = None
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
 
+        if ENABLE_METRICS_DEVICE_TIMER or self.prefill_analysis_enabled:
+
             def _wrap_execution_reporter(**kwargs):
-                self._device_timer_window_gpu_time += kwargs["t"]
-                if self.enable_metrics:
-                    self.metrics_collector.increment_forward_execution_seconds(**kwargs)
+                if ENABLE_METRICS_DEVICE_TIMER:
+                    self._device_timer_window_gpu_time += kwargs["t"]
+                    if self.enable_metrics:
+                        self.metrics_collector.increment_forward_execution_seconds(
+                            category=kwargs["category"],
+                            t=kwargs["t"],
+                            dp_cooperation_info=kwargs.get("dp_cooperation_info"),
+                        )
+                if self.prefill_analysis_enabled:
+                    self._record_prefill_analysis_device_time(**kwargs)
 
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
@@ -190,6 +210,169 @@ class SchedulerMetricsReporter:
                     dw.draft_runner.device_timer = timer
                 for r in getattr(dw, "draft_runner_list", []):
                     r.device_timer = timer
+
+    def record_prefill_analysis_launch(
+        self,
+        batch: ScheduleBatch,
+        *,
+        loop_start: float,
+        recv_ms: float,
+        process_input_ms: float,
+        schedule_ms: float,
+        launch_start: float,
+        launch_end: float,
+    ) -> None:
+        """Capture sync-free host and batch geometry data for one prefill step."""
+        if (
+            not self.prefill_analysis_enabled
+            or batch.forward_iter is None
+            or not batch.forward_mode.is_context_parallel_extend()
+        ):
+            return
+
+        prefix_lens = [int(v) for v in (batch.prefix_lens or [])]
+        extend_lens = [int(v) for v in (batch.extend_lens or [])]
+        query_tokens = int(batch.extend_num_tokens or sum(extend_lens))
+        prefix_tokens = sum(prefix_lens)
+        causal_kv_pairs = sum(
+            q_len * prefix_len + q_len * (q_len + 1) // 2
+            for prefix_len, q_len in zip(prefix_lens, extend_lens)
+        )
+        pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        prefill_stats = batch.prefill_stats
+
+        record: Dict[str, Any] = {
+            "schema": 1,
+            "event": "mimo_prefill_iteration",
+            "forward_iter": int(batch.forward_iter),
+            "forward_mode": batch.forward_mode.name,
+            "batch_size": batch.batch_size(),
+            "query_tokens": query_tokens,
+            "prefix_tokens": prefix_tokens,
+            "causal_kv_pairs": causal_kv_pairs,
+            "prefix_len_min": min(prefix_lens, default=0),
+            "prefix_len_max": max(prefix_lens, default=0),
+            "extend_len_min": min(extend_lens, default=0),
+            "extend_len_max": max(extend_lens, default=0),
+            "prefix_lens": prefix_lens if len(prefix_lens) <= 16 else None,
+            "extend_lens": extend_lens if len(extend_lens) <= 16 else None,
+            "contains_last_prefill_chunk": bool(batch.contains_last_prefill_chunk),
+            "tbo_split_seq_index": batch.tbo_split_seq_index,
+            "new_sequences": prefill_stats.num_new_seqs if prefill_stats else 0,
+            "pending_tokens": prefill_stats.num_pending_tokens if prefill_stats else 0,
+            "running_requests": (
+                prefill_stats.num_running_reqs.total if prefill_stats else 0
+            ),
+            "queued_requests": len(self.scheduler.waiting_queue),
+            "full_pool_used": pool_stats.full_num_used,
+            "full_pool_available": pool_stats.full_available_size,
+            "full_pool_evictable": pool_stats.full_evictable_size,
+            "swa_pool_used": pool_stats.swa_num_used,
+            "swa_pool_available": pool_stats.swa_available_size,
+            "swa_pool_evictable": pool_stats.swa_evictable_size,
+            "sliding_window_size": self.scheduler.sliding_window_size,
+            "loop_start_s": loop_start,
+            "launch_start_s": launch_start,
+            "launch_end_s": launch_end,
+            "recv_ms": recv_ms,
+            "process_input_ms": process_input_ms,
+            "schedule_ms": schedule_ms,
+            "launch_submit_ms": (launch_end - launch_start) * 1000.0,
+            "previous_prefill_launch_interval_ms": (
+                None
+                if self._prefill_analysis_last_launch_start is None
+                else (launch_start - self._prefill_analysis_last_launch_start) * 1000.0
+            ),
+            "previous_prefill_submit_gap_ms": (
+                None
+                if self._prefill_analysis_last_launch_end is None
+                else (launch_start - self._prefill_analysis_last_launch_end) * 1000.0
+            ),
+            "gpu_forward_ms": 0.0,
+            "gpu_forward_intervals": 0,
+            "host_complete": False,
+        }
+        self._prefill_analysis_last_launch_start = launch_start
+        self._prefill_analysis_last_launch_end = launch_end
+
+        orphan = self._prefill_analysis_orphan_gpu.pop(batch.forward_iter, None)
+        if orphan is not None:
+            record["gpu_forward_ms"] = orphan[0]
+            record["gpu_forward_intervals"] = orphan[1]
+        self._prefill_analysis_records[batch.forward_iter] = record
+
+    def record_prefill_analysis_result(
+        self,
+        batch: ScheduleBatch,
+        *,
+        result_start: float,
+        result_end: float,
+    ) -> None:
+        if not self.prefill_analysis_enabled or batch.forward_iter is None:
+            return
+        record = self._prefill_analysis_records.get(batch.forward_iter)
+        if record is None:
+            return
+        record.update(
+            {
+                "result_start_s": result_start,
+                "result_end_s": result_end,
+                "result_process_ms": (result_end - result_start) * 1000.0,
+                "submit_to_result_ms": (result_start - record["launch_end_s"]) * 1000.0,
+                "batch_lifecycle_ms": (result_end - record["loop_start_s"]) * 1000.0,
+                "host_complete": True,
+            }
+        )
+        self._maybe_emit_prefill_analysis(batch.forward_iter)
+
+    def _record_prefill_analysis_device_time(
+        self,
+        *,
+        category: str,
+        t: float,
+        forward_iter: Optional[int] = None,
+        **_kwargs,
+    ) -> None:
+        if category != "extend" or forward_iter is None:
+            return
+        record = self._prefill_analysis_records.get(forward_iter)
+        if record is None:
+            elapsed_ms, count = self._prefill_analysis_orphan_gpu.get(
+                forward_iter, (0.0, 0)
+            )
+            self._prefill_analysis_orphan_gpu[forward_iter] = (
+                elapsed_ms + t * 1000.0,
+                count + 1,
+            )
+            return
+        record["gpu_forward_ms"] += t * 1000.0
+        record["gpu_forward_intervals"] += 1
+        self._maybe_emit_prefill_analysis(forward_iter)
+
+    def _maybe_emit_prefill_analysis(self, forward_iter: int) -> None:
+        record = self._prefill_analysis_records.get(forward_iter)
+        if (
+            record is None
+            or not record["host_complete"]
+            or record["gpu_forward_intervals"] == 0
+        ):
+            return
+        record["lifecycle_minus_gpu_ms"] = max(
+            0.0, record["batch_lifecycle_ms"] - record["gpu_forward_ms"]
+        )
+        logger.info(
+            "MIMO_PREFILL_ANALYSIS %s",
+            json.dumps(record, separators=(",", ":"), sort_keys=True),
+        )
+        del self._prefill_analysis_records[forward_iter]
+
+    def flush_prefill_analysis(self) -> None:
+        if not self.prefill_analysis_enabled:
+            return
+        if self.forward_pass_device_timer is not None:
+            self.forward_pass_device_timer._report()
+        for forward_iter in list(self._prefill_analysis_records):
+            self._maybe_emit_prefill_analysis(forward_iter)
 
     def _init_fpm(self):
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
@@ -985,9 +1168,11 @@ class SchedulerMetricsReporter:
                 )
 
     def update_device_timer(self):
-        if not ENABLE_METRICS_DEVICE_TIMER:
+        if self.forward_pass_device_timer is None:
             return
         self.forward_pass_device_timer._report()
+        if not ENABLE_METRICS_DEVICE_TIMER:
+            return
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
             # Window start: keep the last published value instead of NaN-ing
@@ -1011,6 +1196,7 @@ class SchedulerMetricsReporter:
             self._device_timer_window_batch_count = 0
 
     def reset_device_timer_window(self):
+        self.flush_prefill_analysis()
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self.fwd_occupancy = float("nan")

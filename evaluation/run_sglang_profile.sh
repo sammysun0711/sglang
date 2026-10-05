@@ -12,9 +12,10 @@ served_model_name="${SERVED_MODEL_NAME:-}"
 host="${HOST:-0.0.0.0}"
 port="${PORT:-30001}"
 dataset_path="${DATASET_PATH:-${script_dir}/ShareGPT_V3_unfiltered_cleaned_split.json}"
-profile_output_dir="${PROFILE_OUTPUT_DIR:-${script_dir}/profiles/mimo_pro_2_5_aiter_chunk_prefill_32k_${input_tokens}_con${max_concurrency}}-check-moe"
-profile_prefix="${PROFILE_PREFIX:-mimo_chunk_prefill_32k_${input_tokens}_con${max_concurrency}}-check-moe-new"
+profile_output_dir="${PROFILE_OUTPUT_DIR:-${script_dir}/profiles/mimo_pro_2_5_aiter_chunk_prefill_32k_${input_tokens}_con${max_concurrency}-check-moe}"
+profile_prefix="${PROFILE_PREFIX:-mimo_chunk_prefill_32k_${input_tokens}_con${max_concurrency}-check-moe-new}"
 profile_activities="${PROFILE_ACTIVITIES:-CPU GPU}"
+profile_start_step="${PROFILE_START_STEP:-}"
 profile_num_steps="${PROFILE_NUM_STEPS:-}"
 profile_by_stage="${PROFILE_BY_STAGE:-0}"
 profile_stages="${PROFILE_STAGES:-}"
@@ -23,7 +24,7 @@ fake_prefill="${FAKE_PREFILL:-0}"
 
 export SGLANG_TORCH_PROFILER_DIR="${profile_output_dir}"
 
-echo "Profiling input=${input_tokens}, output=${output_tokens}, concurrency=${max_concurrency}, prompts=${num_prompts}, warmups=${warmup_requests}, by_stage=${profile_by_stage}, fake_prefill=${fake_prefill}"
+echo "Profiling input=${input_tokens}, output=${output_tokens}, concurrency=${max_concurrency}, prompts=${num_prompts}, warmups=${warmup_requests}, start_step=${profile_start_step:-immediate}, by_stage=${profile_by_stage}, fake_prefill=${fake_prefill}"
 echo "Profile output: ${profile_output_dir}"
 
 profile_args=(
@@ -33,6 +34,9 @@ profile_args=(
 )
 read -r -a profile_activity_args <<<"${profile_activities}"
 profile_args+=(--profile-activities "${profile_activity_args[@]}")
+if [[ -n "${profile_start_step}" ]]; then
+    profile_args+=(--profile-start-step "${profile_start_step}")
+fi
 if [[ -n "${profile_num_steps}" ]]; then
     profile_args+=(--profile-num-steps "${profile_num_steps}")
 fi

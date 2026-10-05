@@ -254,6 +254,9 @@ class Envs:
         False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
     )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
+    # Emit one structured, sync-free timing line per prefill scheduler iteration.
+    # Intended for diagnosing chunk-shape and CPU/GPU overlap differences.
+    SGLANG_MIMO_PREFILL_ANALYSIS_LOG = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)

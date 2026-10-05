@@ -1472,20 +1472,48 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            analysis_enabled = self.metrics_reporter.prefill_analysis_enabled
+            loop_start = time.perf_counter() if analysis_enabled else 0.0
+
             # Receive requests
+            recv_start = time.perf_counter() if analysis_enabled else 0.0
             recv_reqs = self.request_receiver.recv_requests()
+            recv_end = time.perf_counter() if analysis_enabled else 0.0
             self.process_input_requests(recv_reqs)
+            process_input_end = time.perf_counter() if analysis_enabled else 0.0
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            schedule_start = time.perf_counter() if analysis_enabled else 0.0
             batch = self.get_next_batch_to_run()
+            schedule_end = time.perf_counter() if analysis_enabled else 0.0
             self.cur_batch = batch
 
             # Launch the current batch
             if batch:
+                launch_start = time.perf_counter() if analysis_enabled else 0.0
                 result = self.run_batch(batch)
+                launch_end = time.perf_counter() if analysis_enabled else 0.0
+                if analysis_enabled:
+                    self.metrics_reporter.record_prefill_analysis_launch(
+                        batch,
+                        loop_start=loop_start,
+                        recv_ms=(recv_end - recv_start) * 1000.0,
+                        process_input_ms=(process_input_end - recv_end) * 1000.0,
+                        schedule_ms=(schedule_end - schedule_start) * 1000.0,
+                        launch_start=launch_start,
+                        launch_end=launch_end,
+                    )
+                    result_start = time.perf_counter()
                 self.process_batch_result(batch, result)
+                if analysis_enabled:
+                    result_end = time.perf_counter()
+                    self.metrics_reporter.record_prefill_analysis_result(
+                        batch,
+                        result_start=result_start,
+                        result_end=result_end,
+                    )
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1505,12 +1533,29 @@ class Scheduler(
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            result_start = (
+                time.perf_counter()
+                if self.metrics_reporter.prefill_analysis_enabled
+                else 0.0
+            )
             self.process_batch_result(tmp_batch, tmp_result)
+            if self.metrics_reporter.prefill_analysis_enabled:
+                self.metrics_reporter.record_prefill_analysis_result(
+                    tmp_batch,
+                    result_start=result_start,
+                    result_end=time.perf_counter(),
+                )
 
         while True:
+            analysis_enabled = self.metrics_reporter.prefill_analysis_enabled
+            loop_start = time.perf_counter() if analysis_enabled else 0.0
+
             # Receive requests
+            recv_start = time.perf_counter() if analysis_enabled else 0.0
             recv_reqs = self.request_receiver.recv_requests()
+            recv_end = time.perf_counter() if analysis_enabled else 0.0
             self.process_input_requests(recv_reqs)
+            process_input_end = time.perf_counter() if analysis_enabled else 0.0
             if self._engine_paused:
                 continue
 
@@ -1519,7 +1564,9 @@ class Scheduler(
                 self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
+            schedule_start = time.perf_counter() if analysis_enabled else 0.0
             batch = self.get_next_batch_to_run()
+            schedule_end = time.perf_counter() if analysis_enabled else 0.0
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1530,7 +1577,19 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                launch_start = time.perf_counter() if analysis_enabled else 0.0
                 batch_result = self.run_batch(batch)
+                launch_end = time.perf_counter() if analysis_enabled else 0.0
+                if analysis_enabled:
+                    self.metrics_reporter.record_prefill_analysis_launch(
+                        batch,
+                        loop_start=loop_start,
+                        recv_ms=(recv_end - recv_start) * 1000.0,
+                        process_input_ms=(process_input_end - recv_end) * 1000.0,
+                        schedule_ms=(schedule_end - schedule_start) * 1000.0,
+                        launch_start=launch_start,
+                        launch_end=launch_end,
+                    )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

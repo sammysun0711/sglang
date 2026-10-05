@@ -339,6 +339,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_split_seq_index: Optional[int] = None
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
+    # Scheduler iteration ID used to correlate optional device timing logs.
+    forward_iter: Optional[int] = None
+
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -645,6 +648,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
+            forward_iter=batch.forward_iter,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,

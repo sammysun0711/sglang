@@ -1252,8 +1252,8 @@ def can_build_mimo_paged_kv_metadata(
 ) -> bool:
     """Whether to scatter ragged slot ids into page-64 tables.
 
-    FlyPA (gfx942/gfx950, BF16 or FP8 SHUFFLE-5D) and CK FP8 paged prefill
-    both consume ``paged_kv_indptr`` / ``paged_kv_indices`` /
+    FlyPA and CK (gfx942/gfx950, BF16 or FP8 SHUFFLE-5D) both consume
+    ``paged_kv_indptr`` / ``paged_kv_indices`` /
     ``paged_kv_last_page_len``. Without these tables ``can_use_mimo_flypa_prefill``
     always returns False.
     """
@@ -1729,8 +1729,8 @@ def forward_extend_vectorized_5d(
 
     3. Direct paged FlyDSL / FlyPA / CK: gfx950 FP8 SHUFFLE-5D prefers the
        size-gated FlyDSL paged kernel over FlyPA. FlyPA is the gfx942 (and
-       gfx950 fallback) paged kernel for BF16 or FP8. Remaining FP8 pages
-       go to CK.
+       gfx950 fallback) paged kernel for BF16 or FP8. Remaining qualified
+       BF16/FP8 pages go directly to CK's MiMo page-64 specialization.
 
     4. Gather-and-linearize: every unsupported case gathers per-token K/V from the
        SHUFFLE 5D pool via ``launch_gather_shuffle_5d_to_linear``
@@ -1747,6 +1747,7 @@ def forward_extend_vectorized_5d(
     returned from ``AiterAttnBackend.forward_extend``.
     """
     asm_q, asm_k, asm_v = q, k, v
+    physical_q_tokens = q.shape[0]
     asm_output_kwargs = {}
     if MIMO_FRESH_BF16_ASM_ENABLED and is_gfx950():
         asm_q, asm_k, asm_v, physical_q_tokens = _mimo_logical_qkv_views(
@@ -1927,17 +1928,18 @@ def forward_extend_vectorized_5d(
             "paged_kv_last_page_len",
         )
     )
+    kv_vector_size = 16 // k_buf.element_size()
     expected_k_tail = (
         CK_MIMO_PREFILL_KV_HEADS,
-        CK_MIMO_PREFILL_HEAD_DIM // 16,
+        CK_MIMO_PREFILL_HEAD_DIM // kv_vector_size,
         CK_MIMO_PREFILL_PAGE_SIZE,
-        16,
+        kv_vector_size,
     )
     expected_v_tail = (
         CK_MIMO_PREFILL_KV_HEADS,
-        CK_MIMO_PREFILL_PAGE_SIZE // 16,
+        CK_MIMO_PREFILL_PAGE_SIZE // kv_vector_size,
         CK_MIMO_PREFILL_VALUE_HEAD_DIM,
-        16,
+        kv_vector_size,
     )
     # gfx950 cached BF16 full-attn prefers varlen ASM. Cached BF16 SWA can
     # instead consume the 5D cache directly through the native FlyPA kernel.
@@ -2040,12 +2042,14 @@ def forward_extend_vectorized_5d(
 
     use_direct_paged = (
         mha_batch_prefill_func is not None
+        and is_mimo_flypa_arch()
         and not is_swa_layer
         and sinks is None
         and tuple(window_size) == (-1, -1)
         and backend.input_dtype == torch.bfloat16
-        and backend.kv_cache_dtype == fp8_dtype
-        and sub_pool.dtype == fp8_dtype
+        and backend.kv_cache_dtype in (fp8_dtype, torch.bfloat16)
+        and sub_pool.dtype == backend.kv_cache_dtype
+        and (sub_pool.dtype == fp8_dtype or sub_pool.store_dtype == torch.bfloat16)
         and backend.page_size == CK_MIMO_PREFILL_PAGE_SIZE
         and layer.tp_q_head_num == CK_MIMO_PREFILL_QUERY_HEADS
         and layer.tp_k_head_num == CK_MIMO_PREFILL_KV_HEADS
@@ -2060,8 +2064,15 @@ def forward_extend_vectorized_5d(
         and tuple(k_buf.shape[1:]) == expected_k_tail
         and tuple(v_buf.shape[1:]) == expected_v_tail
         and k_buf.shape[0] == v_buf.shape[0]
-        and k_buf.element_size() == 1
-        and v_buf.element_size() == 1
+        and k_buf.element_size() in (1, 2)
+        and v_buf.element_size() == k_buf.element_size()
+        and backend.qo_indptr.dtype == torch.int32
+        and metadata.paged_kv_indptr.dtype == torch.int32
+        and metadata.paged_kv_indices.dtype == torch.int32
+        and metadata.paged_kv_last_page_len.dtype == torch.int32
+        and backend.qo_indptr.numel() >= bs0
+        and metadata.paged_kv_indptr.numel() >= bs0
+        and metadata.paged_kv_last_page_len.numel() >= bs0 - 1
     )
 
     if use_direct_paged:
@@ -2078,16 +2089,43 @@ def forward_extend_vectorized_5d(
             if sub_pool.store_dtype != sub_pool.dtype
             else v_buf
         )
-        q_local, q_descale_local = quantize_query_per_tensor_fp8(q)
-        k_descale_local = (
-            layer.k_scale if layer.k_scale is not None else backend.k_scale
+        extend_lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        logical_q_tokens = (
+            q.shape[0]
+            if extend_lengths is None
+            else sum(int(length) for length in extend_lengths)
         )
-        v_descale_local = (
-            layer.v_scale if layer.v_scale is not None else backend.v_scale
-        )
+        if logical_q_tokens < 0 or logical_q_tokens > q.shape[0]:
+            raise ValueError(
+                "MiMo CK paged prefill query metadata is inconsistent: "
+                f"logical_q_tokens={logical_q_tokens}, physical_q_tokens={q.shape[0]}"
+            )
+        q_live = q[:logical_q_tokens]
+        if sub_pool.dtype == fp8_dtype:
+            q_local, q_descale_local = quantize_query_per_tensor_fp8(q_live)
+            k_descale_local = (
+                layer.k_scale if layer.k_scale is not None else backend.k_scale
+            )
+            v_descale_local = (
+                layer.v_scale if layer.v_scale is not None else backend.v_scale
+            )
+        else:
+            q_local = q_live
+            q_descale_local = None
+            k_descale_local = None
+            v_descale_local = None
         max_kv = int(metadata.max_kv_len)
         max_q = int(metadata.max_q_len)
         q_paged = q_local.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if not getattr(backend, "_logged_mimo_ck_paged_prefill", False):
+            logger.info(
+                "Using AITER CK MiMo page-64 prefill fallback (kv_dtype=%s, "
+                "max_q=%d, max_kv=%d).",
+                sub_pool.dtype,
+                max_q,
+                max_kv,
+            )
+            backend._logged_mimo_ck_paged_prefill = True
         o = mha_batch_prefill_func(
             q_paged,
             k_paged,
@@ -2111,6 +2149,16 @@ def forward_extend_vectorized_5d(
         )
         if o.dtype != backend.input_dtype:
             o = o.to(backend.input_dtype)
+        if q_paged.shape[0] != q.shape[0]:
+            output_storage, output_live = _allocate_mimo_asm_output(
+                q,
+                q_paged.shape[0],
+                q.shape[0],
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+            )
+            output_live.copy_(o)
+            o = output_storage
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # Path 4: gather-and-linearize. SWA layers gather from the SWA sub-pool;

@@ -1889,8 +1889,8 @@ def test_gfx950_fp8_uses_aiter_flydsl_at_small_sizes(monkeypatch):
     assert "gather_slot_ids" not in captured
 
 
-def test_gfx950_bf16_prefill_skips_local_flypa(monkeypatch):
-    captured, _, _, _ = _run_flypa_prefill_case(
+def test_gfx950_bf16_prefill_uses_direct_ck_page64(monkeypatch):
+    captured, k_buf, v_buf, _ = _run_flypa_prefill_case(
         monkeypatch,
         gfx942=False,
         gfx950=True,
@@ -1898,7 +1898,14 @@ def test_gfx950_bf16_prefill_skips_local_flypa(monkeypatch):
         kv_dtype=torch.bfloat16,
     )
     assert captured["selected"] == "ck"
-    assert "gather_slot_ids" in captured
+    assert "gather_slot_ids" not in captured
+    assert captured["k"].data_ptr() == k_buf.data_ptr()
+    assert captured["v"].data_ptr() == v_buf.data_ptr()
+    assert captured["q"].dtype == torch.bfloat16
+    assert captured["kwargs"]["q_descale"] is None
+    assert captured["kwargs"]["k_descale"] is None
+    assert captured["kwargs"]["v_descale"] is None
+    assert captured["kwargs"]["kv_last_page_lens"].tolist() == [64]
 
 
 def test_gfx950_flypa_env_keeps_fresh_asm_shortcut(monkeypatch):
@@ -1960,8 +1967,8 @@ def test_gfx950_cached_asm_is_preferred_over_flypa(monkeypatch):
     assert captured.get("selected") != "flypa"
 
 
-def test_flypa_env_off_gfx942_bf16_gathers(monkeypatch):
-    captured, _, _, _ = _run_flypa_prefill_case(
+def test_flypa_env_off_gfx942_bf16_uses_direct_ck_page64(monkeypatch):
+    captured, k_buf, v_buf, _ = _run_flypa_prefill_case(
         monkeypatch,
         gfx942=True,
         gfx950=False,
@@ -1969,7 +1976,9 @@ def test_flypa_env_off_gfx942_bf16_gathers(monkeypatch):
         kv_dtype=torch.bfloat16,
     )
     assert captured["selected"] == "ck"
-    assert "gather_slot_ids" in captured
+    assert "gather_slot_ids" not in captured
+    assert captured["k"].data_ptr() == k_buf.data_ptr()
+    assert captured["v"].data_ptr() == v_buf.data_ptr()
 
 
 def test_flypa_ignored_without_gfx942_or_gfx950(monkeypatch):

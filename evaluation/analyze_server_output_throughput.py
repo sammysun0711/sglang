@@ -232,8 +232,11 @@ def filter_full_load(
     samples: List[DecodeSample],
     target_bs: int,
     ratio: float,
+    exact_bs: bool = False,
 ) -> Tuple[List[DecodeSample], int]:
     threshold = math.ceil(target_bs * ratio)
+    if exact_bs:
+        return [s for s in samples if s.running_req == target_bs], target_bs
     return [s for s in samples if s.running_req >= threshold], threshold
 
 
@@ -335,10 +338,11 @@ def compute_stats(samples: List[DecodeSample], target_bs: int) -> dict:
         return {}
     t = np.array([s.throughput for s in samples])
     mean = float(np.mean(t))
+    median = float(np.median(t))
     std = float(np.std(t, ddof=1)) if len(t) > 1 else 0.0
     return {
         "mean": mean,
-        "median": float(np.median(t)),
+        "median": median,
         "std": std,
         "cov": std / mean if mean > 0 else 0.0,
         "min": float(np.min(t)),
@@ -348,8 +352,12 @@ def compute_stats(samples: List[DecodeSample], target_bs: int) -> dict:
         "p95": float(np.percentile(t, 95)),
         "p99": float(np.percentile(t, 99)),
         "valid_samples": len(t),
-        "tps_per_request": mean / target_bs if target_bs > 0 else 0.0,
-        "tpot_ms": 1000.0 * target_bs / mean if mean > 0 else 0.0,
+        "mean_tps_per_request": mean / target_bs if target_bs > 0 else 0.0,
+        "mean_tpot_ms": 1000.0 * target_bs / mean if mean > 0 else 0.0,
+        # Use the recommended server-throughput statistic for the headline
+        # latency conversion. This also matches the MiMo alignment reports.
+        "tps_per_request": median / target_bs if target_bs > 0 else 0.0,
+        "tpot_ms": 1000.0 * target_bs / median if median > 0 else 0.0,
     }
 
 
@@ -475,7 +483,9 @@ def run_pipeline(args: argparse.Namespace) -> Tuple[
 
     for sec in sections:
         sid = sec[0].section_id
-        full_load, _ = filter_full_load(sec, args.target_bs, args.full_load_ratio)
+        full_load, _ = filter_full_load(
+            sec, args.target_bs, args.full_load_ratio, args.exact_bs
+        )
         total_full_load += len(full_load)
         resident = max(s.running_req for s in sec) if sec else 0
 
@@ -603,10 +613,13 @@ def format_text_report(
     lines.append(f"  Log File:             {filepath}")
     lines.append(f"  Analysis Time:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"  Target Batch Size:    {args.target_bs}")
-    lines.append(
-        f"  Full-Load Threshold:  >= {threshold} "
-        f"(ceil({args.target_bs} * {args.full_load_ratio}))"
-    )
+    if args.exact_bs:
+        lines.append(f"  Resident Batch Filter: == {args.target_bs}")
+    else:
+        lines.append(
+            f"  Full-Load Threshold:  >= {threshold} "
+            f"(ceil({args.target_bs} * {args.full_load_ratio}))"
+        )
     lines.append(f"  IQR Coefficient (k):  {args.iqr_k}")
     lines.append(f"  Warmup / Drain Trim:  {args.warmup_n} / {args.drain_n}")
     lines.append(f"  Gap Multiplier:       {args.gap_multiplier}")
@@ -648,9 +661,13 @@ def format_text_report(
         f"TP rank filter ({report.tp_rank_used})",
         str(report.after_tp_filter), str(report.tp_removed), "",
     ))
+    load_filter = (
+        f"Exact-resident filter (=={args.target_bs})"
+        if args.exact_bs
+        else f"Full-load filter (>={threshold})"
+    )
     lines.append(fmt.format(
-        f"Full-load filter (>={threshold})",
-        str(report.after_full_load), str(report.full_load_removed), "",
+        load_filter, str(report.after_full_load), str(report.full_load_removed), "",
     ))
     rnd_note = f"{report.total_rounds} round(s)"
     if report.short_rounds_dropped > 0:
@@ -864,6 +881,7 @@ def format_json_report(
             "log_file": filepath,
             "analysis_time": datetime.now().isoformat(),
             "target_bs": args.target_bs,
+            "exact_bs": args.exact_bs,
             "full_load_ratio": args.full_load_ratio,
             "full_load_threshold": threshold,
             "iqr_k": args.iqr_k,
@@ -956,6 +974,11 @@ def main():
     parser.add_argument(
         "--full-load-ratio", type=float, default=1.00,
         help="Full-load threshold ratio (default: 1.00, i.e. running_req must equal target_bs).",
+    )
+    parser.add_argument(
+        "--exact-bs",
+        action="store_true",
+        help="Keep only samples whose running request count exactly equals target-bs.",
     )
     parser.add_argument(
         "--iqr-k", type=float, default=1.0,

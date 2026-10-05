@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # Prefill-only client benchmark.
-# Milestone server settings: CHUNKED_PREFILL_SIZE=32768 DISABLE_RADIX_CACHE=1;
-# run the same client matrix against separately launched TBO-off/on servers.
+# Current customer-aligned server setting: CHUNKED_PREFILL_SIZE=65536. Run the
+# same client matrix against separately launched TBO/radix-cache configurations
+# and record those server-side settings with each result.
 # --flush-cache below does not disable the server's radix cache.
 #
 # DRY_RUN=1 prints commands without contacting the server or creating logs.
@@ -44,6 +45,7 @@ small_input_concurrency_list="${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_C
 short_concurrency_list="${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_short_concurrency}}"
 long_concurrency_list="${LONG_CONCURRENCY_LIST_OVERRIDE:-${default_long_concurrency}}"
 warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
+tokenize_prompt="${TOKENIZE_PROMPT:-0}"
 small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-${default_small_num_prompts}}"
 prompt_waves="${PROMPT_WAVES:-4}"
 min_num_prompts="${MIN_NUM_PROMPTS:-32}"
@@ -62,6 +64,10 @@ if [[ "${dry_run}" != "0" && "${dry_run}" != "1" ]]; then
 fi
 if ! [[ "${warmup_requests}" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "WARMUP_REQUESTS_OVERRIDE must be a non-negative integer, observed '${warmup_requests}'" >&2
+  exit 2
+fi
+if [[ "${tokenize_prompt}" != "0" && "${tokenize_prompt}" != "1" ]]; then
+  echo "TOKENIZE_PROMPT must be 0 or 1, observed '${tokenize_prompt}'" >&2
   exit 2
 fi
 require_positive_integer SMALL_INPUT_NUM_PROMPTS_OVERRIDE "${small_input_num_prompts}"
@@ -130,7 +136,8 @@ done
 
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 if [[ "${benchmark_preset}" == "customer" ]]; then
-  echo "Required milestone server settings: chunked_prefill_size=32768, disable_radix_cache=True"
+  echo "Required customer server setting: chunked_prefill_size=65536"
+  echo "Record TBO and radix-cache modes from the server log for this run."
   echo "Run separately for TBO off/on; record SGLANG_TBO_MIM_SEQ_LEN (current launcher default 2000; 8000 excludes 4K requests)."
   if [[ -n "${PROMPT_WAVES:-}${MIN_NUM_PROMPTS:-}" ]]; then
     echo "PROMPT_WAVES/MIN_NUM_PROMPTS apply only to BENCHMARK_PRESET=sweep; using customer prompt counts."
@@ -164,6 +171,9 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --num-prompts "${num_prompts}" \
         --warmup-requests "${warmup_requests}" \
         --max-concurrency "${concurrency}")
+    if [[ "${tokenize_prompt}" == "1" ]]; then
+      benchmark_cmd+=(--tokenize-prompt)
+    fi
     printf 'Command:'
     printf ' %q' "${benchmark_cmd[@]}"
     printf '\n'

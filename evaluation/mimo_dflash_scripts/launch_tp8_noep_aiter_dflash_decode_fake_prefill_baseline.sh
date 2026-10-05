@@ -29,10 +29,11 @@ case "${TARGET_MODEL_VARIANT}" in
 esac
 
 export AITER_CONFIG_FMOE="${AITER_CONFIG_FMOE:-${default_fmoe_config}}"
-export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-fp8}"
+export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-bf16}"
 export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-30001}"
 export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"
+export MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-triton_attn}"
 
 export SPECULATIVE_ALGORITHM=DFLASH
 export SPECULATIVE_DRAFT_MODEL="${SPECULATIVE_DRAFT_MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash/dflash}"
@@ -55,8 +56,10 @@ export SGLANG_SPEC_OOB_DETECTION=1
 export SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY="${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY:-1}"
 export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
 
-# Decode baseline contract: BF16 KV, no lossy Quick Reduce, and no mixed router.
-export KV_CACHE_DTYPE=bf16
+# Decode baseline contract: BF16 KV by default, no lossy Quick Reduce, and no
+# mixed router. FP8 target-KV experiments may override KV_CACHE_DTYPE while the
+# DFlash draft KV remains BF16.
+export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bf16}"
 unset ROCM_QUICK_REDUCE_QUANTIZATION
 export SGLANG_MIMO_MIXED_ROUTER=0
 
@@ -65,9 +68,15 @@ export SGLANG_MIMO_MIXED_ROUTER=0
 export SGLANG_FLYDSL_MIMO_PREFILL=0
 export SGLANG_FLYPA_MIMO_PREFILL=1
 export SGLANG_AITER_PA_DECODE_IMPL=flydsl
-export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL=flydsl
 export SGLANG_AITER_DFLASH_SWA_IMPL=flydsl
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM="${SGLANG_ENABLE_OVERLAP_PLAN_STREAM:-0}"
+if [[ "${KV_CACHE_DTYPE}" == "fp8_e4m3" ]]; then
+  export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL=gluon
+  export SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1=1
+else
+  export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL=flydsl
+  unset SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1
+fi
 export SGLANG_USE_AITER_UNIFIED_ATTN="${SGLANG_USE_AITER_UNIFIED_ATTN:-1}"
 
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
@@ -81,6 +90,7 @@ export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-204}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
 export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
 export DECODE_LOG_INTERVAL="${DECODE_LOG_INTERVAL:-1}"
+export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-300}"
 export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-1.0}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
@@ -128,6 +138,10 @@ if ! [[ "${DECODE_LOG_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
   echo "DECODE_LOG_INTERVAL must be a positive integer" >&2
   exit 2
 fi
+if ! [[ "${WATCHDOG_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "WATCHDOG_TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
 if ! [[ "${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS must be a positive integer" >&2
   exit 2
@@ -163,6 +177,11 @@ if [[ -n "${DECODE_ATTENTION_BACKEND}" ]]; then
   decode_attention_args+=(--decode-attention-backend "${DECODE_ATTENTION_BACKEND}")
 fi
 
+mm_attention_args=()
+if [[ -n "${MM_ATTENTION_BACKEND}" ]]; then
+  mm_attention_args+=(--mm-attention-backend "${MM_ATTENTION_BACKEND}")
+fi
+
 capacity_args=()
 if [[ -n "${MAX_TOTAL_TOKENS}" ]]; then
   capacity_args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
@@ -183,11 +202,12 @@ if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then
 fi
 
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, full-target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}"
-echo "Configuration: model=${MODEL}, target-format=${MIMO_TARGET_WEIGHT_FORMAT}, max-running=${MAX_RUNNING_REQUESTS}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}, preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, decode-log-interval=${DECODE_LOG_INTERVAL}, page=${PAGE_SIZE}, chunked-prefill=${CHUNKED_PREFILL_SIZE}, moe-runner=${MOE_RUNNER_BACKEND}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=disabled, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, overlap-plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}"
+echo "Configuration: model=${MODEL}, target-format=${MIMO_TARGET_WEIGHT_FORMAT}, stage2-output-dtype=${AITER_MXFP4_STAGE2_OUTPUT_DTYPE}, max-running=${MAX_RUNNING_REQUESTS}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}, preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, decode-log-interval=${DECODE_LOG_INTERVAL}, page=${PAGE_SIZE}, chunked-prefill=${CHUNKED_PREFILL_SIZE}, moe-runner=${MOE_RUNNER_BACKEND}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=disabled, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, overlap-plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}"
 echo "AITER root/configs: ${AITER_ROOT}; fmoe=$(basename -- "${AITER_CONFIG_FMOE}"); gemm=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}"); bpreshuffle=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}")"
 echo "DFlash: draft-tokens=${SPECULATIVE_NUM_DRAFT_TOKENS}, draft-model=${SPECULATIVE_DRAFT_MODEL}, draft-attention=${SPECULATIVE_DRAFT_ATTENTION_BACKEND}, draft-kv=${SPECULATIVE_DRAFT_KV_CACHE_DTYPE}, draft-window=${SPECULATIVE_DRAFT_WINDOW_SIZE}"
 echo "Simulated acceptance: length=${SGLANG_SIMULATE_ACC_LEN}, method=${SGLANG_SIMULATE_ACC_METHOD}"
 echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
+echo "Multimodal attention: ${MM_ATTENTION_BACKEND:-auto}"
 echo "Custom all-reduce: ${custom_all_reduce_status}; radix cache: ${radix_cache_status}"
 echo "Server log: ${SERVER_LOG_PATH}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
@@ -200,6 +220,7 @@ python3 -u -m sglang.launch_server \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   "${capacity_args[@]}" \
   --decode-log-interval "${DECODE_LOG_INTERVAL}" \
+  --watchdog-timeout "${WATCHDOG_TIMEOUT}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
@@ -214,6 +235,7 @@ python3 -u -m sglang.launch_server \
   --disaggregation-transfer-backend fake \
   --attention-backend aiter \
   "${decode_attention_args[@]}" \
+  "${mm_attention_args[@]}" \
   --moe-runner-backend "${MOE_RUNNER_BACKEND}" \
   --aiter-mxfp4-stage2-output-dtype "${AITER_MXFP4_STAGE2_OUTPUT_DTYPE}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \

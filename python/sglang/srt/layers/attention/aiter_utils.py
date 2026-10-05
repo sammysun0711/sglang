@@ -51,6 +51,12 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     pa_decode_gluon = None
     get_recommended_splits = None
 
+try:
+    from aiter import fmha_fwd_bf16_opus_fwd, fmha_fwd_bf16_opus_varlen_fwd
+except ImportError:  # Keep compatibility with AITER builds predating OPUS varlen.
+    fmha_fwd_bf16_opus_fwd = None
+    fmha_fwd_bf16_opus_varlen_fwd = None
+
 from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.utils import get_bool_env_var
@@ -94,6 +100,8 @@ MIMO_FRESH_BF16_SWA_VARLEN_ENABLED = get_bool_env_var(
     MIMO_FRESH_BF16_SWA_VARLEN_ENV, "false"
 )
 MIMO_FRESH_BF16_SWA_WINDOW_SIZE = 128
+MIMO_CHUNK_BF16_OPUS_SPLIT_MIN_Q = 32768
+MIMO_CHUNK_BF16_OPUS_SPLIT_MIN_KV = 262144
 DFLASH_SWA_IMPL_ENV = "SGLANG_AITER_DFLASH_SWA_IMPL"
 TARGET_VERIFY_SWA_IMPL_ENV = "SGLANG_AITER_TARGET_VERIFY_SWA_IMPL"
 
@@ -915,39 +923,106 @@ def mimo_chunk_bf16_varlen_asm(
         layer.tp_q_head_num,
         layer.v_head_dim,
     )
-    result = fmha_v3_varlen_fwd(
-        q_varlen,
-        k_varlen,
-        v_varlen,
-        backend.qo_indptr[: batch_size + 1],
-        metadata.kv_indptr[: batch_size + 1],
-        max(extend_lengths),
-        max(seq_lengths),
-        min(extend_lengths),
-        0.0,
-        layer.scaling,
-        0.0,
-        False,
-        True,
-        -1,
-        -1,
-        False,
-        False,
-        0,
-        output,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+    use_opus = (
+        fmha_fwd_bf16_opus_varlen_fwd is not None
+        and int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) == 0
     )
-    if result[0].data_ptr() != output.data_ptr():
+    if use_opus:
+        # A full 64K scheduler budget can pack one long request tail together
+        # with the next request's short head. On gfx950, OPUS group mode sizes
+        # both groups from the batch maxima and is slower for this long-KV
+        # two-sequence shape than two dense launches. Keep the split narrowly
+        # gated so ordinary short/ragged batches retain the grouped path.
+        use_split_dense_opus = (
+            fmha_fwd_bf16_opus_fwd is not None
+            and batch_size == 2
+            and total_q >= MIMO_CHUNK_BF16_OPUS_SPLIT_MIN_Q
+            and max(seq_lengths) >= MIMO_CHUNK_BF16_OPUS_SPLIT_MIN_KV
+        )
+        if use_split_dense_opus:
+            if not getattr(backend, "_logged_mimo_chunk_bf16_split_opus", False):
+                logger.info(
+                    "Using split dense OPUS gfx950 ASM for two-sequence cached "
+                    "MiMo BF16 full attention."
+                )
+                backend._logged_mimo_chunk_bf16_split_opus = True
+            q_start = 0
+            kv_start = 0
+            for q_len, kv_len in zip(extend_lengths, seq_lengths):
+                fmha_fwd_bf16_opus_fwd(
+                    q_varlen[q_start : q_start + q_len].view(
+                        1, q_len, layer.tp_q_head_num, layer.qk_head_dim
+                    ),
+                    k_varlen[kv_start : kv_start + kv_len].view(
+                        1, kv_len, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v_varlen[kv_start : kv_start + kv_len].view(
+                        1, kv_len, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    out=output[q_start : q_start + q_len].view(
+                        1, q_len, layer.tp_q_head_num, layer.v_head_dim
+                    ),
+                )
+                q_start += q_len
+                kv_start += kv_len
+            assert q_start == total_q and kv_start == total_kv
+            result_output = output
+        else:
+            if not getattr(backend, "_logged_mimo_chunk_bf16_opus", False):
+                logger.info(
+                    "Using OPUS gfx950 varlen ASM for cached MiMo BF16 full "
+                    "attention."
+                )
+                backend._logged_mimo_chunk_bf16_opus = True
+            result_output = fmha_fwd_bf16_opus_varlen_fwd(
+                q_varlen,
+                k_varlen,
+                v_varlen,
+                softmax_scale=layer.scaling,
+                causal=True,
+                seqstart_q=backend.qo_indptr[: batch_size + 1],
+                seqstart_k=metadata.kv_indptr[: batch_size + 1],
+                max_seqlen_q=max(extend_lengths),
+                max_seqlen_k=max(seq_lengths),
+                out=output,
+            )
+    else:
+        result = fmha_v3_varlen_fwd(
+            q_varlen,
+            k_varlen,
+            v_varlen,
+            backend.qo_indptr[: batch_size + 1],
+            metadata.kv_indptr[: batch_size + 1],
+            max(extend_lengths),
+            max(seq_lengths),
+            min(extend_lengths),
+            0.0,
+            layer.scaling,
+            0.0,
+            False,
+            True,
+            -1,
+            -1,
+            False,
+            False,
+            0,
+            output,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        result_output = result[0]
+    if result_output.data_ptr() != output.data_ptr():
         raise RuntimeError(
-            "gfx950 MiMo chunk BF16 varlen ASM ignored its output buffer"
+            "gfx950 MiMo cached BF16 full-attention ASM ignored its output buffer"
         )
     return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

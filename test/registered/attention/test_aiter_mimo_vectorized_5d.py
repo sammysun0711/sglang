@@ -1045,7 +1045,7 @@ def test_fresh_ragged_mimo_extend_uses_gfx950_bf16_varlen_asm(monkeypatch):
 
 
 @pytest.mark.parametrize("reported_prefix_len", [256, 0])
-def test_cached_bf16_chunk_prefill_uses_gfx950_varlen_asm(
+def test_cached_bf16_chunk_prefill_uses_gfx950_opus_varlen_asm(
     monkeypatch, reported_prefix_len
 ):
     backend, layer, forward_batch, q, k, v = _make_cached_bf16_chunk_case()
@@ -1061,24 +1061,24 @@ def test_cached_bf16_chunk_prefill_uses_gfx950_varlen_asm(
             torch.zeros((seq_len, 1, 128), dtype=torch.bfloat16),
         )
 
-    def fake_varlen_asm(q_varlen, k_varlen, v_varlen, *args):
-        out = args[15]
+    def fake_opus_varlen_asm(q_varlen, k_varlen, v_varlen, **kwargs):
+        out = kwargs["out"]
         captured.update(
             q=q_varlen,
             k=k_varlen,
             v=v_varlen,
-            cu_q=args[0],
-            cu_k=args[1],
-            max_q=args[2],
-            max_k=args[3],
-            min_q=args[4],
-            causal=args[9],
-            window_left=args[10],
-            window_right=args[11],
+            cu_q=kwargs["seqstart_q"],
+            cu_k=kwargs["seqstart_k"],
+            max_q=kwargs["max_seqlen_q"],
+            max_k=kwargs["max_seqlen_k"],
+            causal=kwargs["causal"],
             out=out,
         )
         out.fill_(11.0)
-        return [out]
+        return out
+
+    def reject_v3(*args, **kwargs):
+        raise AssertionError("OPUS-qualified BF16 chunk must not use v3 ASM")
 
     def reject_batch_prefill(*args, **kwargs):
         raise AssertionError("qualified BF16 chunk must not use CK prefill")
@@ -1086,7 +1086,13 @@ def test_cached_bf16_chunk_prefill_uses_gfx950_varlen_asm(
     monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
     monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_VARLEN_ENABLED", True)
     monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
-    monkeypatch.setattr(aiter_utils, "fmha_v3_varlen_fwd", fake_varlen_asm)
+    monkeypatch.delenv("AITER_DISABLE_FMHA_OPUS", raising=False)
+    monkeypatch.setattr(
+        aiter_utils,
+        "fmha_fwd_bf16_opus_varlen_fwd",
+        fake_opus_varlen_asm,
+    )
+    monkeypatch.setattr(aiter_utils, "fmha_v3_varlen_fwd", reject_v3)
     monkeypatch.setattr(aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather)
     monkeypatch.setattr(aiter_utils, "mha_batch_prefill_func", reject_batch_prefill)
 
@@ -1111,13 +1117,85 @@ def test_cached_bf16_chunk_prefill_uses_gfx950_varlen_asm(
     assert captured["cu_k"].tolist() == [0, 512]
     assert captured["max_q"] == 256
     assert captured["max_k"] == 512
-    assert captured["min_q"] == 256
     assert captured["causal"] is True
-    assert captured["window_left"] == -1
-    assert captured["window_right"] == -1
     assert captured["out"].shape == (256, 16, 128)
     assert captured["out"].stride(-2) == 128
     assert torch.all(output == 11.0)
+
+
+def test_ragged_cached_bf16_chunk_splits_dense_opus(monkeypatch):
+    prefix_lengths = (256, 0)
+    extend_lengths = (257, 17)
+    logical_tokens = sum(extend_lengths)
+    physical_tokens = 280
+    backend, layer, forward_batch, _, _, _ = _make_cached_bf16_ragged_case(
+        prefix_lengths=prefix_lengths,
+        extend_lengths=extend_lengths,
+    )
+    q = torch.zeros((physical_tokens, 16 * 192), dtype=torch.bfloat16)
+    k = torch.zeros((physical_tokens, 1, 192), dtype=torch.bfloat16)
+    v = torch.zeros((physical_tokens, 1, 128), dtype=torch.bfloat16)
+    captured = []
+
+    def fake_gather(k_buf, v_buf, slot_ids):
+        total_kv = slot_ids.numel()
+        return (
+            torch.zeros((total_kv, 1, 192), dtype=torch.bfloat16),
+            torch.zeros((total_kv, 1, 128), dtype=torch.bfloat16),
+        )
+
+    def fake_dense_opus(q_dense, k_dense, v_dense, **kwargs):
+        captured.append((q_dense.shape, k_dense.shape, v_dense.shape))
+        kwargs["out"].fill_(15.0)
+        return kwargs["out"]
+
+    def reject_group_opus(*args, **kwargs):
+        raise AssertionError("qualified imbalanced batch must split dense OPUS")
+
+    def reject_v3(*args, **kwargs):
+        raise AssertionError("qualified OPUS batch must not use v3 ASM")
+
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
+    monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_VARLEN_ENABLED", True)
+    monkeypatch.setattr(aiter_utils, "MIMO_CHUNK_BF16_OPUS_SPLIT_MIN_Q", 0)
+    monkeypatch.setattr(aiter_utils, "MIMO_CHUNK_BF16_OPUS_SPLIT_MIN_KV", 0)
+    monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.delenv("AITER_DISABLE_FMHA_OPUS", raising=False)
+    monkeypatch.setattr(aiter_utils, "fmha_fwd_bf16_opus_fwd", fake_dense_opus)
+    monkeypatch.setattr(
+        aiter_utils,
+        "fmha_fwd_bf16_opus_varlen_fwd",
+        reject_group_opus,
+    )
+    monkeypatch.setattr(aiter_utils, "fmha_v3_varlen_fwd", reject_v3)
+    monkeypatch.setattr(aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather)
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        bs0=3,
+        window_size=(-1, -1),
+        sinks=None,
+    ).view(physical_tokens, 16, 128)
+
+    assert captured == [
+        (
+            torch.Size([1, 257, 16, 192]),
+            torch.Size([1, 513, 1, 192]),
+            torch.Size([1, 513, 1, 128]),
+        ),
+        (
+            torch.Size([1, 17, 16, 192]),
+            torch.Size([1, 17, 1, 192]),
+            torch.Size([1, 17, 1, 128]),
+        ),
+    ]
+    assert torch.all(output[:logical_tokens] == 15.0)
+    assert torch.count_nonzero(output[logical_tokens:]) == 0
 
 
 def test_tbo_padded_cached_bf16_chunk_uses_gfx950_varlen_asm(monkeypatch):
@@ -1151,6 +1229,7 @@ def test_tbo_padded_cached_bf16_chunk_uses_gfx950_varlen_asm(monkeypatch):
     monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
     monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_VARLEN_ENABLED", True)
     monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setenv("AITER_DISABLE_FMHA_OPUS", "1")
     monkeypatch.setattr(aiter_utils, "fmha_v3_varlen_fwd", fake_varlen_asm)
     monkeypatch.setattr(aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather)
     monkeypatch.setattr(aiter_utils, "mha_batch_prefill_func", reject_batch_prefill)
@@ -1220,6 +1299,7 @@ def test_tbo_ragged_cached_bf16_batch_uses_gfx950_varlen_asm(monkeypatch):
     monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_ENABLED", True)
     monkeypatch.setattr(aiter_utils, "MIMO_FRESH_BF16_ASM_VARLEN_ENABLED", True)
     monkeypatch.setattr(aiter_utils, "is_gfx950", lambda: True)
+    monkeypatch.setenv("AITER_DISABLE_FMHA_OPUS", "1")
     monkeypatch.setattr(aiter_utils, "fmha_v3_varlen_fwd", fake_varlen_asm)
     monkeypatch.setattr(aiter_utils, "launch_gather_shuffle_5d_to_linear", fake_gather)
     monkeypatch.setattr(

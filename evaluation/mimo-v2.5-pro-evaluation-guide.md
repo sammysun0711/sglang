@@ -68,7 +68,7 @@ cd /root/workspace/sglang/evaluation
 
 ### Run decode throughput analysis
 ```python
-python3 analyze_server_output_throughput.py <path-to-server-log>
+python3 analyze_server_output_throughput.py <path-to-server-log> --target-bs <concurrency>
 ```
 
 ## 5. Run baseline single node prefill benchmark
@@ -169,27 +169,60 @@ cd /root/workspace/sglang/evaluation
 
 ### Run decode throughput analysis
 ```python
-python3 analyze_server_output_throughput.py <path-to-server-log>
+python3 analyze_server_output_throughput.py <path-to-server-log> --target-bs <concurrency>
 ```
 
-## 8. Profiling & Analysis
+## 8. Run EP8 single node decode benchmark with fake prefill
+
+### Launch server
+```bash
+cd /root/workspace/sglang/evaluation
+LOG_DIR=./logs/ep8_decode/server LOG_FILE=server.log \
+./launch_tp8_ep8_aiter_mori_mtp_decode_fake_prefill_baseline.sh
+```
+
+The default `MAX_RUNNING_REQUESTS=185` is the 64K concurrency (184) plus one.
+Keep this server running for all five input lengths.
+
+### Run decode benchmark
+Run in another terminal:
+```bash
+cd /root/workspace/sglang/evaluation
+BENCHMARK_PRESET=ep8_baseline_highest \
+LOG_DIR=./logs/ep8_decode/client \
+./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh
+```
+
+The preset uses 64K/256K/512K/768K/near-1M inputs with concurrency 184/64/32/23/16,
+OSL 1024, 32 warmup requests and `4 × concurrency` formal requests per case.
+
+### Run decode throughput analysis
+Use each case's server-log segment, after its warmup cache flush and before the
+next case starts. Do not pool different ISLs or their warmup runs.
+```bash
+python3 analyze_server_output_throughput.py <path-to-case-server-log> --target-bs <concurrency>
+```
+
+Read `Median` output throughput and `TPOT (median)` from the server-log analysis.
+
+## 9. Profiling & Analysis
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sglang_profile.sh
 ```
 
 
-## 9. Run real-MTP ShareGPT dataset accuracy gate
+## 10. Run real-MTP ShareGPT dataset accuracy gate
 ```bash
 cd /root/workspace/sglang/evaluation
 ./run_sharegpt_mtp_accuracy_test.sh
 ```
 
-## 10. Run swe-bench & accuracy benchmark test
+## 11. Run swe-bench & accuracy benchmark test
 Follow up customer's swe-bench accuracy verification guide.
 
-## 11. H200 performance evaluation
+## 12. H200 performance evaluation
 Follow up customer's shared performance data
 
-## 11. Run prefill/decode disaggregated deployment
+## 13. Run prefill/decode disaggregated deployment
 Please refer to the [PD disaggregated guide](mimo_pd_scripts/mimo-v2.5-pro-pd-disaggregated-guide.md).

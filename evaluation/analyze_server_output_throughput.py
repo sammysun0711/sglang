@@ -19,6 +19,9 @@ Pipeline:
 Usage:
     python decode_bench_analyzer.py <log_file> --target-bs 96
     python decode_bench_analyzer.py <log_file> --target-bs 194 --per-round --drift-check
+
+The legacy tpot_ms field and --max-tpot checks use mean throughput.
+median_tpot_ms is derived from median throughput: 1000 * target_bs / median.
 """
 
 import argparse
@@ -335,10 +338,11 @@ def compute_stats(samples: List[DecodeSample], target_bs: int) -> dict:
         return {}
     t = np.array([s.throughput for s in samples])
     mean = float(np.mean(t))
+    median = float(np.median(t))
     std = float(np.std(t, ddof=1)) if len(t) > 1 else 0.0
     return {
         "mean": mean,
-        "median": float(np.median(t)),
+        "median": median,
         "std": std,
         "cov": std / mean if mean > 0 else 0.0,
         "min": float(np.min(t)),
@@ -350,6 +354,7 @@ def compute_stats(samples: List[DecodeSample], target_bs: int) -> dict:
         "valid_samples": len(t),
         "tps_per_request": mean / target_bs if target_bs > 0 else 0.0,
         "tpot_ms": 1000.0 * target_bs / mean if mean > 0 else 0.0,
+        "median_tpot_ms": 1000.0 * target_bs / median if median > 0 else None,
     }
 
 
@@ -709,7 +714,10 @@ def format_text_report(
         lines.append("")
         lines.append(f"  Derived Metrics (target_bs={args.target_bs})")
         lines.append(f"    TPS/request:   {stats['tps_per_request']:>10.3f}")
-        lines.append(f"    TPOT:          {stats['tpot_ms']:>10.3f} ms")
+        lines.append(f"    TPOT (mean):   {stats['tpot_ms']:>10.3f} ms")
+        median_tpot = stats['median_tpot_ms']
+        median_tpot_text = f"{median_tpot:>10.3f} ms" if median_tpot is not None else "       N/A"
+        lines.append(f"    TPOT (median): {median_tpot_text}")
 
         if hasattr(args, 'min_tps') and args.min_tps is not None:
             tps_ok = stats['tps_per_request'] >= args.min_tps
@@ -760,7 +768,10 @@ def format_text_report(
             lines.append(f"      P99:           {s['p99']:>10.2f}")
             lines.append(f"    Derived Metrics (target_bs={args.target_bs})")
             lines.append(f"      TPS/request:   {s['tps_per_request']:>10.3f}")
-            lines.append(f"      TPOT:          {s['tpot_ms']:>10.3f} ms")
+            lines.append(f"      TPOT (mean):   {s['tpot_ms']:>10.3f} ms")
+            median_tpot = s['median_tpot_ms']
+            median_tpot_text = f"{median_tpot:>10.3f} ms" if median_tpot is not None else "       N/A"
+            lines.append(f"      TPOT (median): {median_tpot_text}")
             if hasattr(args, 'min_tps') and args.min_tps is not None:
                 tps_ok = s['tps_per_request'] >= args.min_tps
                 lines.append(f"      TPS threshold: {'>= ' + str(args.min_tps):<10s}  "

@@ -53,7 +53,7 @@ export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 # 0.01 overflowed SWA on 65k PD seqs; keep more headroom than the single-node default.
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.2}"
-export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 export ENABLE_TWO_BATCH_OVERLAP="${ENABLE_TWO_BATCH_OVERLAP:-0}"
@@ -132,11 +132,20 @@ python3 -u -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --enable-multi-layer-eagle \
-  --watchdog-time 5000 \
   --disable-cuda-graph \
+  --log-level-http warning \
+  --watchdog-time 1000000  \
   --tokenizer-worker-num 64 \
   --enable-cache-report \
   --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}' \
+  --collect-tokens-histogram \
+  --enable-metrics \
+  --bucket-time-to-first-token 0.1 0.2 0.4 0.6 0.8 1 2 4 6 8 10 20 40 60 80 100 200 400 800 1200 1800 2400 3600 5400 7200 \
+  --bucket-e2e-request-latency 0.1 0.2 0.4 0.6 0.8 1 2 4 6 8 10 20 40 60 80 100 200 400 600 1200 1800 2400 3600 5400 7200 \
+  --load-balance-method round_robin \
+  --allow-auto-truncate \
+  --enable-metrics-for-all-schedulers \
+  --disable-tokenizer-batch-decode \
   "${tbo_args[@]}" \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \

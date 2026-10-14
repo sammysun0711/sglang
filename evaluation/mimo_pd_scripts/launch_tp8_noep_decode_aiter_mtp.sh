@@ -13,7 +13,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 export HSA_NO_SCRATCH_RECLAIM=1
 
 # Native InfiniBand use GID 0 is valid. GID 1 used for RoCE.
-export SGLANG_HOST_IP="${SGLANG_HOST_IP:-172.16.1.122}"
+export SGLANG_HOST_IP="${SGLANG_HOST_IP:-10.2.80.29}"
 export HOST_IP="${HOST_IP:-${SGLANG_HOST_IP}}"
 export MC_GID_INDEX="${MC_GID_INDEX:-1}"
 #export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-mlx5_ib0,mlx5_ib1,mlx5_ib2,mlx5_ib3,mlx5_ib4,mlx5_ib5,mlx5_ib6,mlx5_ib7}"
@@ -66,12 +66,12 @@ unset SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
 
 export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
 export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-export LOG_DIR="${LOG_DIR:-/root/workspace/bench_tp8_noep_mooncake}"
-export LOG_FILE="${LOG_FILE:-decode_server.log}"
+export LOG_DIR="${LOG_DIR:-./logs/server_log-${RUN_ID}}"
+export LOG_FILE="${LOG_FILE:-pd_decode_server.log}"
 
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, KV-layout=${SGLANG_AITER_KV_CACHE_LAYOUT}"
 echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}"
-echo "PD decode: mooncake, ib-device=${DISAGGREGATION_IB_DEVICE}, gid-index=${MC_GID_INDEX}, host-ip=${SGLANG_HOST_IP}, topo=${MC_CUSTOM_TOPO_JSON}"
+echo "PD decode: mooncake, ib-device=${DISAGGREGATION_IB_DEVICE}, gid-index=${MC_GID_INDEX}, host-ip=${SGLANG_HOST_IP}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "MTP: EAGLE, steps=3, top-k=1, draft-tokens=4, multi-layer=enabled"
 
@@ -121,7 +121,10 @@ python3 -u -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --enable-multi-layer-eagle \
-  --watchdog-time 1200 \
+  --watchdog-time 5000 \
+  --decode-log-interval 1 \
+  --tokenizer-worker-num 64 \
+  --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}' \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \
   2>&1 | tee "${LOG_DIR}/${LOG_FILE}"

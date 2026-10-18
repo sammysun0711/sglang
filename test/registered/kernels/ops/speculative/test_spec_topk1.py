@@ -1,6 +1,7 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import unittest
 
@@ -147,6 +148,55 @@ class TestSpecTopk1Triton(CustomTestCase):
         self.assertEqual(topk_index.shape, (0, 1))
         self.assertEqual(draft_tokens.numel(), 0)
 
+    def test_selected_rows_preserve_first_index_ties_in_graph_replay(self):
+        # Match Qwen's wide logits and poison unused backing columns. Ties
+        # cross reduction splits, so finalization must pick the first token.
+        vocab_size = 248320
+        backing = torch.full((32, vocab_size + 64), 200.0, device=self.device)
+        logits = backing[:, :vocab_size]
+        logits.fill_(-3.0)
+        logits[:, 17] = 7.0
+        logits[:, 8197] = 7.0
+        logits[:, vocab_size - 1] = 7.0
+        rows = torch.tensor([31, 3, 19, 0, 4, 18, 7, 25], device=self.device)
+        expected = torch.max(torch.softmax(logits[rows], dim=-1), dim=-1)[1][:, None]
+        graph = torch.cuda.CUDAGraph()
+        draft_topk1_postprocess(logits, input_row_indices=rows)
+        with torch.cuda.graph(graph):
+            probabilities, indices = draft_topk1_postprocess(
+                logits, input_row_indices=rows
+            )
+        graph.replay()
+        torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            probabilities, torch.ones_like(probabilities), rtol=0, atol=0
+        )
+        logits[:, 17] = 2.0
+        rows.copy_(rows.flip(0))
+        graph.replay()
+        expected = torch.max(torch.softmax(logits[rows], dim=-1), dim=-1)[1][:, None]
+        torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+
+    def test_selected_rows_advance_only_selected_output_positions(self):
+        logits, _ = _make_logits_with_unique_argmax(
+            32, 248320, dtype=torch.float32, device=self.device, seed=42
+        )
+        rows = torch.tensor([31, 2, 7, 16, 8, 20, 1, 0], device=self.device)
+        positions = torch.arange(8, device=self.device)
+        chain = torch.full((8, 3), -1, dtype=torch.long, device=self.device)
+        probabilities, indices = draft_topk1_postprocess(
+            logits, positions, chain, 1, input_row_indices=rows
+        )
+        expected = torch.max(torch.softmax(logits[rows], dim=-1), dim=-1)[1][:, None]
+        torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+        torch.testing.assert_close(chain[:, 1:2], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            chain[:, [0, 2]], torch.full_like(chain[:, [0, 2]], -1), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            positions, torch.arange(1, 9, device=self.device), rtol=0, atol=0
+        )
+
     def test_non_contiguous_inputs_raise(self):
         logits = torch.empty((16, 4), dtype=torch.float32, device=self.device).t()
         positions = torch.arange(8, dtype=torch.long, device=self.device)[::2]
@@ -157,6 +207,31 @@ class TestSpecTopk1Triton(CustomTestCase):
             )
         with self.assertRaises(AssertionError):
             draft_topk1_postprocess(torch.empty((4, 16), device=self.device), positions)
+
+    def test_selected_rows_empty_repeated_and_int32(self):
+        logits, _ = _make_logits_with_unique_argmax(
+            4, 8193, dtype=torch.float32, device=self.device, seed=76
+        )
+        for dtype in (torch.int32, torch.int64):
+            rows = torch.tensor([3, 0, 3, 1], dtype=dtype, device=self.device)
+            probabilities, indices = draft_topk1_postprocess(
+                logits, input_row_indices=rows
+            )
+            torch.testing.assert_close(indices, logits[rows].argmax(-1, keepdim=True))
+            torch.testing.assert_close(probabilities, torch.ones_like(probabilities))
+            empty = torch.empty(0, dtype=dtype, device=self.device)
+            probabilities, indices = draft_topk1_postprocess(
+                logits, input_row_indices=empty
+            )
+            self.assertEqual(indices.shape, (0, 1))
+            self.assertEqual(probabilities.shape, (0, 1))
+
+    def test_raw_logit_near_tie_contract(self):
+        # Greedy selection uses raw logits. A rounded softmax may turn these
+        # distinct FP32 values into a tie; that is not this helper's contract.
+        logits = torch.tensor([[0.0, 1e-8]], device=self.device)
+        _, indices = draft_topk1_postprocess(logits)
+        torch.testing.assert_close(indices, torch.tensor([[1]], device=self.device))
 
 
 if __name__ == "__main__":

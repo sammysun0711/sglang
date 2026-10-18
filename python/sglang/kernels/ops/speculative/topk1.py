@@ -10,20 +10,25 @@ _DRAFT_TOPK1_BLOCK = 8192
 @triton.jit
 def _draft_topk1_partial_argmax_kernel(
     logits,
+    input_row_indices,
     partial_vals,
     partial_indices,
     logits_row_stride,
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
+    SELECT_INPUT_ROW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # int64 row base: row * stride overflows int32 once bs * vocab reaches 2^31.
     row = tl.program_id(0).to(tl.int64)
+    input_row = (
+        tl.load(input_row_indices + row).to(tl.int64) if SELECT_INPUT_ROW else row
+    )
     split = tl.program_id(1)
     offsets = split * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < vocab_size
     vals = tl.load(
-        logits + row * logits_row_stride + offsets,
+        logits + input_row * logits_row_stride + offsets,
         mask=mask,
         other=-float("inf"),
     ).to(tl.float32)
@@ -49,6 +54,7 @@ def _draft_topk1_finalize_kernel(
     draft_token_column,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    ADVANCE_POSITION: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -67,17 +73,19 @@ def _draft_topk1_finalize_kernel(
     if WRITE_DRAFT_TOKEN:
         tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
 
-    position = tl.load(positions + row)
-    tl.store(positions + row, position + 1)
+    if ADVANCE_POSITION:
+        position = tl.load(positions + row)
+        tl.store(positions + row, position + 1)
 
 
 def draft_topk1_postprocess(
     next_token_logits: torch.Tensor,
-    positions: torch.Tensor,
+    positions: torch.Tensor | None = None,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
+    input_row_indices: torch.Tensor | None = None,
 ):
-    """Argmax draft logits for topk=1 and advance positions.
+    """Argmax draft logits for topk=1, optionally advancing positions.
 
     PyTorch eager argmax reduces each row with too little parallelism for the
     GLM/DSV4 vocab widths in CUDA graph replay. This split reduction exposes
@@ -87,23 +95,35 @@ def draft_topk1_postprocess(
     into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
     buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
     is greedy and the chain probabilities are unused downstream.
+    ``input_row_indices`` selects accepted rows directly from draft-extend
+    logits, avoiding a full-vocabulary gather before the reduction.
+    Selected rows must be valid indices into ``next_token_logits``. Selection
+    uses raw logits with first-index ties; finite-precision softmax can create
+    additional ties, so equality to argmax of rounded probabilities is not
+    guaranteed. This helper is for greedy drafting, not rejection sampling.
     """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
-    assert positions.ndim == 1
-    assert positions.is_contiguous()
-    assert positions.shape[0] == next_token_logits.shape[0]
-    assert positions.device == next_token_logits.device
+    bs, vocab_size = next_token_logits.shape
+    if input_row_indices is not None:
+        assert input_row_indices.ndim == 1 and input_row_indices.is_contiguous()
+        assert input_row_indices.device == next_token_logits.device
+        assert input_row_indices.dtype in (torch.int32, torch.int64)
+        bs = input_row_indices.numel()
+    if positions is not None:
+        assert positions.ndim == 1
+        assert positions.is_contiguous()
+        assert positions.shape[0] == bs
+        assert positions.device == next_token_logits.device
     write_draft_token = draft_tokens is not None
     if write_draft_token:
         assert draft_tokens.ndim == 2
         assert draft_tokens.dtype == torch.long
         assert draft_tokens.device == next_token_logits.device
-        assert draft_tokens.shape[0] == next_token_logits.shape[0]
+        assert draft_tokens.shape[0] == bs
         assert draft_tokens.stride(1) == 1
         assert 0 <= draft_token_column < draft_tokens.shape[1]
 
-    bs, vocab_size = next_token_logits.shape
     topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
     topk_index = torch.empty(
         (bs, 1), dtype=torch.int64, device=next_token_logits.device
@@ -122,11 +142,13 @@ def draft_topk1_postprocess(
 
     _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
         next_token_logits,
+        input_row_indices if input_row_indices is not None else topk_index,
         partial_vals,
         partial_indices,
         next_token_logits.stride(0),
         vocab_size,
         num_splits,
+        SELECT_INPUT_ROW=input_row_indices is not None,
         BLOCK=block,
         num_warps=8,
     )
@@ -138,12 +160,13 @@ def draft_topk1_postprocess(
         partial_indices,
         topk_p,
         topk_index,
-        positions,
+        positions if positions is not None else topk_index,
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        ADVANCE_POSITION=positions is not None,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
     )

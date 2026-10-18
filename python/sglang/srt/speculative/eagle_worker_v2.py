@@ -196,6 +196,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        self._hip_topk1_fusion = (
+            _is_hip
+            and envs.SGLANG_HIP_MTP_TOPK1_FUSION.get()
+            and is_qwen_qsa(self.draft_runner.model_config.hf_config)
+        )
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -694,13 +699,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk == 1
             and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
         )
-        # Materialize the chain directly only when the CUDA kernel can write
+        # Materialize the chain directly only when the fused kernel can write
         # every subsequent column. Other topk=1 paths retain the token list and
         # assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
         if (
             topk1_chain_fits
-            and _is_cuda
+            and (_is_cuda or self._hip_topk1_fusion)
             and self.hot_token_id is None
             and not get_spec().speculative_use_rejection_sampling
         ):
@@ -772,8 +777,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
-                elif self.topk == 1 and not _is_hip:
-                    if _is_cuda:
+                elif self.topk == 1 and (not _is_hip or self._hip_topk1_fusion):
+                    if _is_cuda or self._hip_topk1_fusion:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -959,15 +964,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if self._hip_topk1_fusion and self.topk == 1 and not use_rejection_sampling:
+            topk_p, topk_index = draft_topk1_postprocess(
+                logits_output.next_token_logits
+            )
+            probs = None
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1095,16 +1106,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
+        fused_selected_topk1 = (
+            self._hip_topk1_fusion
+            and self.topk == 1
+            and not get_spec().speculative_use_rejection_sampling
+        )
+        if not fused_selected_topk1:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if get_spec().speculative_use_rejection_sampling:
+        if fused_selected_topk1:
+            ret_topk_p, ret_topk_index = draft_topk1_postprocess(
+                draft_logits_output.next_token_logits,
+                input_row_indices=select_index,
+            )
+            ret_draft_probs = None
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,

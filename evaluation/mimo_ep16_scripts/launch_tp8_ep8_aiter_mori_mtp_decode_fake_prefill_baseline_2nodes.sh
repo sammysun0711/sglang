@@ -222,6 +222,7 @@ python3 -u -m sglang.launch_server \
   --dist-init-addr "${DIST_INIT_ADDR}" \
   --moe-a2a-backend mori \
   --moe-runner-backend aiter \
+  --moe-dense-tp-size 1 \
   --deepep-mode "${MORI_MODE}" \
   "${ep_args[@]}" \
   --tokenizer-worker-num "${TOKENIZER_WORKER_NUM}" \

@@ -10,7 +10,7 @@ export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPAT
 export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE="${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE:-${AITER_ROOT}/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_mimo_v2_5_pro.csv}"
 export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE="${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE:-${AITER_ROOT}/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_mimo_v2_5_pro.csv}"
 
-TARGET_MODEL_VARIANT="${TARGET_MODEL_VARIANT:-fp8}"
+TARGET_MODEL_VARIANT="${TARGET_MODEL_VARIANT:-mxfp4}"
 case "${TARGET_MODEL_VARIANT}" in
   fp8)
     export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
@@ -18,7 +18,7 @@ case "${TARGET_MODEL_VARIANT}" in
     default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2_5_pro_b16_tuned_fmoe.csv"
     ;;
   mxfp4)
-    export MODEL="${MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash}"
+    export MODEL="${MODEL:-/models/MiMo-V2.6-Pro-RL}"
     export MIMO_TARGET_WEIGHT_FORMAT=mxfp4
     default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2_5_pro_tuned_fmoe.csv"
     ;;
@@ -36,7 +36,7 @@ export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"
 export MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-triton_attn}"
 
 export SPECULATIVE_ALGORITHM=DFLASH
-export SPECULATIVE_DRAFT_MODEL="${SPECULATIVE_DRAFT_MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash/dflash}"
+export SPECULATIVE_DRAFT_MODEL="${SPECULATIVE_DRAFT_MODEL:-/models/MiMo-V2.6-Pro-RL/dflash}"
 export SPECULATIVE_NUM_DRAFT_TOKENS=8
 export SPECULATIVE_DRAFT_ATTENTION_BACKEND=aiter
 export SPECULATIVE_DRAFT_KV_CACHE_DTYPE=bf16

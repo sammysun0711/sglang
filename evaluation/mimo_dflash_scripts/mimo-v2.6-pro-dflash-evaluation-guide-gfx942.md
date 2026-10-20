@@ -6,12 +6,6 @@
 docker run -it --name mimo-sgl-opt-gfx942 --ipc=host --network=host --privileged --security-opt seccomp=unconfined --cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE --device=/dev/kfd --device=/dev/dri --device=/dev/mem  -v $HOME:/root/workspace  -v /data/models:/models  rocm/sgl-dev:v0.5.11-rocm720-mi30x-20260510
 ```
 
-### gfx950
-
-```bash
-docker run -it --name mimo-sgl-opt-gfx950 --ipc=host --network=host --privileged --security-opt seccomp=unconfined --cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE --device=/dev/kfd --device=/dev/dri --device=/dev/mem  -v $HOME:/root/workspace  -v /data/models:/models  rocm/sgl-dev:v0.5.11-rocm720-mi35x-20260510
-```
-
 ## 2. Environment setup
 
 ### Clean up pre-installed environment
@@ -54,17 +48,17 @@ pip install flydsl==0.3.2
 
 Baseline prefill keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache
 
-### Launch TBO-off server
+### Launch TBO-off server with gfx942
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
 MEM_FRACTION_STATIC=0.80 \
-CHUNKED_PREFILL_SIZE=65536 \
+CHUNKED_PREFILL_SIZE=32768 \
 DISABLE_RADIX_CACHE=1 \
 ENABLE_TWO_BATCH_OVERLAP=0 \
 MAX_RUNNING_REQUESTS=96 \
 SGLANG_DFLASH_PERFORMANCE_MODE=1 \
-./launch_tp8_noep_aiter_dflash_accuracy_baseline.sh
+./launch_tp8_noep_aiter_dflash_accuracy_baseline_gfx942.sh
 ```
 
 ### Run prefill benchmark
@@ -80,18 +74,14 @@ TBO-on server and run the same client matrix:
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
 MEM_FRACTION_STATIC=0.75 \
-CHUNKED_PREFILL_SIZE=65536 \
+CHUNKED_PREFILL_SIZE=32768 \
 DISABLE_RADIX_CACHE=1 \
 ENABLE_TWO_BATCH_OVERLAP=1 \
 SGLANG_TBO_MIM_SEQ_LEN=2000 \
 MAX_RUNNING_REQUESTS=32 \
 SGLANG_DFLASH_PERFORMANCE_MODE=1 \
-./launch_tp8_noep_aiter_dflash_accuracy_baseline.sh
+./launch_tp8_noep_aiter_dflash_accuracy_baseline_gfx942.sh
 ```
-
-The qualified TBO-on memory fraction is `0.75`. The `0.80` configuration can
-exhaust transient HSA memory even though the static KV pools themselves are
-not full.
 
 ## 4. Run baseline single node decode benchmark with fake prefill
 
@@ -120,14 +110,14 @@ MEM_FRACTION_STATIC=0.85 \
 DISABLE_RADIX_CACHE=1 \
 SWA_FULL_TOKENS_RATIO=0.016 \
 MAX_RUNNING_REQUESTS=286 \
-  ./launch_tp8_noep_aiter_dflash_decode_fake_prefill_baseline.sh
+  ./launch_tp8_noep_aiter_dflash_decode_fake_prefill_baseline_gfx942.sh
 ```
 
 ### Run the matching decode point
 
 ```bash
 cd /sgl-workspace/sglang/evaluation
-CASE_SPECS='65532|65536|64k|285' \
+CASE_SPECS='65532|65536|64k|128' \
 PROMPT_WAVES=4 \
 WARMUP_REQUESTS=32 \
 ./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh

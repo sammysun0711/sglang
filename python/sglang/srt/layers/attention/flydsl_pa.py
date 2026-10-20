@@ -148,6 +148,9 @@ def PagedAttention(
         assert page_size == 32
         assert head_dim_qk == head_dim_v == 128
     num_BN_per_page = page_size // BN
+    # One page toggles the ping-pong buffer once per BN tile. Three warmup
+    # pages leave buffer 1 for even tile counts, and buffer 0 for odd counts.
+    first_page_lds_buffer = 1 ^ (num_BN_per_page & 1)
     LOG2E = 1.4426950408889634
     sm_scale_log2 = float(LOG2E / (head_dim_qk**0.5))
 
@@ -438,15 +441,14 @@ def PagedAttention(
                 fx.rocdl.sched_barrier(0)
                 lds_buff_id = lds_buff_id^1
 
-            return lds_buff_id, cur_max, l_in, kv_page_id1, kv_page_id2, kv_page_id3, kv_page_id4
+            return cur_max, l_in, kv_page_id1, kv_page_id2, kv_page_id3, kv_page_id4
 
         if wave_m == 1:
             gpu.barrier()
         cur_max, l_in, page0, page1, page2, page3 = fx.Float32(float("-inf")), fx.Float32(0.0), 0,0,0,ptr_kv_page_table[0]
-        lds_buff_id = 1
-        lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(-3, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
-        lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(-2, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
-        lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(-1, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
+        cur_max, l_in, page0, page1, page2, page3 = kv_step(-3, 1, cur_max, l_in, page0, page1, page2, page3)
+        cur_max, l_in, page0, page1, page2, page3 = kv_step(-2, first_page_lds_buffer, cur_max, l_in, page0, page1, page2, page3)
+        cur_max, l_in, page0, page1, page2, page3 = kv_step(-1, 1, cur_max, l_in, page0, page1, page2, page3)
 
         if fx.const_expr(is_causal):
             # Bottom-right causal diagonal for this Q tile:
@@ -455,7 +457,7 @@ def PagedAttention(
             # Pages [0, causal_full_pages) are valid for even the first query
             # row in this tile, so they need no element mask.  Round this
             # prefix down to an even count because the hot loop processes two
-            # pages with compile-time LDS buffer IDs 0/1.
+            # pages with compile-time LDS buffer selectors.
             causal_base = kv_len - full_qo_len + q_pos0
             causal_full_pages = (causal_base + 1) // page_size
             num_kv_pages_valid = (causal_full_pages // 2) * 2
@@ -483,30 +485,30 @@ def PagedAttention(
         results = [cur_max, l_in, page0, page1, page2, page3]
         for page_i, state in range(0, num_kv_pages_valid, 2, init=results):
             cur_max, l_in, page0, page1, page2, page3 = state
-            lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
-            lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i+1, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
+            cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i, first_page_lds_buffer, cur_max, l_in, page0, page1, page2, page3)
+            cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i+1, 1, cur_max, l_in, page0, page1, page2, page3)
             results = yield [cur_max, l_in, page0, page1, page2, page3]
 
         # Process the specialized tail in page pairs.  Non-causal has only one
         # or two tail pages; causal may have several pages intersected by this
         # Q tile's diagonal.
-        # Keep lds_buff_id as the compile-time constants 0/1: kv_step uses it
-        # to index Python fragment lists, so deriving it from the dynamic
-        # induction variable (page_i & 1) is not legal FlyDSL.
+        # Pass constexpr buffer IDs and return only dynamic attention state.
+        # Assigning a returned buffer ID inside this runtime if promotes it to
+        # an scf.if result, which cannot index the Python fragment lists.
         for page_i, state in range(
             num_kv_pages_valid, num_kv_pages_to_process, 2, init=results
         ):
             cur_max, l_in, page0, page1, page2, page3 = state
-            lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(
+            cur_max, l_in, page0, page1, page2, page3 = kv_step(
                 page_i,
-                lds_buff_id, cur_max, l_in, page0, page1, page2, page3,
+                first_page_lds_buffer, cur_max, l_in, page0, page1, page2, page3,
                 is_all_kv_valid=False,
             )
             
             if fx.Int32(page_i + 1) < num_kv_pages_to_process:
-                lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(
+                cur_max, l_in, page0, page1, page2, page3 = kv_step(
                     page_i+1,
-                    lds_buff_id, cur_max, l_in, page0, page1, page2, page3,
+                    1, cur_max, l_in, page0, page1, page2, page3,
                     is_all_kv_valid=False,
                 )
             results = yield [cur_max, l_in, page0, page1, page2, page3]

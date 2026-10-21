@@ -20,7 +20,8 @@ case "${TARGET_MODEL_VARIANT}" in
   mxfp4)
     export MODEL="${MODEL:-/models/MiMo-V2.6-Pro-RL}"
     export MIMO_TARGET_WEIGHT_FORMAT=mxfp4
-    default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2.6_a16w4_tuned_fmoe.csv"
+    default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2.6_a16w4_tuned_fmoe.csv" # A16W4
+    #default_fmoe_config="${AITER_ROOT}/aiter/mimo_v2.6_a16w4_a8w4_tuned_fmoe.csv"                   # A8W4
     ;;
   *)
     echo "TARGET_MODEL_VARIANT must be fp8 or mxfp4, observed '${TARGET_MODEL_VARIANT}'" >&2

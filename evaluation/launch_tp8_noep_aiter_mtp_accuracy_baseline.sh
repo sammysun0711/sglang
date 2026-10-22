@@ -17,6 +17,8 @@ export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
 unset ROCM_QUICK_REDUCE_QUANTIZATION
 export SGLANG_MIMO_MIXED_ROUTER=0
 
+# gfx942 BF16 prefill uses FlyPA for full and sliding-window attention.
+# The gfx950-only FlyDSL prefill and ASM paths retain their hardware guards.
 export SGLANG_FLYPA_MIMO_PREFILL="${SGLANG_FLYPA_MIMO_PREFILL:-1}"
 export SGLANG_FLYDSL_MIMO_PREFILL="${SGLANG_FLYDSL_MIMO_PREFILL:-1}"
 
@@ -65,7 +67,7 @@ export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 export LOG_DIR="${LOG_DIR:-./logs/accuracy_${RUN_ID}}"
 export LOG_FILE="${LOG_FILE:-server_tp8_flydsl_accuracy.log}"
 
-echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
+echo "Attention hybrid: prefill-flypa=${SGLANG_FLYPA_MIMO_PREFILL}, prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
 
 echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=1, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"

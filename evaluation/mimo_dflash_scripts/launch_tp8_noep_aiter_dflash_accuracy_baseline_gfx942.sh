@@ -62,8 +62,8 @@ unset ROCM_QUICK_REDUCE_QUANTIZATION
 export ENABLE_PREFILL_QUICK_REDUCE=0
 export SGLANG_MIMO_MIXED_ROUTER=0
 
-# Full prompt attention stays on the gfx950 BF16 ASM path. Cached target SWA
-# prefill and DFlash verification use the qualified AITER-hosted FlyPA paths.
+# Full-attention prefill uses the gfx942 FlyPA path. Qualified target SWA
+# prefill and DFlash verification use AITER-hosted page-64 5D FlyPA.
 export SGLANG_FLYDSL_MIMO_PREFILL=0
 export SGLANG_FLYPA_MIMO_PREFILL=1
 export SGLANG_AITER_PA_DECODE_IMPL=flydsl

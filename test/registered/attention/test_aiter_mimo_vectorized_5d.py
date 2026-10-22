@@ -2087,7 +2087,21 @@ def test_gfx942_bf16_flypa_requires_paged_kv_metadata(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_bf16_flypa_matches_torch_with_causal_partial_last_page():
+@pytest.mark.parametrize(
+    "page_size,query_length,kv_length",
+    [
+        (32, 16, 23),
+        (32, 65, 141),
+        (64, 16, 23),
+        (64, 32, 70),
+        (64, 129, 257),
+        (128, 65, 141),
+        (128, 257, 513),
+    ],
+)
+def test_bf16_flypa_matches_torch_with_causal_partial_last_page(
+    page_size, query_length, kv_length
+):
     arch = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).gcnArchName.split(":", 1)[0]
@@ -2096,10 +2110,7 @@ def test_bf16_flypa_matches_torch_with_causal_partial_last_page():
 
     torch.manual_seed(20260819)
     device = torch.device("cuda")
-    page_size = 64
-    num_pages = 2
-    query_length = 32
-    kv_length = 70
+    num_pages = math.ceil(kv_length / page_size)
     num_qo_heads = 16
     num_kv_heads = 1
     head_dim_qk = 192
@@ -2178,9 +2189,13 @@ def test_bf16_flypa_matches_torch_with_causal_partial_last_page():
 
     cu_seqlens_q = torch.tensor([0, query_length], dtype=torch.int32, device=device)
     kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
-    kv_page_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    # The prefetch pipeline looks ahead past the final logical page.
+    kv_page_indices = torch.zeros(num_pages + 8, dtype=torch.int32, device=device)
+    kv_page_indices[:num_pages] = torch.arange(
+        num_pages, dtype=torch.int32, device=device
+    )
     kv_last_page_lens = torch.tensor(
-        [kv_length - page_size], dtype=torch.int32, device=device
+        [kv_length - (num_pages - 1) * page_size], dtype=torch.int32, device=device
     )
     unit_scale = torch.ones((), dtype=torch.float32, device=device)
 

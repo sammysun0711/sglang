@@ -25,10 +25,11 @@ elif [[ -v ROCM_QUICK_REDUCE_QUANTIZATION ]]; then
 else
   echo "ROCM_QUICK_REDUCE_QUANTIZATION is unset"
 fi
-# Accuracy baseline keeps mixed router and FlyDSL prefill disabled by default;
-# ablation runners may override these with explicit environment settings.
+# Keep mixed router disabled by default; ablation runners may override it.
 export SGLANG_MIMO_MIXED_ROUTER="${SGLANG_MIMO_MIXED_ROUTER:-0}"
 
+# gfx942 BF16 prefill uses FlyPA for full and sliding-window attention.
+# The gfx950-only FlyDSL prefill and ASM paths retain their hardware guards.
 export SGLANG_FLYPA_MIMO_PREFILL="${SGLANG_FLYPA_MIMO_PREFILL:-1}"
 export SGLANG_FLYDSL_MIMO_PREFILL="${SGLANG_FLYDSL_MIMO_PREFILL:-1}"
 
@@ -67,7 +68,7 @@ fi
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-1.0}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
-export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
+export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bf16}"
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT="${SGLANG_MIMO_FUSED_RMS_MOE_QUANT:-1}"
@@ -84,7 +85,7 @@ export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 export LOG_DIR="${LOG_DIR:-./logs/decode_fake_prefill_baseline_${RUN_ID}}"
 export LOG_FILE="${LOG_FILE:-decode_fake_prefill_baseline.log}"
 
-echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
+echo "Attention hybrid: prefill-flypa=${SGLANG_FLYPA_MIMO_PREFILL}, prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, SWA/sink and ordinary decode=AITER/Gluon"
 
 echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, decode-log-interval=${DECODE_LOG_INTERVAL}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, mtp=fake:${SGLANG_SIMULATE_ACC_LEN}/${SGLANG_SIMULATE_ACC_METHOD}, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=off"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"

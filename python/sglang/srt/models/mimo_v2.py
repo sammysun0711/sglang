@@ -1594,7 +1594,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         ), "forward() should not be called in encoder_only mode"
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and (
+            not self._is_multimodal or input_embeds is not None
+        ):
             hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
                 input_ids,
                 positions,
@@ -1603,7 +1605,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            model_output = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1611,6 +1613,12 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 positions=positions,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if self.capture_aux_hidden_states:
+                hidden_states, hidden_states_before_norm, aux_hidden_states = (
+                    model_output
+                )
+            else:
+                hidden_states, hidden_states_before_norm = model_output
         else:
             hidden_states, hidden_states_before_norm = self.model(
                 input_ids,

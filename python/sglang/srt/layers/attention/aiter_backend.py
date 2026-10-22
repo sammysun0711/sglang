@@ -2823,6 +2823,7 @@ class AiterAttnBackend(AttentionBackend):
                     bs0,
                     window_size,
                     sinks,
+                    kv_cache_written=save_kv_cache and k is not None,
                 )
 
             # NHD path — original aiter paged batch_prefill.

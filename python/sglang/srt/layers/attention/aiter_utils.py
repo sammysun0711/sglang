@@ -396,9 +396,7 @@ def prepare_flydsl_swa_forward_metadata(
         )
     page_indices = backend._flydsl_dflash_swa_kv_indices
     block_size = 32
-    _flatten_page_table_to_csr_kernel[
-        (batch_size, triton.cdiv(max_pages, block_size))
-    ](
+    _flatten_page_table_to_csr_kernel[(batch_size, triton.cdiv(max_pages, block_size))](
         block_tables,
         page_indptr,
         page_indices,
@@ -543,8 +541,7 @@ def _mimo_effective_prefix_lengths(forward_batch: ForwardBatch) -> list[int] | N
         return reported
 
     derived = [
-        int(seq_len) - int(extend_len)
-        for seq_len, extend_len in zip(seq_lens, extend)
+        int(seq_len) - int(extend_len) for seq_len, extend_len in zip(seq_lens, extend)
     ]
     return derived if all(length >= 0 for length in derived) else reported
 
@@ -1777,6 +1774,134 @@ def run_mimo_flydsl_fp8_prefill(
     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
+def _mimo_gfx942_paged_swa_prefill(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    bs0: int,
+    window_size,
+    sinks,
+) -> torch.Tensor | None:
+    """Use native BF16 FlyPA for gfx942 MiMo SWA after the cache write.
+
+    Full and SWA allocators use different physical page IDs. The existing
+    paged runner translates the table once per forward batch and retains
+    per-request page counts, last-page lengths, sinks and prefill masking.
+    """
+    metadata = backend.forward_metadata
+    lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if getattr(metadata, "swa_page_table", None) is None:
+        return None
+    if (
+        backend.page_size != CK_MIMO_PREFILL_PAGE_SIZE
+        or backend.input_dtype != torch.bfloat16
+        or backend.kv_cache_dtype != torch.bfloat16
+        or layer.sliding_window_size is None
+        or int(layer.sliding_window_size) <= 0
+        or tuple(window_size) != (int(layer.sliding_window_size), -1)
+        or float(backend.logits_soft_cap) != 0.0
+        or getattr(layer, "mimo_original_v_head_dim", None) != 128
+        or (
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            layer.tp_v_head_num,
+            layer.head_dim,
+            layer.qk_head_dim,
+            layer.v_head_dim,
+        )
+        != (16, 1, 1, 192, 192, 128)
+        or q.dtype != torch.bfloat16
+        or q.ndim != 2
+        or q.shape[1] != 16 * 192
+        or q.stride(-1) != 1
+        or lengths is None
+        or len(lengths) != bs0 - 1
+        or not lengths
+        or any(int(length) <= 0 for length in lengths)
+    ):
+        return None
+    if sinks is not None and not (
+        isinstance(sinks, torch.Tensor)
+        and sinks.dtype == torch.float32
+        and sinks.device == q.device
+        and sinks.shape == (16,)
+        and sinks.is_contiguous()
+    ):
+        return None
+    tables = [
+        backend.qo_indptr,
+        getattr(metadata, "paged_kv_indptr", None),
+        getattr(metadata, "paged_kv_indices", None),
+        getattr(metadata, "paged_kv_last_page_len", None),
+    ]
+    if any(
+        not isinstance(table, torch.Tensor)
+        or table.dtype != torch.int32
+        or table.device != q.device
+        or table.ndim != 1
+        or not table.is_contiguous()
+        for table in tables
+    ):
+        return None
+    if (
+        tables[0].numel() < bs0
+        or tables[1].numel() < bs0
+        or tables[3].numel() < bs0 - 1
+    ):
+        return None
+    pool = backend.token_to_kv_pool
+    mapping = getattr(pool, "layers_mapping", {}).get(layer.layer_id)
+    if (
+        mapping is None
+        or not mapping[1]
+        or not hasattr(pool, "translate_loc_from_full_to_swa")
+    ):
+        return None
+    sub_pool = pool.swa_kv_pool
+    if sub_pool.dtype != torch.bfloat16 or sub_pool.store_dtype != torch.bfloat16:
+        return None
+    k_buf = sub_pool.k_buffer[mapping[0] - sub_pool.start_layer]
+    v_buf = sub_pool.v_buffer[mapping[0] - sub_pool.start_layer]
+    if (
+        k_buf.ndim != 5
+        or v_buf.ndim != 5
+        or k_buf.shape[0] != v_buf.shape[0]
+        or tuple(k_buf.shape[1:]) != (1, 24, 64, 8)
+        or tuple(v_buf.shape[1:]) != (1, 8, 128, 8)
+        or k_buf.dtype != torch.bfloat16
+        or v_buf.dtype != torch.bfloat16
+        or k_buf.device != q.device
+        or v_buf.device != q.device
+        or not k_buf.is_contiguous()
+        or not v_buf.is_contiguous()
+    ):
+        return None
+    logical_tokens = sum(int(length) for length in lengths)
+    if logical_tokens > q.shape[0]:
+        raise ValueError("MiMo gfx942 paged SWA query lengths exceed the query buffer")
+    if not getattr(backend, "_logged_gfx942_mimo_paged_swa_prefill", False):
+        logger.info(
+            "Using gfx942 FlyPA MiMo BF16 SWA page-64 5D prefill "
+            "(window=%s, max_q=%d, max_kv=%d); no LINEAR K/V gather.",
+            window_size,
+            int(metadata.max_q_len),
+            int(metadata.max_kv_len),
+        )
+        backend._logged_gfx942_mimo_paged_swa_prefill = True
+    return run_mimo_flypa_swa_prefill(
+        backend,
+        q[:logical_tokens],
+        layer,
+        bs0,
+        k_buf,
+        v_buf,
+        metadata,
+        sinks,
+        output_token_count=q.shape[0],
+    )
+
+
 def forward_extend_vectorized_5d(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -1787,10 +1912,12 @@ def forward_extend_vectorized_5d(
     bs0: int,
     window_size,
     sinks,
+    kv_cache_written: bool = True,
 ) -> torch.Tensor:
     """``forward_extend`` specialization for the SHUFFLE 5D KV pool.
 
-    Four sub-paths handle vectorized-5D extend:
+    Qualified gfx942 BF16 MiMo SWA uses native page-64 FlyPA first, for both
+    fresh and cached chunks. Other extends follow these existing sub-paths:
 
     1. Fresh-prompt shortcut: when every request in the batch has zero
        ``extend_prefix_lens`` (first chunk of a fresh prompt, or any
@@ -1815,12 +1942,28 @@ def forward_extend_vectorized_5d(
        raw fp8 with the per-tensor descales — aiter's LINEAR-mode kernel
        supports fp8 K/V/Q natively, so no host-side dequant is needed.
 
-    The optimized paths are deliberately narrow. SWA/sink, unsupported dtypes,
-    other head shapes, and missing metadata retain the established fallback.
+    The optimized paths are deliberately narrow. Unsupported dtypes, head
+    shapes, and missing metadata retain the established fallback.
 
     Returns the ``(T, H_q * D_v)`` attention output, ready to be
     returned from ``AiterAttnBackend.forward_extend``.
     """
+    # The gfx950 routing below stays unchanged. On gfx942, handle both fresh
+    # and cached SWA here so the fresh-prompt shortcut cannot select page-1.
+    if (
+        is_gfx942()
+        and not is_gfx950()
+        and kv_cache_written
+        and layer.sliding_window_size is not None
+        and layer.sliding_window_size > 0
+        and get_bool_env_var(FLYPA_MIMO_PREFILL_ENV, "false")
+    ):
+        paged_swa_output = _mimo_gfx942_paged_swa_prefill(
+            backend, q, layer, forward_batch, bs0, window_size, sinks
+        )
+        if paged_swa_output is not None:
+            return paged_swa_output
+
     asm_q, asm_k, asm_v = q, k, v
     physical_q_tokens = q.shape[0]
     asm_output_kwargs = {}
@@ -2743,9 +2886,7 @@ def _ensure_swa_target_verify_workspace(
     capacity_partitions = max(max_partitions, capacity_partitions)
     max_rows = capacity_bs * capacity_q
     query_group_size = num_q_heads // num_kv_heads
-    scalar_numel = (
-        max_rows * num_kv_heads * capacity_partitions * query_group_size
-    )
+    scalar_numel = max_rows * num_kv_heads * capacity_partitions * query_group_size
 
     backend._swa_target_verify_offsets = torch.arange(
         1, capacity_q + 1, dtype=context_dtype, device=device

@@ -23,40 +23,14 @@ tokenize_prompt="${TOKENIZE_PROMPT:-0}"
 fake_prefill="${FAKE_PREFILL:-0}"
 
 export SGLANG_TORCH_PROFILER_DIR="${profile_output_dir}"
-
-echo "Profiling input=${input_tokens}, output=${output_tokens}, concurrency=${max_concurrency}, prompts=${num_prompts}, warmups=${warmup_requests}, start_step=${profile_start_step:-immediate}, by_stage=${profile_by_stage}, fake_prefill=${fake_prefill}"
-echo "Profile output: ${profile_output_dir}"
-
-profile_args=(
-    --profile
-    --profile-output-dir "${profile_output_dir}"
-    --profile-prefix "${profile_prefix}"
-)
-read -r -a profile_activity_args <<<"${profile_activities}"
-profile_args+=(--profile-activities "${profile_activity_args[@]}")
-if [[ -n "${profile_start_step}" ]]; then
-    profile_args+=(--profile-start-step "${profile_start_step}")
-fi
-if [[ -n "${profile_num_steps}" ]]; then
-    profile_args+=(--profile-num-steps "${profile_num_steps}")
-fi
-if [[ "${profile_by_stage}" == "1" ]]; then
-    profile_args+=(--profile-by-stage)
-fi
-if [[ -n "${profile_stages}" ]]; then
-    read -r -a profile_stage_args <<<"${profile_stages}"
-    profile_args+=(--profile-stages "${profile_stage_args[@]}")
-fi
-if [[ "${tokenize_prompt}" == "1" ]]; then
-    profile_args+=(--tokenize-prompt)
-fi
-if [[ "${fake_prefill}" == "1" ]]; then
-    profile_args+=(--fake-prefill)
-fi
-
 model_args=(--model "${model_path}")
 if [[ -n "${served_model_name}" ]]; then
     model_args+=(--served-model-name "${served_model_name}")
+fi
+
+tokenize_args=()
+if [[ "${tokenize_prompt}" == "1" ]]; then
+    tokenize_args+=(--tokenize-prompt)
 fi
 
 python3 -m sglang.bench_serving \
@@ -74,4 +48,5 @@ python3 -m sglang.bench_serving \
     --num-prompts "${num_prompts}" \
     --warmup-requests "${warmup_requests}" \
     --max-concurrency "${max_concurrency}" \
-    "${profile_args[@]}"
+    --profile \
+    "${tokenize_args[@]}"

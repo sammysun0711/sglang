@@ -83,6 +83,24 @@ else
           "1047548|1047548|1m|16"
       )
       ;;
+    ep16_baseline_highest)
+      cases=(
+          "65536|65536|64k|368"
+          "262144|262144|256k|160"
+          "524288|524288|512k|96"
+          "786432|786432|768k|64"
+          "1047548|1047548|1m|52"
+      )
+      ;;
+    tp16_baseline_highest)
+      cases=(
+          "65536|65536|64k|224"
+          "262144|262144|256k|128"
+          "524288|524288|512k|94"
+          "786432|786432|768k|64"
+          "1047548|1047548|1m|32"
+      )
+      ;;
     sweep)
       cases=(
           "65532|65536|64k|16 32 48 64 80 88 96 112 114 116 118 120 124 126 128"
@@ -93,7 +111,7 @@ else
       )
       ;;
     *)
-      echo "BENCHMARK_PRESET must be customer, tp8_baseline_highest, tp8_optimized_highest, ep8_baseline_highest or sweep, observed '${BENCHMARK_PRESET}'" >&2
+      echo "BENCHMARK_PRESET must be customer, tp8_baseline_highest, tp8_optimized_highest, ep8_baseline_highest, ep16_baseline_highest, tp16_baseline_highest or sweep, observed '${BENCHMARK_PRESET}'" >&2
       exit 2
       ;;
   esac

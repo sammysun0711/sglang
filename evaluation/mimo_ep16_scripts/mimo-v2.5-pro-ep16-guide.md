@@ -88,13 +88,13 @@ export HIP_FORCE_DEV_KERNARG=1
 On node 0:
 ```bash
 NODE_RANK=0 SGLANG_HOST_IP=10.2.80.21 \
-	bash ./launch_tp8_ep8_aiter_mori_mtp_decode_fake_prefill_baseline_2nodes.sh
+	bash ./launch_tp16_ep16_aiter_mori_mtp_decode_fake_prefill_baseline_2nodes.sh
 ```
 
 On node 1, in a separate terminal:
 ```bash
 NODE_RANK=1 SGLANG_HOST_IP=10.2.80.29 \
-	bash ./launch_tp8_ep8_aiter_mori_mtp_decode_fake_prefill_baseline_2nodes.sh
+	bash ./launch_tp16_ep16_aiter_mori_mtp_decode_fake_prefill_baseline_2nodes.sh
 ```
 
 The launcher enables dense TP1, DP LM head, fake expert routing and simulated MTP acceptance length3.
@@ -119,12 +119,10 @@ LOG_DIR=./logs/ep16_perf_01/benchmark \
 | Input tokens | Global concurrency | Full-load batch per DP |
 | ---: | ---: | ---: |
 | 65536 | 368 | 184 |
-| 262144 | 128 | 64 |
-| 524288 | 64 | 32 |
-| 786432 | 46 | 23 |
-| 1047548 | 32 | 16 |
-
-The matrix uses seed12345, flushes after warmup, and sends four waves per case (2552 measured requests in total). Add `DRY_RUN=1` to print commands without sending requests.
+| 262144 | 160 | 80 |
+| 524288 | 96 | 48 |
+| 786432 | 64 | 32 |
+| 1047548 | 52 | 26 |
 
 Keep both nodes' server logs under `logs/decode_ep16_fake_prefill_baseline_<RUN_ID>/node<N>/`. For each case, extract its log interval from the successful cache flush to benchmark completion, separately for DP0/TP0 and DP1/TP8. Do not analyze a mixed five-case log with a smaller target batch. For a 64k DP0 slice:
 ```bash

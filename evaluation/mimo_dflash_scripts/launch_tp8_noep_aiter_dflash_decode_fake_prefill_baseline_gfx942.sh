@@ -10,7 +10,7 @@ export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPAT
 export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE="${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE:-${AITER_ROOT}/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_mimo_v2_5_pro.csv}"
 export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE="${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE:-${AITER_ROOT}/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_mimo_v2_5_pro.csv}"
 
-TARGET_MODEL_VARIANT="${TARGET_MODEL_VARIANT:-fp8}"
+TARGET_MODEL_VARIANT="${TARGET_MODEL_VARIANT:-mxfp4}"
 case "${TARGET_MODEL_VARIANT}" in
   fp8)
     export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
@@ -18,9 +18,10 @@ case "${TARGET_MODEL_VARIANT}" in
     default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2_5_pro_b16_tuned_fmoe.csv"
     ;;
   mxfp4)
-    export MODEL="${MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash}"
+    export MODEL="${MODEL:-/models/MiMo-V2.6-Pro-RL}"
     export MIMO_TARGET_WEIGHT_FORMAT=mxfp4
-    default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2_5_pro_tuned_fmoe.csv"
+    default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2.6_a16w4_tuned_fmoe.csv" # A16W4
+    #default_fmoe_config="${AITER_ROOT}/aiter/mimo_v2.6_a16w4_a8w4_tuned_fmoe.csv"                   # A8W4
     ;;
   *)
     echo "TARGET_MODEL_VARIANT must be fp8 or mxfp4, observed '${TARGET_MODEL_VARIANT}'" >&2
@@ -29,10 +30,11 @@ case "${TARGET_MODEL_VARIANT}" in
 esac
 
 export AITER_CONFIG_FMOE="${AITER_CONFIG_FMOE:-${default_fmoe_config}}"
-export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-bf16}"
+#export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-bf16}"
 export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-30001}"
 export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"
+# MiMo vision blocks request FA3 explicitly; override it with a ROCm backend.
 export MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-triton_attn}"
 
 export SPECULATIVE_ALGORITHM=DFLASH
@@ -100,11 +102,11 @@ export MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-1048576}"
 export PAGE_SIZE="${PAGE_SIZE:-64}"
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 
-export SGLANG_MIMO_FUSED_RMS_MOE_QUANT="${SGLANG_MIMO_FUSED_RMS_MOE_QUANT:-1}"
-export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-1}"
-export SGLANG_AITER_MIMO_FRESH_BF16_ASM="${SGLANG_AITER_MIMO_FRESH_BF16_ASM:-1}"
-export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN="${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN:-1}"
-export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN="${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN:-1}"
+export SGLANG_MIMO_FUSED_RMS_MOE_QUANT="${SGLANG_MIMO_FUSED_RMS_MOE_QUANT:-0}"
+export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-0}"
+export SGLANG_AITER_MIMO_FRESH_BF16_ASM="${SGLANG_AITER_MIMO_FRESH_BF16_ASM:-0}"
+export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN="${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN:-0}"
+export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN="${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN:-0}"
 
 # Fake-prefill decode benchmarking uses deterministic DFlash acceptance.
 export SGLANG_SIMULATE_ACC_LEN=4
@@ -237,7 +239,6 @@ python3 -u -m sglang.launch_server \
   "${decode_attention_args[@]}" \
   "${mm_attention_args[@]}" \
   --moe-runner-backend "${MOE_RUNNER_BACKEND}" \
-  --aiter-mxfp4-stage2-output-dtype "${AITER_MXFP4_STAGE2_OUTPUT_DTYPE}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
   --page-size "${PAGE_SIZE}" \
   --speculative-algorithm DFLASH \

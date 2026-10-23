@@ -14,14 +14,14 @@ set -euo pipefail
 # The 1M case uses 1048000 input tokens, as in the customer preset.
 # NUM_PROMPTS_OVERRIDE overrides all counts; SMALL_INPUT_NUM_PROMPTS_OVERRIDE
 # overrides counts for inputs <=8K. PROMPT_WAVES/MIN_NUM_PROMPTS are sweep-only.
-benchmark_preset="${BENCHMARK_PRESET:-customer}"
+benchmark_preset="${BENCHMARK_PRESET:-simple}"
 dry_run="${DRY_RUN:-0}"
-model="${MODEL:-/models/MiMo-V2.5-Pro}"
+model="${MODEL:-/models/MiMo-V2.6-Flash-MOPD}"
 host="${HOST:-0.0.0.0}"
 port="${PORT:-30001}"
 case "${benchmark_preset}" in
   customer)
-    default_tokens="4096 8192 16384 32768 65536 131072 262144 524288 786432 1048000"
+    default_tokens="4096 8192 16384 32768 65536 131068 262144 524284 786428 1047548"
     default_small_concurrency="32"
     default_short_concurrency="16"
     default_long_concurrency="2"
@@ -195,6 +195,7 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
     if [[ "${tokenize_prompt}" == "1" ]]; then
       benchmark_cmd+=(--tokenize-prompt)
     fi
+    benchmark_cmd+=("$@")
     printf 'Command:'
     printf ' %q' "${benchmark_cmd[@]}"
     printf '\n'

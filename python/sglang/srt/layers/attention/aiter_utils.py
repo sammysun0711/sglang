@@ -2852,13 +2852,6 @@ def _ensure_swa_target_verify_workspace(
             "Target verification requires Q heads to be divisible by KV heads"
         )
 
-    capacity_bs = int(getattr(backend, "_swa_target_verify_workspace_bs", 0))
-    capacity_q = int(getattr(backend, "_swa_target_verify_workspace_q", 0))
-    capacity_blocks = int(getattr(backend, "_swa_target_verify_workspace_blocks", 0))
-    capacity_partitions = int(
-        getattr(backend, "_swa_target_verify_workspace_partitions", 0)
-    )
-    signature = getattr(backend, "_swa_target_verify_workspace_signature", None)
     requested_signature = (
         num_q_heads,
         num_kv_heads,
@@ -2867,6 +2860,24 @@ def _ensure_swa_target_verify_workspace(
         context_dtype,
         device,
     )
+    # A shared backend can alternate full and SWA layers with different KV
+    # head counts (Flash TP4: one and two). Keep each layout's buffers alive
+    # and restore their pointers instead of reallocating during graph capture.
+    workspaces = getattr(backend, "_target_verify_workspaces", None)
+    if workspaces is None:
+        workspaces = backend._target_verify_workspaces = {}
+    for name, value in workspaces.get(requested_signature, {}).items():
+        setattr(backend, name, value)
+
+    capacity_bs = int(getattr(backend, "_swa_target_verify_workspace_bs", 0))
+    capacity_q = int(getattr(backend, "_swa_target_verify_workspace_q", 0))
+    capacity_blocks = int(getattr(backend, "_swa_target_verify_workspace_blocks", 0))
+    capacity_partitions = int(
+        getattr(backend, "_swa_target_verify_workspace_partitions", 0)
+    )
+    signature = getattr(backend, "_swa_target_verify_workspace_signature", None)
+    if signature != requested_signature:
+        capacity_bs = capacity_q = capacity_blocks = capacity_partitions = 0
     if (
         signature == requested_signature
         and capacity_bs >= max_batch_size
@@ -2879,6 +2890,13 @@ def _ensure_swa_target_verify_workspace(
         raise RuntimeError(
             "split-SWA target-verification workspace cannot grow during capture"
         )
+    if requested_signature in workspaces:
+        # Earlier graph buckets still hold device pointers into the old
+        # allocation when a later warmup needs more partitions or page slots.
+        retired = getattr(backend, "_retired_target_verify_workspaces", None)
+        if retired is None:
+            retired = backend._retired_target_verify_workspaces = []
+        retired.append(workspaces[requested_signature])
 
     capacity_bs = max(max_batch_size, capacity_bs)
     capacity_q = max(query_length, capacity_q)
@@ -2911,6 +2929,11 @@ def _ensure_swa_target_verify_workspace(
     backend._swa_target_verify_workspace_blocks = capacity_blocks
     backend._swa_target_verify_workspace_partitions = capacity_partitions
     backend._swa_target_verify_workspace_signature = requested_signature
+    workspaces[requested_signature] = {
+        name: value
+        for name, value in vars(backend).items()
+        if name.startswith("_swa_target_verify_")
+    }
 
 
 def prepare_swa_target_verify(
@@ -3091,6 +3114,11 @@ def forward_target_verify_vectorized_5d(
     kernel_query_length = query_length
     kernel_query_group_size = equivalent_group_size
     if split_verify_queries:
+        if is_swa_layer and sliding_window > 0:
+            # Gluon's qlen-1 mask starts at context_length - window + 1.
+            # Our context length already includes the current query token;
+            # keep exactly layer.sliding_window_size keys visible.
+            sliding_window += 1
         _ensure_swa_target_verify_workspace(
             backend,
             max_batch_size=batch_size,

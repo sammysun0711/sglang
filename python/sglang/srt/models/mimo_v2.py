@@ -1197,10 +1197,11 @@ class MiMoV2Model(nn.Module):
             return "speculative target/draft batches are not supported"
         if self.pp_group.world_size != 1:
             return "pipeline parallelism is not supported"
-        if get_tensor_model_parallel_world_size() != 8:
-            return "tensor parallel size must be 8"
-        if get_attention_tp_size() != 8:
-            return "attention tensor parallel size must be 8"
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size not in (4, 8):
+            return "tensor parallel size must be 4 or 8"
+        if get_attention_tp_size() != tp_size:
+            return "attention tensor parallel size must match tensor parallel size"
         if get_moe_expert_parallel_world_size() != 1:
             return "expert parallelism must be disabled"
         if is_dp_attention_enabled():
@@ -1243,7 +1244,8 @@ class MiMoV2Model(nn.Module):
                     child.tbo_padded_len for child in forward_batch.tbo_children
                 ]
                 logger.info(
-                    "Running MiMo TP8 non-EP prefill TBO with child lengths %s",
+                    "Running MiMo TP%d non-EP prefill TBO with child lengths %s",
+                    get_tensor_model_parallel_world_size(),
                     child_lens,
                 )
                 self._logged_no_ep_tbo = True
@@ -1253,7 +1255,8 @@ class MiMoV2Model(nn.Module):
                 and not self._logged_no_ep_tbo_fallback
             ):
                 logger.info(
-                    "Skipping MiMo TP8 non-EP TBO and using the existing path: %s",
+                    "Skipping MiMo TP%d non-EP TBO and using the existing path: %s",
+                    get_tensor_model_parallel_world_size(),
                     ineligible_reason,
                 )
                 self._logged_no_ep_tbo_fallback = True
@@ -1594,7 +1597,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         ), "forward() should not be called in encoder_only mode"
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and (
+            not self._is_multimodal or input_embeds is not None
+        ):
             hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
                 input_ids,
                 positions,
@@ -1603,7 +1608,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            model_output = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1611,6 +1616,12 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 positions=positions,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if self.capture_aux_hidden_states:
+                hidden_states, hidden_states_before_norm, aux_hidden_states = (
+                    model_output
+                )
+            else:
+                hidden_states, hidden_states_before_norm = model_output
         else:
             hidden_states, hidden_states_before_norm = self.model(
                 input_ids,

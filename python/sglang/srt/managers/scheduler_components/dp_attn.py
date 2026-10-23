@@ -275,7 +275,8 @@ class SchedulerDPAttnAdapter:
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
             local_batch,
-            dp_size=self.server_args.dp_size,
+            # Independent DP replicas synchronize only within their TP group.
+            dp_size=self.ps.attn_dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,

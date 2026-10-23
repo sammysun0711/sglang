@@ -812,6 +812,138 @@ def test_fresh_mimo_swa_gfx942_fallback_uses_asymmetric_batch_prefill(
     assert torch.all(output == 13.0)
 
 
+@pytest.mark.skipif(
+    not torch.version.hip or not torch.cuda.is_available(),
+    reason="requires ROCm CK prefill",
+)
+@pytest.mark.parametrize("prefix_len", [0, 73])
+@pytest.mark.parametrize("swa", [False, True])
+@pytest.mark.parametrize("value_dim", [128, 192])
+def test_gfx942_ck_linear_prefill_matches_torch(monkeypatch, prefix_len, swa, value_dim):
+    if not aiter_utils.is_gfx942():
+        pytest.skip("regression for the gfx942 CK LINEAR path")
+    monkeypatch.setenv("SGLANG_FLYPA_MIMO_PREFILL", "0")
+    monkeypatch.setenv("SGLANG_FLYDSL_MIMO_PREFILL", "0")
+    torch.manual_seed(12345)
+    device = torch.device("cuda")
+    lengths = [255, 257]
+    kv_lengths = [length + prefix_len for length in lengths]
+    q_heads, kv_heads = 16, 2 if swa and value_dim == 192 else 1
+    total_q, total_kv = sum(lengths), sum(kv_lengths)
+    # Keep Q strided as it is after MiMo's fused QKV projection.
+    q_storage = torch.randn(
+        total_q, q_heads * 192 + 384, device=device, dtype=torch.bfloat16
+    )
+    q = q_storage[:, : q_heads * 192].view(total_q, q_heads, 192)
+    k = torch.randn(total_kv, kv_heads, 192, device=device, dtype=torch.bfloat16)
+    v = torch.randn(total_kv, kv_heads, value_dim, device=device, dtype=torch.bfloat16)
+    sinks = torch.linspace(-1, 1, q_heads, device=device) if swa else None
+    qo_indptr = torch.tensor([0, lengths[0], total_q], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor(
+        [0, kv_lengths[0], total_kv], dtype=torch.int32, device=device
+    )
+    metadata = SimpleNamespace(
+        max_q_len=max(lengths),
+        max_kv_len=max(kv_lengths),
+        kv_indptr=kv_indptr,
+        kv_indices=torch.arange(total_kv, dtype=torch.int32, device=device),
+        swa_page_table=None,
+    )
+    backend = SimpleNamespace(
+        input_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=64,
+        logits_soft_cap=0.0,
+        qo_indptr=qo_indptr,
+        forward_metadata=metadata,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        sliding_window_size=128 if swa else -1,
+        tp_q_head_num=q_heads,
+        tp_k_head_num=kv_heads,
+        tp_v_head_num=kv_heads,
+        qk_head_dim=192,
+        head_dim=192,
+        v_head_dim=value_dim,
+        scaling=192**-0.5,
+    )
+    batch = SimpleNamespace(
+        extend_prefix_lens_cpu=[prefix_len] * 2,
+        extend_seq_lens_cpu=lengths,
+        seq_lens_cpu=torch.tensor(kv_lengths),
+        seq_lens_sum=total_kv,
+    )
+    if prefix_len:
+        # Exercise the real SHUFFLE gather as well as the fresh-prompt path.
+        pages = math.ceil(total_kv / 64)
+        k_padded = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pages * 64 - total_kv))
+        v_padded = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pages * 64 - total_kv))
+        backend.token_to_kv_pool = SimpleNamespace(
+            start_layer=0,
+            dtype=torch.bfloat16,
+            store_dtype=torch.bfloat16,
+            k_buffer=[
+                k_padded.view(pages, 64, kv_heads, 24, 8)
+                .permute(0, 2, 3, 1, 4)
+                .contiguous()
+            ],
+            v_buffer=[
+                v_padded.view(pages, 8, 8, kv_heads, value_dim)
+                .permute(0, 3, 1, 4, 2)
+                .contiguous()
+            ],
+        )
+        if swa:
+            metadata.swa_page_table = metadata.kv_indices
+
+    output = aiter_utils.forward_extend_vectorized_5d(
+        backend,
+        q,
+        k,
+        v,
+        layer,
+        batch,
+        bs0=3,
+        window_size=(128, -1) if swa else (-1, -1),
+        sinks=sinks,
+    ).view(total_q, q_heads, value_dim)
+    torch.cuda.synchronize()
+
+    q_start = kv_start = 0
+    for q_len, kv_len in zip(lengths, kv_lengths):
+        k_ref = (
+            k[kv_start : kv_start + kv_len]
+            .float()
+            .repeat_interleave(q_heads // kv_heads, dim=1)
+        )
+        v_ref = (
+            v[kv_start : kv_start + kv_len]
+            .float()
+            .repeat_interleave(q_heads // kv_heads, dim=1)
+        )
+        scores = torch.einsum(
+            "qhd,khd->hqk", q[q_start : q_start + q_len].float(), k_ref
+        ) * layer.scaling
+        q_pos = torch.arange(q_len, device=device)[:, None] + prefix_len
+        k_pos = torch.arange(kv_len, device=device)[None, :]
+        mask = k_pos <= q_pos
+        if swa:
+            mask &= k_pos >= q_pos - 128
+        scores.masked_fill_(~mask, float("-inf"))
+        if swa:
+            scores = torch.cat(
+                [scores, sinks[:, None, None].expand(-1, q_len, 1)], dim=-1
+            )
+        probs = torch.softmax(scores, dim=-1)[..., :kv_len]
+        expected = torch.einsum("hqk,khd->qhd", probs, v_ref)
+        torch.testing.assert_close(
+            output[q_start : q_start + q_len].float(), expected, atol=0.02, rtol=0.02
+        )
+        q_start += q_len
+        kv_start += kv_len
+
+
 @pytest.mark.parametrize(
     "guard",
     [
@@ -3486,3 +3618,182 @@ def test_flydsl_bf16_decode_configuration_rejects_unsupported_arch(monkeypatch):
 
     with pytest.raises(RuntimeError, match="validated only on gfx942 or gfx950"):
         backend._configure_flydsl_pa_decode(max_bs=1)
+
+
+@pytest.mark.skipif(
+    not torch.version.hip or not torch.cuda.is_available(), reason="requires ROCm"
+)
+def test_split_verify_mixed_kv_heads_matches_torch_and_graph(monkeypatch):
+    import weakref
+
+    monkeypatch.setenv("SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1", "1")
+    torch.manual_seed(721)
+    device = torch.device("cuda")
+    qlen, q_heads, dim, total_kv, page = 8, 16, 192, 384, 64
+    table = torch.arange(total_kv // page, dtype=torch.int32, device=device)[None]
+    backend = SimpleNamespace(
+        page_size=page,
+        input_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        forward_metadata=SimpleNamespace(
+            max_q_len=qlen, kv_indices=table, swa_page_table=table
+        ),
+    )
+    batch = SimpleNamespace(
+        batch_size=1,
+        seq_lens=torch.tensor([300], dtype=torch.int64, device=device),
+    )
+    cases = []
+    for kv_heads, window in [(1, -1), (2, 128)]:
+        q = torch.randn(qlen, q_heads, dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(total_kv, kv_heads, dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        k_cache = (
+            k.view(-1, page, kv_heads, dim // 8, 8)
+            .permute(0, 2, 3, 1, 4)
+            .contiguous()
+        )
+        v_cache = (
+            v.view(-1, page // 8, 8, kv_heads, dim)
+            .permute(0, 3, 1, 4, 2)
+            .contiguous()
+        )
+        layer = SimpleNamespace(
+            sliding_window_size=window,
+            tp_q_head_num=q_heads,
+            tp_k_head_num=kv_heads,
+            qk_head_dim=dim,
+            v_head_dim=dim,
+            scaling=dim**-0.5,
+            logit_cap=0.0,
+        )
+        sinks = (
+            torch.linspace(-0.4, 0.3, q_heads, device=device) if window > 0 else None
+        )
+        cases.append((q, k, v, k_cache, v_cache, layer, sinks, torch.empty_like(q)))
+
+    def run():
+        # MiMo alternates full attention (one KV head) and SWA (two KV heads)
+        # on the same backend, including within one captured graph.
+        for i in (0, 1, 0):
+            q, _, _, k_cache, v_cache, layer, sinks, output = cases[i]
+            aiter_utils.forward_target_verify_vectorized_5d(
+                backend, q, layer, batch, k_cache, v_cache, output, sinks
+            )
+
+    def check(prefix):
+        for q, k, v, _, _, layer, sinks, output in cases:
+            repeats = q_heads // layer.tp_k_head_num
+            k_ref = k.float().repeat_interleave(repeats, dim=1)
+            v_ref = v.float().repeat_interleave(repeats, dim=1)
+            scores = torch.einsum("qhd,khd->hqk", q.float(), k_ref) * layer.scaling
+            q_pos = prefix + torch.arange(qlen, device=device)[:, None]
+            k_pos = torch.arange(total_kv, device=device)[None, :]
+            visible = k_pos <= q_pos
+            if layer.sliding_window_size > 0:
+                visible &= k_pos > q_pos - layer.sliding_window_size
+            scores.masked_fill_(~visible, float("-inf"))
+            if sinks is not None:
+                scores = torch.cat(
+                    [scores, sinks[:, None, None].expand(-1, qlen, 1)], -1
+                )
+            probs = torch.softmax(scores, -1)[..., :total_kv]
+            expected = torch.einsum("hqk,khd->qhd", probs, v_ref)
+            torch.testing.assert_close(
+                output.float(),
+                expected,
+                atol=0.003,
+                rtol=0.02,
+                msg=lambda msg: (
+                    f"KV heads={layer.tp_k_head_num}, "
+                    f"window={layer.sliding_window_size}, prefix={prefix}: {msg}"
+                ),
+            )
+
+    run()
+    torch.cuda.synchronize()
+    check(300)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    old_context = weakref.ref(backend._swa_target_verify_context_lengths)
+    aiter_utils._ensure_swa_target_verify_workspace(
+        backend,
+        max_batch_size=2,
+        query_length=qlen,
+        num_q_heads=q_heads,
+        num_kv_heads=1,
+        value_head_dim=dim,
+        max_blocks_per_sequence=12,
+        max_partitions=8,
+        device=device,
+        output_dtype=torch.bfloat16,
+        context_dtype=batch.seq_lens.dtype,
+    )
+    assert old_context() is not None, "captured graph still needs the old allocation"
+    batch.seq_lens.fill_(180)
+    for case in cases:
+        case[-1].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    check(180)
+
+
+@pytest.mark.parametrize("capture_aux", [False, True])
+def test_mimo_multimodal_aux_capture_embeds_placeholders_first(monkeypatch, capture_aux):
+    from sglang.srt.managers import mm_utils
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(16, 4)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+        def forward(
+            self, input_ids=None, positions=None, forward_batch=None,
+            input_embeds=None, **kwargs
+        ):
+            # A raw multimodal placeholder would raise an embedding OOB here.
+            hidden = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            if capture_aux:
+                return hidden + 1, None, [hidden + 2]
+            return hidden + 1, None
+
+    embedded = torch.full((2, 4), 7.0)
+    monkeypatch.setattr(mm_utils, "embed_mm_inputs", lambda **kwargs: (embedded, {}))
+    monkeypatch.setattr(mm_utils, "get_global_server_args", lambda: None)
+    model = object.__new__(mimo_v2.MiMoV2ForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(encoder_only=False)
+    model.capture_aux_hidden_states = capture_aux
+    model._is_multimodal = True
+    model.model = LanguageModel()
+    model.pp_group = SimpleNamespace(is_last_rank=True)
+    model.lm_head = None
+    model.logits_processor = lambda _ids, hidden, _head, _batch, **kwargs: (
+        hidden,
+        kwargs["aux_hidden_states"],
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        contains_mm_inputs=lambda: True,
+        mm_inputs=[SimpleNamespace(mm_items=[])],
+        extend_prefix_lens_cpu=[0],
+        extend_seq_lens_cpu=[2],
+        input_embeds=None,
+    )
+    hidden, auxiliary = model.forward(
+        torch.tensor([7, 123456789]), torch.arange(2), batch
+    )
+    torch.testing.assert_close(hidden, embedded + 1)
+    assert batch.mm_inputs is None
+    if capture_aux:
+        assert len(auxiliary) == 1
+        torch.testing.assert_close(auxiliary[0], embedded + 2)
+    else:
+        assert auxiliary is None

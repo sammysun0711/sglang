@@ -7811,20 +7811,19 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         architectures = getattr(hf_config, "architectures", None) or []
         model_arch = architectures[0] if architectures else None
-        supports_mimo_tp8_no_ep_tbo = (
+        supports_mimo_no_ep_tbo = (
             model_arch == "MiMoV2ForCausalLM"
-            and self.tp_size == 8
-            and self.dp_size == 1
+            and (self.tp_size, self.dp_size) in ((8, 1), (4, 2))
             and self.ep_size == 1
             and self.pp_size == 1
             and self.attn_cp_size == 1
             and not self.enable_dp_attention
         )
-        if not supports_mimo_tp8_no_ep_tbo:
+        if not supports_mimo_no_ep_tbo:
             raise ValueError(
                 "Two batch overlap with moe_a2a_backend='none' is currently "
-                "supported only for MiMoV2ForCausalLM with TP8/DP1/EP1/PP1 "
-                "and no attention context parallelism."
+                "supported only for MiMoV2ForCausalLM with TP8/DP1 or TP4/DP2, "
+                "EP1/PP1, and no DP attention or attention context parallelism."
             )
 
         if self.enable_pdmux:

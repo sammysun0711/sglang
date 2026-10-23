@@ -49,14 +49,16 @@ if [[ -n "${CASE_SPECS:-}" ]]; then
   mapfile -t cases <<<"${CASE_SPECS}"
 else
   case "${BENCHMARK_PRESET}" in
-    customer)
+    h200)
       cases=(
-          "65532|65536|64k|204"
-          "262140|262144|256k|63"
-          "65532|65536|64k|196"
+          "65532|65536|64k|96"
+          "262140|262144|256k|70"
+          "524284|524288|512k|16"
+          "786428|786428|768K|23"
+          "1047548|1047552|1m|8"
       )
       ;;
-    baseline_highest)
+    mi355_baseline_highest)
       cases=(
           "65532|65536|64k|204"
           "262140|262144|256k|70"
@@ -65,7 +67,7 @@ else
           "1047548|1047552|1m|17"
       )
       ;;
-    optimized_highest)
+    mi355_optimized_highest)
       cases=(
           "65532|65536|64k|258"
           "262140|262144|256k|141"

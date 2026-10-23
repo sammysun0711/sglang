@@ -2,14 +2,8 @@
 set -euo pipefail
 
 # Standalone MiMo-V2.6-Flash fake-prefill decode launcher for gfx942:
-# TP4/DP2/EP1, DFlash block8, static FP8 MoE, BF16 KV, Gluon attention,
-# real acceptance, and no lossy Quick Reduce.
 # Convert checkpoint MXFP4 experts once at load time to FP8 128x128 blockscale
 # weights; activations remain dynamically quantized.
-# Requires AITER's mxfp4_to_fp8_128block (PR #17), FlyDSL 0.3.2, and the CK
-# MiMo prefill patch including gfx942 bounds fixes from AITER PR #18.
-# AITER_ROOT may select a source checkout; otherwise use the installed AITER.
-# DRY_RUN=1 prints the final command without starting a server or creating logs.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EVALUATION_DIR="$(dirname -- "${SCRIPT_DIR}")"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -96,8 +90,9 @@ export SGLANG_MIMO_FUSED_RMS_QKV_QUANT=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=0
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
-# Keep real DFlash acceptance, matching the Flash accuracy baseline.
-unset SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
+# Match the Pro fake-prefill benchmark's deterministic DFlash acceptance.
+export SGLANG_SIMULATE_ACC_LEN=4
+export SGLANG_SIMULATE_ACC_METHOD=match-expected
 
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-5000}"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-5000}"
@@ -173,7 +168,8 @@ fi
 echo "MiMo-V2.6-Flash: static FP8 blockscale MoE weights converted from MXFP4 at load time"
 echo "Configuration: model=${MODEL_PATH}, tp=4, dp=2, ep=1, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}"
 echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}, qlen1=${SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}"
-echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/gluon, draft-kv=bf16, draft-window=1024, acceptance=real"
+echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/gluon, draft-kv=bf16, draft-window=1024, acceptance=simulated"
+echo "Simulated acceptance: length=${SGLANG_SIMULATE_ACC_LEN}, method=${SGLANG_SIMULATE_ACC_METHOD}"
 echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
 echo "Decode: preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, log-interval=${DECODE_LOG_INTERVAL}, watchdog=${WATCHDOG_TIMEOUT}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}"
 echo "Quick Reduce: disabled; mixed-router=${SGLANG_MIMO_MIXED_ROUTER}; custom all-reduce=${custom_all_reduce_status}; radix cache=${radix_cache_status}; tbo=${ENABLE_TWO_BATCH_OVERLAP}"

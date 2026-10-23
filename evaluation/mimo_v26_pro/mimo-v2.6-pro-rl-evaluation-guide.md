@@ -57,7 +57,7 @@ Baseline prefill keeps quick-reduce disabled, mixed router disabled, FlyDSL pref
 ### Launch TBO-off server
 
 ```bash
-cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_v26_pro
 MEM_FRACTION_STATIC=0.80 \
 CHUNKED_PREFILL_SIZE=65536 \
 DISABLE_RADIX_CACHE=1 \
@@ -78,7 +78,7 @@ Stop the TBO-off server, verify that the GPUs are clear, then launch a fresh
 TBO-on server and run the same client matrix:
 
 ```bash
-cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_v26_pro
 MEM_FRACTION_STATIC=0.75 \
 CHUNKED_PREFILL_SIZE=65536 \
 DISABLE_RADIX_CACHE=1 \
@@ -115,7 +115,7 @@ more than that reduces the full-token pool without increasing concurrency.
 ### Launch server
 
 ```bash
-cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_v26_pro
 MEM_FRACTION_STATIC=0.85 \
 DISABLE_RADIX_CACHE=1 \
 SWA_FULL_TOKENS_RATIO=0.016 \
@@ -162,12 +162,31 @@ cd /sgl-workspace/sglang/evaluation
 ./run_sglang_profile.sh
 ```
 
-## 8. Run real-MTP ShareGPT dataset accuracy gate
+## 8. Run GSM8K accuracy and acceptance gate
+
+Use the real-prefill accuracy launcher with acceptance simulation disabled.
+The runner uses upstream `/server_info` statistics.
+
+Run one command for the complete GSM8K `main` test split, 4-shot prompting,
+and each worker's mean acceptance length >= 4:
 
 ```bash
+pip install evalscope==1.11.0
 cd /sgl-workspace/sglang/evaluation
-./run_sharegpt_mtp_accuracy_test.sh
+MODEL_PATH=/models/MiMo-V2.6-Pro-RL/ \
+MIN_ACCEPT_LENGTH=4.0 \
+python3 ./run_evalscope_gsm8k_accuracy.py
 ```
+
+This runs EvalScope once, then reads each worker's upstream
+`avg_spec_accept_length` (including the bonus token). Every worker's mean
+must meet `MIN_ACCEPT_LENGTH`; their arithmetic mean is also reported and
+is explicitly unweighted. Raw counts for an exact global weighted mean are
+not available from this API.
+
+`MIN_GSM8K_ACCURACY=0.97` optionally enforces 97% accuracy;
+`MIN_ACCEPT_LENGTH=4.0` sets the acceptance threshold for every worker.
+
 
 ## 9. Run swe-bench & accuracy benchmark test
 

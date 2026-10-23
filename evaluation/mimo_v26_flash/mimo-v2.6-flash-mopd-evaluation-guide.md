@@ -53,7 +53,7 @@ Baseline prefill keeps quick-reduce disabled, mixed router disabled, FlyDSL pref
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
 CHUNKED_PREFILL_SIZE=16384 \
-MEM_FRACTION_STATIC=0.70 \
+MEM_FRACTION_STATIC=0.75 \
 SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
 DISABLE_RADIX_CACHE=1 \
@@ -74,7 +74,7 @@ TBO-on server and run the same client matrix:
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
 CHUNKED_PREFILL_SIZE=16384 \
-MEM_FRACTION_STATIC=0.70 \
+MEM_FRACTION_STATIC=0.75 \
 SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
 DISABLE_RADIX_CACHE=1 \
@@ -92,9 +92,11 @@ The standalone fake-prefill launcher defines the Flash baseline settings:
 TP4 x DP2, EP1, DFlash block 8, load-time MXFP4-to-FP8 MoE conversion,
 Gluon attention, BF16 target/draft KV, and disabled Quick Reduce/mixed router.
 It adds `--disaggregation-mode decode --disaggregation-transfer-backend fake`.
-Acceptance remains real, matching the accuracy baseline; simulated acceptance
-is not forced. Fake prefill skips prompt computation, so this is a performance
-test rather than an accuracy evaluation.
+Acceptance is simulated at length 4 using `SGLANG_SIMULATE_ACC_LEN=4` and
+`SGLANG_SIMULATE_ACC_METHOD=match-expected`, matching the Pro fake-prefill
+reference. This gives a controlled acceptance length for decode throughput
+comparisons. Fake prefill skips prompt computation, so these runs measure
+performance; use the accuracy launcher with real prefill to evaluate accuracy.
 
 The fake-prefill decode capacity must fit both the full-token and SWA-token
 pools:
@@ -122,11 +124,7 @@ MAX_RUNNING_REQUESTS=96 \
   ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_decode_fake_prefill_baseline.sh
 ```
 
-Use `DRY_RUN=1` to inspect the command without starting the server. Supported
-overrides such as `MODEL_PATH`, `DFLASH_BLOCK_SIZE`, `AITER_ROOT`, and
-`CUDA_GRAPH_BS_DECODE` are configured in this script. Decode-specific controls include
-`MAX_TOTAL_TOKENS`, `DECODE_LOG_INTERVAL`, `WATCHDOG_TIMEOUT`, and
-`SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS` (defaults to the request limit).
+Use `DRY_RUN=1` to inspect the command without starting the server.
 
 ### Run the matching decode point
 
@@ -140,6 +138,10 @@ WARMUP_REQUESTS=32 \
 ```
 
 The client uses explicit token IDs, so no four-token subtraction is needed.
+At the 1M context boundary, reserve additional slots for the scheduler:
+use `CASE_SPECS='1047548|1047548|1m|18'` for 1,024 output tokens. An input
+length of 1,047,552 leaves no scheduler margin and is capped at 1,022 output
+tokens. This margin is separate from tokenizer special tokens.
 
 ### Run decode throughput analysis
 
@@ -170,12 +172,36 @@ cd /sgl-workspace/sglang/evaluation
 ./run_sglang_profile.sh
 ```
 
-## 8. Run real-MTP ShareGPT dataset accuracy gate
+## 8. Run GSM8K accuracy and acceptance gate
+
+Use the real-prefill accuracy launcher with acceptance simulation disabled.
+The runner uses upstream `/server_info` statistics and requires no SGLang
+source changes. It rejects decode-only servers.
+
+Run one command for the complete
+GSM8K `main` test split, 4-shot prompting, and each worker's mean acceptance length >= 4:
 
 ```bash
+pip install evalscope==1.11.0
 cd /sgl-workspace/sglang/evaluation
-./run_sharegpt_mtp_accuracy_test.sh
+MODEL_PATH=/models/MiMo-V2.6-Flash-MOPD/ \
+MIN_ACCEPT_LENGTH=4.0 \
+python3 ./run_evalscope_gsm8k_accuracy.py
 ```
+
+This runs EvalScope once, then reads each worker's upstream
+`avg_spec_accept_length` (including the bonus token). Every worker's mean
+must meet `MIN_ACCEPT_LENGTH`; their arithmetic mean is also reported and
+is explicitly unweighted. Raw counts for an exact global weighted mean are
+not available from this API.
+
+`FLUSH_CACHE=1` is required for the acceptance check. Use a dedicated server
+with no concurrent inference or statistics resets during evaluation. The
+upstream API does not expose simulation settings, so real acceptance must
+be configured in the server launcher.
+
+`MIN_GSM8K_ACCURACY=0.97` optionally enforces 97% accuracy;
+`MIN_ACCEPT_LENGTH=4.0` sets the acceptance threshold for every worker.
 
 ## 9. Run swe-bench & accuracy benchmark test
 

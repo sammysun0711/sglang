@@ -14,8 +14,6 @@ set -euo pipefail
 # The 1M case uses 1048000 input tokens, as in the customer preset.
 # NUM_PROMPTS_OVERRIDE overrides all counts; SMALL_INPUT_NUM_PROMPTS_OVERRIDE
 # overrides counts for inputs <=8K. PROMPT_WAVES/MIN_NUM_PROMPTS are sweep-only.
-# Extra arguments are forwarded to sglang.bench_serving, for example:
-# ./run_benchmark_mimo_pro_prefill.sh --profile --profile-by-stage --profile-stages prefill
 benchmark_preset="${BENCHMARK_PRESET:-simple}"
 dry_run="${DRY_RUN:-0}"
 model="${MODEL:-/models/MiMo-V2.6-Flash-MOPD}"

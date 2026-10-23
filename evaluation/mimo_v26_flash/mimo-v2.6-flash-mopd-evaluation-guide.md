@@ -68,23 +68,23 @@ cd /sgl-workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-Stop the TBO-off server, verify that the GPUs are clear, then launch a fresh
-TBO-on server and run the same client matrix:
+MiMo-v2.6-Pro Flash DP2 x TP4 baseline defaults to `ENABLE_TWO_BATCH_OVERLAP=0`.
+To opt into prefill-only TBO, stop the existing server and launch with:
 
 ```bash
-cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
 CHUNKED_PREFILL_SIZE=16384 \
-MEM_FRACTION_STATIC=0.75 \
+MEM_FRACTION_STATIC=0.70 \
 SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
 DISABLE_RADIX_CACHE=1 \
-ENABLE_TWO_BATCH_OVERLAP=0 \
+ENABLE_TWO_BATCH_OVERLAP=1 \
 ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
 ```
 
-The qualified TBO-on memory fraction is `0.75`. The `0.80` configuration can
-exhaust transient HSA memory even though the static KV pools themselves are
-not full.
+Each DP replica overlaps its own TP4 collectives. DP attention remains disabled;
+ordinary prefill can use TBO, while DFlash draft/verify and decode retain their
+existing paths.
 
 ## 4. Run baseline single node decode benchmark with fake prefill
 
@@ -116,7 +116,7 @@ more than that reduces the full-token pool without increasing concurrency.
 ### Launch server
 
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_v26_flash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
 MEM_FRACTION_STATIC=0.70 \
 DISABLE_RADIX_CACHE=1 \
 SWA_FULL_TOKENS_RATIO=0.03 \
@@ -129,7 +129,7 @@ Use `DRY_RUN=1` to inspect the command without starting the server.
 ### Run the matching decode point
 
 ```bash
-cd /root/workspace/sglang/evaluation
+cd /sgl-workspace/sglang/evaluation
 MODEL=/models/MiMo-V2.6-Flash-MOPD/ \
 CASE_SPECS='65536|65536|64k|128' \
 PROMPT_WAVES=4 \

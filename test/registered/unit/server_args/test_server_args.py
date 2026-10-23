@@ -880,6 +880,29 @@ class TestMiMoNoEpTboArgs(CustomTestCase):
         server_args = self._make_server_args([0] + [1] * 69)
         server_args._validate_two_batch_overlap()
 
+    def test_accepts_flash_tp4_dp2_replicas(self):
+        server_args = self._make_server_args([0] + [1] * 47)
+        server_args.tp_size = 4
+        server_args.dp_size = 2
+        server_args._validate_two_batch_overlap()
+
+    def test_rejects_unsupported_parallel_sizes(self):
+        for tp_size, dp_size in ((4, 1), (8, 2), (2, 4)):
+            with self.subTest(tp_size=tp_size, dp_size=dp_size):
+                server_args = self._make_server_args([0] + [1] * 47)
+                server_args.tp_size = tp_size
+                server_args.dp_size = dp_size
+                with self.assertRaisesRegex(ValueError, "TP8/DP1 or TP4/DP2"):
+                    server_args._validate_two_batch_overlap()
+
+    def test_rejects_flash_dp_attention(self):
+        server_args = self._make_server_args([0] + [1] * 47)
+        server_args.tp_size = 4
+        server_args.dp_size = 2
+        server_args.enable_dp_attention = True
+        with self.assertRaisesRegex(ValueError, "no DP attention"):
+            server_args._validate_two_batch_overlap()
+
     def test_rejects_sparse_layer_zero(self):
         server_args = self._make_server_args([1, 1, 1, 1])
         with self.assertRaisesRegex(ValueError, "dense layer 0"):

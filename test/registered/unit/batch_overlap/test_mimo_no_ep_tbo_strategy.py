@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations_strategy import (
     _compute_moe_mimov2_layer_operations_strategy_tbo,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.managers.scheduler_components import dp_attn
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -467,7 +468,7 @@ def _make_forward_batch(forward_mode=ForwardMode.EXTEND, spec_info=None):
     )
 
 
-def _no_ep_tbo_reason(forward_batch):
+def _no_ep_tbo_reason(forward_batch, tp_size=8, attn_tp_size=None, dp_attention=False):
     model = SimpleNamespace(pp_group=SimpleNamespace(world_size=1))
     server_args = SimpleNamespace(
         attn_cp_size=1,
@@ -476,23 +477,37 @@ def _no_ep_tbo_reason(forward_batch):
     )
     with (
         patch.object(mimo_v2, "get_global_server_args", return_value=server_args),
-        patch.object(mimo_v2, "get_tensor_model_parallel_world_size", return_value=8),
-        patch.object(mimo_v2, "get_attention_tp_size", return_value=8),
+        patch.object(
+            mimo_v2, "get_tensor_model_parallel_world_size", return_value=tp_size
+        ),
+        patch.object(
+            mimo_v2,
+            "get_attention_tp_size",
+            return_value=tp_size if attn_tp_size is None else attn_tp_size,
+        ),
         patch.object(mimo_v2, "get_moe_expert_parallel_world_size", return_value=1),
-        patch.object(mimo_v2, "is_dp_attention_enabled", return_value=False),
+        patch.object(mimo_v2, "is_dp_attention_enabled", return_value=dp_attention),
         patch.object(mimo_v2, "get_moe_a2a_backend", return_value=_FakeNoEpBackend()),
     ):
         return mimo_v2.MiMoV2Model._no_ep_tbo_ineligible_reason(model, forward_batch)
 
 
-def test_mimo_no_ep_tbo_gate_accepts_only_ordinary_prefill():
-    assert _no_ep_tbo_reason(_make_forward_batch()) is None
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_mimo_no_ep_tbo_gate_accepts_only_ordinary_prefill(tp_size):
+    assert _no_ep_tbo_reason(_make_forward_batch(), tp_size=tp_size) is None
 
     target_verify = _make_forward_batch(ForwardMode.TARGET_VERIFY)
-    assert "ordinary EXTEND" in _no_ep_tbo_reason(target_verify)
+    assert "ordinary EXTEND" in _no_ep_tbo_reason(target_verify, tp_size=tp_size)
 
     speculative_extend = _make_forward_batch(spec_info=object())
-    assert "speculative" in _no_ep_tbo_reason(speculative_extend)
+    assert "speculative" in _no_ep_tbo_reason(speculative_extend, tp_size=tp_size)
+
+
+def test_mimo_no_ep_tbo_gate_rejects_attention_sharding():
+    batch = _make_forward_batch()
+    assert "must match" in _no_ep_tbo_reason(batch, tp_size=4, attn_tp_size=2)
+    assert "DP attention" in _no_ep_tbo_reason(batch, tp_size=4, dp_attention=True)
+    assert "4 or 8" in _no_ep_tbo_reason(batch, tp_size=2)
 
 
 def test_tbo_aux_capture_merge_restores_parent_order_and_trims_padding():
@@ -669,6 +684,7 @@ def test_mimo_model_threads_dflash_capture_through_tbo(monkeypatch):
             "_no_ep_tbo_ineligible_reason",
             return_value=None,
         ),
+        patch.object(mimo_v2, "get_tensor_model_parallel_world_size", return_value=4),
         patch.object(
             mimo_v2,
             "model_forward_maybe_tbo",
@@ -714,6 +730,59 @@ def test_tbo_forces_scheduler_split_metadata_without_dp_mlp_sync():
     )
 
     assert result is marker
+
+
+@pytest.mark.parametrize("attn_dp_size", [1, 2])
+def test_tbo_sync_metadata_matches_tp_group_size(monkeypatch, attn_dp_size):
+    # Replicated DP2/TP4 has attn_dp_size=1 and four ranks per collective.
+    # DP attention instead gathers both attention-DP shards in one TP8 group.
+    group_size = attn_dp_size * 4
+    group = SimpleNamespace(
+        cpu_group=object(),
+        active_ranks_cpu=torch.ones(group_size, dtype=torch.int32),
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        spec_info=None,
+        extend_num_tokens=8192,
+        extend_lens=[4096, 4096],
+        extend_logprob_start_lens=[4095, 4095],
+        return_logprob=False,
+        batch_size=lambda: 2,
+        reqs=[SimpleNamespace(origin_input_ids=range(8192)) for _ in range(2)],
+    )
+    adapter = SimpleNamespace(
+        server_args=SimpleNamespace(dp_size=2, disable_overlap_schedule=False),
+        ps=SimpleNamespace(attn_dp_size=attn_dp_size, attn_tp_size=4, attn_cp_size=1),
+        tp_group=group,
+        get_idle_batch=lambda: pytest.fail("an active batch must not become idle"),
+        offload_tags=set(),
+    )
+
+    def all_gather(output, local, group):
+        assert output.numel() == local.numel() * group_size
+        output.copy_(local.repeat(group_size))
+
+    monkeypatch.setenv("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "0")
+    monkeypatch.setattr(dp_attn, "get_tp_group", lambda: group)
+    monkeypatch.setattr(dp_attn, "cuda_graph_fully_disabled", lambda: True)
+    monkeypatch.setattr(dp_attn, "require_mlp_tp_gather", lambda _: attn_dp_size > 1)
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", all_gather)
+    monkeypatch.setattr(two_batch_overlap, "is_tbo_enabled", lambda: True)
+    monkeypatch.setattr(two_batch_overlap, "get_moe_a2a_backend", _FakeNoEpBackend)
+    monkeypatch.setattr(
+        two_batch_overlap,
+        "get_deepep_mode",
+        lambda: SimpleNamespace(resolve=lambda _: None),
+    )
+
+    result = SchedulerDPAttnAdapter.prepare_mlp_sync_batch(adapter, batch)
+
+    assert result is batch
+    assert result.global_num_tokens == [8192] * attn_dp_size
+    assert result.global_num_tokens_for_logprob == [2] * attn_dp_size
+    assert result.tbo_split_seq_index == 1
+    assert result.global_forward_mode == ForwardMode.EXTEND
 
 
 @pytest.mark.parametrize(

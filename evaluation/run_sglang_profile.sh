@@ -23,9 +23,12 @@ if [[ -n "${served_model_name}" ]]; then
     model_args+=(--served-model-name "${served_model_name}")
 fi
 
-tokenize_args=()
+profile_args=(--profile-prefix "${profile_prefix}")
 if [[ "${tokenize_prompt}" == "1" ]]; then
-    tokenize_args+=(--tokenize-prompt)
+    profile_args+=(--tokenize-prompt)
+fi
+if [[ "${fake_prefill}" == "1" ]]; then
+    profile_args+=(--fake-prefill)
 fi
 
 python3 -m sglang.bench_serving \
@@ -44,4 +47,4 @@ python3 -m sglang.bench_serving \
     --warmup-requests "${warmup_requests}" \
     --max-concurrency "${max_concurrency}" \
     --profile \
-    "${tokenize_args[@]}"
+    "${profile_args[@]}"

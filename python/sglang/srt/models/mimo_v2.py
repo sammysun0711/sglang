@@ -92,6 +92,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_v2_utils import (
+    mimo_flydsl_target_verify_enabled,
     supports_native_mimo_vectorized_v_cache,
 )
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
@@ -161,7 +162,10 @@ def _mimo_needs_v_padding(
         not force_v_pad
         and head_dim == 192
         and v_head_dim == 128
-        and num_kv_heads == 1
+        and (
+            num_kv_heads == 1
+            or (num_kv_heads == 2 and mimo_flydsl_target_verify_enabled())
+        )
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
     )
     return not native_aiter_v_cache

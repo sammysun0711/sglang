@@ -57,16 +57,17 @@ export SGLANG_FLYDSL_MIMO_PREFILL=0
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
 export SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d
 export SGLANG_AITER_UNIFIED_VERIFY=1
-# Flash TP4 has two local draft KV heads. Use the AITER/Gluon path with
-# NHD draft KV rather than the Pro-only FlyPA draft layout.
+# Flash TP4 has two local draft KV heads. FlyDSL uses BF16 SHUFFLE-5D
+# draft KV; the Gluon fallback retains the existing NHD draft layout.
 export SGLANG_USE_AITER_UNIFIED_ATTN=1
-export SGLANG_AITER_DFLASH_SWA_IMPL=gluon
-export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL=gluon
-# Gluon's native multi-query kernel is limited to qlen <= 4. Verify a
-# DFlash block of 8 as eight causal qlen-1 rows with shared paged KV.
+# Set SGLANG_AITER_PA_DECODE_IMPL=gluon to restore the Gluon target and NHD draft.
+export SGLANG_AITER_PA_DECODE_IMPL="${SGLANG_AITER_PA_DECODE_IMPL:-flydsl}"
+export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL="${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL:-${SGLANG_AITER_PA_DECODE_IMPL}}"
+export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-${SGLANG_AITER_PA_DECODE_IMPL}}"
+# Retain qlen-1 expansion for the Gluon fallback. FlyDSL consumes Qlen8
+# directly and uses native V128 for both Flash TP4 target KV pools.
 export SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_AITER_PA_DECODE_IMPL="${SGLANG_AITER_PA_DECODE_IMPL:-gluon}"
 export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
 export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
@@ -116,7 +117,7 @@ export LOG_DIR="${LOG_DIR:-${SGLANG_ROOT}/evaluation/logs/mimo_v2.6_static_fp8_$
 export LOG_FILE="${LOG_FILE:-server_tp8_mimo_v2.6_static_fp8_accuracy.log}"
 
 echo "MiMo-V2.6: static FP8 blockscale MoE weights converted from MXFP4 at load time"
-echo "Attention: CK prefill; target-verify=${SGLANG_AITER_PA_DECODE_IMPL}; SWA/sink and ordinary decode=AITER/Gluon"
+echo "Attention: full target-verify=${SGLANG_AITER_PA_DECODE_IMPL}; SWA target-verify=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}; BF16 draft=${SGLANG_AITER_DFLASH_SWA_IMPL}"
 
 echo "Configuration: tp=4, dp=2, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, speculative=DFLASH, dflash-block=${DFLASH_BLOCK_SIZE}, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"

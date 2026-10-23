@@ -50,6 +50,47 @@ def test_mimo_model_uses_native_v128_only_for_target_vectorized_5d(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "full_impl,swa_impl,native",
+    [
+        ("gluon", "gluon", False),
+        ("flydsl", "gluon", False),
+        ("gluon", "flydsl", False),
+        ("flydsl", "flydsl", True),
+    ],
+)
+def test_flash_tp4_native_v128_requires_both_flydsl_target_paths(
+    monkeypatch, full_impl, swa_impl, native
+):
+    monkeypatch.setenv("SGLANG_AITER_PA_DECODE_IMPL", full_impl)
+    monkeypatch.setenv("SGLANG_AITER_TARGET_VERIFY_SWA_IMPL", swa_impl)
+    monkeypatch.setenv("SGLANG_AITER_KV_CACHE_LAYOUT", "vectorized_5d")
+    monkeypatch.setattr(mimo_v2, "get_attention_tp_size", lambda: 4)
+    server_args = SimpleNamespace(attention_backend="aiter")
+    config = SimpleNamespace(
+        head_dim=192,
+        swa_head_dim=192,
+        v_head_dim=128,
+        swa_v_head_dim=128,
+        num_key_value_heads=4,
+        swa_num_key_value_heads=8,
+    )
+    assert (
+        mimo_v2._mimo_model_uses_native_v_cache(config=config, server_args=server_args)
+        is native
+    )
+    assert (
+        mimo_v2._mimo_needs_v_padding(
+            head_dim=192,
+            v_head_dim=128,
+            num_kv_heads=2,
+            server_args=server_args,
+            force_v_pad=not native,
+        )
+        is not native
+    )
+
+
+@pytest.mark.parametrize(
     "full_kv_heads,swa_kv_heads,expected",
     [(1, 1, True), (2, 1, False), (1, 2, False)],
 )
@@ -2705,10 +2746,14 @@ def test_flydsl_swa_prepares_graph_stable_metadata(
     assert backend._flydsl_dflash_swa_kv_indptr.shape == (5,)
 
 
-def test_flydsl_target_swa_qlen8_compacts_full_context_table(monkeypatch):
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+@pytest.mark.parametrize("query_length", [1, 8])
+def test_flydsl_target_swa_qlen8_compacts_full_context_table(
+    monkeypatch, num_kv_heads, query_length
+):
     monkeypatch.delenv("SGLANG_AITER_VEC5D_SWA_VERIFY_QLEN1", raising=False)
     monkeypatch.setenv("SGLANG_AITER_TARGET_VERIFY_SWA_IMPL", "flydsl")
-    batch_size, query_length = 1, 8
+    batch_size = 1
     backend = SimpleNamespace(
         is_draft_worker=False,
         use_sliding_window_kv_pool=True,
@@ -2732,16 +2777,18 @@ def test_flydsl_target_swa_qlen8_compacts_full_context_table(monkeypatch):
     )
     q = torch.zeros((query_length, 16 * 192), dtype=torch.bfloat16)
     output = torch.empty((query_length, 16 * 128), dtype=torch.bfloat16)
-    k_cache = torch.empty((1024, 1, 24, 64, 8), dtype=torch.bfloat16)
-    v_cache = torch.empty((1024, 1, 8, 128, 8), dtype=torch.bfloat16)
+    k_cache = torch.empty((1024, num_kv_heads, 24, 64, 8), dtype=torch.bfloat16)
+    v_cache = torch.empty((1024, num_kv_heads, 8, 128, 8), dtype=torch.bfloat16)
     forward_batch = SimpleNamespace(
         batch_size=batch_size,
-        seq_lens=torch.tensor([65528], dtype=torch.int64),
+        seq_lens=torch.tensor(
+            [65536 if query_length == 1 else 65528], dtype=torch.int64
+        ),
     )
     layer = SimpleNamespace(
         sliding_window_size=128,
         tp_q_head_num=16,
-        tp_k_head_num=1,
+        tp_k_head_num=num_kv_heads,
         qk_head_dim=192,
         v_head_dim=128,
         scaling=192**-0.5,
@@ -2782,43 +2829,53 @@ def test_flydsl_target_swa_qlen8_compacts_full_context_table(monkeypatch):
         backend, batch_size, query_length, window_size=128
     )
     aiter_utils.prepare_flydsl_swa_forward_metadata(
-        backend, batch_size, forward_batch.seq_lens
+        backend,
+        batch_size,
+        forward_batch.seq_lens,
+        context_includes_query=query_length == 1,
     )
 
-    aiter_utils.forward_target_verify_vectorized_5d(
-        backend, q, layer, forward_batch, k_cache, v_cache, output, sinks
+    forward = (
+        aiter_utils.forward_decode_vectorized_5d
+        if query_length == 1
+        else aiter_utils.forward_target_verify_vectorized_5d
     )
-    aiter_utils.forward_target_verify_vectorized_5d(
-        backend, q, layer, forward_batch, k_cache, v_cache, output, sinks
-    )
+    forward(backend, q, layer, forward_batch, k_cache, v_cache, output, sinks)
+    forward(backend, q, layer, forward_batch, k_cache, v_cache, output, sinks)
 
     args = captured["args"]
     assert captured["flatten_calls"] == 1
     assert captured["flydsl_calls"] == 2
-    assert args[4].tolist() == [0, 4]
-    assert args[5][:4].tolist() == [1020, 1021, 1022, 1023]
+    expected_pages = 3 if query_length == 1 else 4
+    assert args[4].tolist() == [0, expected_pages]
+    assert args[5][:expected_pages].tolist() == list(range(1024 - expected_pages, 1024))
     assert captured["kv_last_page_lens"].tolist() == [64]
-    assert args[7] == 199
-    assert captured["window_left"] == 128
+    assert args[7] == 128 + 63 + query_length
+    assert captured["window_left"] == (127 if num_kv_heads == 2 else 128)
     assert torch.all(output == 5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize(
-    "qk_dim,window_size,total_kv",
-    [(128, 1024, 2048), (192, 128, 4096)],
-    ids=["draft-d128", "target-d192"],
+    "qk_dim,window_size,total_kv,num_kv_heads",
+    [
+        (128, 1024, 2048, 1),
+        (192, 128, 4096, 1),
+        (192, 128, 4096, 2),
+        (128, 1024, 2048, 2),
+    ],
+    ids=["draft-d128", "target-d192", "flash-tp4-target", "flash-tp4-draft"],
 )
 def test_flydsl_swa_qlen8_matches_torch_and_replays_graph(
-    qk_dim, window_size, total_kv
+    monkeypatch, qk_dim, window_size, total_kv, num_kv_heads
 ):
-    if not aiter_utils.is_gfx950():
-        pytest.skip("DFlash FlyPA SWA is validated on gfx950")
+    if not (aiter_utils.is_gfx950() or aiter_utils.is_gfx942()):
+        pytest.skip("DFlash FlyPA SWA requires gfx942 or gfx950")
 
     torch.manual_seed(20260918 + qk_dim)
     device = torch.device("cuda")
     query_length, page_size = 8, 64
-    num_q_heads, num_kv_heads, value_dim = 16, 1, 128
+    num_q_heads, value_dim = 16, 128
     num_pages = total_kv // page_size
     prefix_length = total_kv - query_length
 
@@ -2843,10 +2900,11 @@ def test_flydsl_swa_qlen8_matches_torch_and_replays_graph(
     )
     page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(1, -1)
     backend = SimpleNamespace(
+        is_draft_worker=qk_dim == 128,
         page_size=page_size,
         kv_cache_dtype=torch.bfloat16,
         num_head=num_q_heads,
-        num_kv_head=num_kv_heads,
+        num_kv_head=num_kv_heads if qk_dim == 128 else 1,
         head_dim=qk_dim,
         v_head_dim=value_dim,
         device=device,
@@ -2854,14 +2912,18 @@ def test_flydsl_swa_qlen8_matches_torch_and_replays_graph(
         _flydsl_dflash_swa_enabled=qk_dim == 128,
         _flydsl_target_verify_swa_enabled=qk_dim == 192,
     )
-    aiter_utils._prepare_flydsl_swa(
-        backend,
-        max_batch_size=1,
-        query_length=query_length,
-        window_size=window_size,
-        qk_head_dim=qk_dim,
-        env_name="gpu-test",
-    )
+    if qk_dim == 128 and num_kv_heads == 2:
+        monkeypatch.setenv("SGLANG_AITER_DFLASH_SWA_IMPL", "flydsl")
+        aiter_utils.prepare_flydsl_dflash_swa(backend, 1, query_length, window_size)
+    else:
+        aiter_utils._prepare_flydsl_swa(
+            backend,
+            max_batch_size=1,
+            query_length=query_length,
+            window_size=window_size,
+            qk_head_dim=qk_dim,
+            env_name="gpu-test",
+        )
     backend.forward_metadata = SimpleNamespace(
         max_q_len=query_length,
         qo_indptr=torch.tensor([0, query_length], dtype=torch.int32, device=device),
@@ -2919,12 +2981,12 @@ def test_flydsl_swa_qlen8_matches_torch_and_replays_graph(
         k_tail = (
             k_linear[first_token:context_len]
             .float()
-            .expand(-1, num_q_heads, -1)
+            .repeat_interleave(num_q_heads // num_kv_heads, dim=1)
         )
         v_tail = (
             v_linear[first_token:context_len]
             .float()
-            .expand(-1, num_q_heads, -1)
+            .repeat_interleave(num_q_heads // num_kv_heads, dim=1)
         )
         scores = torch.einsum("qhd,khd->hqk", q.float(), k_tail) * layer.scaling
         q_positions = torch.arange(
@@ -2932,7 +2994,8 @@ def test_flydsl_swa_qlen8_matches_torch_and_replays_graph(
         )
         k_positions = torch.arange(first_token, context_len, device=device)
         visible = (k_positions[None, :] <= q_positions[:, None]) & (
-            k_positions[None, :] >= (q_positions - window_size)[:, None]
+            k_positions[None, :]
+            >= (q_positions - window_size + int(num_kv_heads == 2))[:, None]
         )
         scores.masked_fill_(~visible.unsqueeze(0), float("-inf"))
         sink_scores = sinks[:, None, None].expand(num_q_heads, query_length, 1)
@@ -2942,7 +3005,7 @@ def test_flydsl_swa_qlen8_matches_torch_and_replays_graph(
         return torch.einsum("hqk,khd->qhd", probabilities, v_tail)
 
     expected = reference(prefix_length)
-    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.005, atol=0.005)
     eager = actual.clone()
 
     graph = torch.cuda.CUDAGraph()
@@ -2961,7 +3024,7 @@ def test_flydsl_swa_qlen8_matches_torch_and_replays_graph(
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(
-        graph_output.float(), reference(replay_prefix), rtol=0.02, atol=0.02
+        graph_output.float(), reference(replay_prefix), rtol=0.005, atol=0.005
     )
 
 

@@ -8,13 +8,12 @@ set -euo pipefail
 # from AITER PR #18. Rebuild cached CK attention modules after patching CK.
 # This launcher never applies patches or changes the installed packages.
 #
-# The Flash baseline uses TP4 x DP2 with DFlash block 8; the filename is retained
-# for compatibility with the original Pro-RL launcher.
-# MODEL_PATH=/models/MiMo-V2.6-Flash-MOPD/ bash evaluation/launch_tp8_noep_aiter_mtp_accuracy_baseline_v2.6_static_fp8.sh
-# DRY_RUN=1 prints the command; CHECK_ONLY=1 checks dependencies without serving.
+# The Flash baseline uses TP4 x DP2 with DFlash block 8.
+# Additional server options may be passed as positional arguments.
+# DRY_RUN=1 prints the command
 # AITER_ROOT may select a source checkout; otherwise use the installed AITER.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD/}"
 export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL_PATH:-${MODEL_PATH%/}/dflash}"
@@ -205,6 +204,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \
   "${custom_all_reduce_args[@]}" \
+  "$@" \
 )
 
 printf 'Command:'
@@ -214,92 +214,5 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-# Resolve the MiMo GEMM table from the selected installation, not a machine-
-# specific checkout. Avoid merging unrelated model tables with duplicate rows.
-if [[ -z "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE:-}" ]]; then
-  AITER_CONFIG_GEMM_A8W8_BLOCKSCALE="$("${PYTHON_BIN}" - <<'PY_CONFIG'
-import importlib.util
-from pathlib import Path
-spec = importlib.util.find_spec("aiter")
-if spec is None or spec.origin is None:
-    raise SystemExit("AITER is not installed in this Python environment")
-print(Path(spec.origin).parent / "configs/model_configs/a8w8_blockscale_tuned_gemm_mimo_v2_5_pro.csv")
-PY_CONFIG
-)"
-  export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
-fi
-
-"${PYTHON_BIN}" - <<'PY_CHECK'
-import os
-import json
-from pathlib import Path
-import torch
-import aiter
-import flydsl
-from aiter.jit.core import CK_DIR
-try:
-    from aiter.ops.flydsl import mxfp4_to_fp8_128block
-except ImportError as exc:
-    raise SystemExit(
-        f"AITER at {aiter.__file__} does not expose the required conversion API. "
-        "Install the MXFP4-to-FP8 AITER PR and FlyDSL 0.3.2; check PYTHONPATH/AITER_ROOT."
-    ) from exc
-print(f"AITER: {aiter.__file__}; FlyDSL: {flydsl.__version__}")
-draft_path = Path(os.environ["SPECULATIVE_DRAFT_MODEL_PATH"])
-draft_config_path = draft_path / "config.json"
-if not draft_config_path.is_file():
-    raise SystemExit(f"Missing DFlash draft config: {draft_config_path}")
-draft_config = json.loads(draft_config_path.read_text())
-if "DFlashDraftModel" not in draft_config.get("architectures", []):
-    raise SystemExit(f"Expected DFlashDraftModel at {draft_path}")
-index_path = draft_path / "model.safetensors.index.json"
-if not index_path.is_file():
-    raise SystemExit(f"Missing DFlash checkpoint index: {index_path}")
-for shard in set(json.loads(index_path.read_text())["weight_map"].values()):
-    if not (draft_path / shard).is_file():
-        raise SystemExit(f"Missing DFlash checkpoint shard: {draft_path / shard}")
-print(f"DFlash draft: {draft_path}; configured block={os.environ['DFLASH_BLOCK_SIZE']}; checkpoint block={draft_config.get('block_size')}")
-if not torch.version.hip or torch.cuda.device_count() < 8:
-    raise SystemExit("This TP4/DP2 launcher requires eight visible ROCm GPUs")
-arches = [torch.cuda.get_device_properties(i).gcnArchName.split(":")[0] for i in range(8)]
-if any(arch not in ("gfx942", "gfx950") for arch in arches):
-    raise SystemExit(f"MXFP4-to-FP8 supports gfx942/gfx950, found {arches}")
-table = Path(os.environ["AITER_CONFIG_GEMM_A8W8_BLOCKSCALE"])
-if not table.is_file():
-    raise SystemExit(f"Missing MiMo blockscale GEMM table: {table}")
-print(f"GEMM table: {table}")
-# Check the known CK extension used by this baseline. The conversion PR does
-# not include it; cached/chunked full attention can otherwise fail only after
-# loading the entire model. CK_DIR is AITER's supported source override.
-codegen = Path(CK_DIR) / "example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py"
-if not codegen.is_file() or "def _get_mimo_d192_tiles(" not in codegen.read_text():
-    raise SystemExit(
-        f"Missing CK MiMo page64 QK192/V128 prefill extension in {CK_DIR}. "
-        "This attention baseline requires the separate "
-        "patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch "
-        "from AITER (or its integrated equivalent). Prepare that CK dependency "
-        "before launch; the script does not apply it."
-    )
-print(f"CK MiMo prefill extension: {codegen}")
-if "gfx942" in arches:
-    scatter = Path(CK_DIR) / "include/ck_tile/core/tensor/tile_scatter_gather.hpp"
-    kernel = Path(CK_DIR) / "include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp"
-    if (
-        not scatter.is_file()
-        or "make_wave_buffer_resource(nullptr, 0)" not in scatter.read_text()
-        or not kernel.is_file()
-        or "sink / variant_params.sm_scale" not in kernel.read_text()
-    ):
-        raise SystemExit(
-            "Missing gfx942 CK prefill bounds/sink fixes. Apply the complete "
-            "MiMo CK patch from https://github.com/sammysun0711/aiter/pull/18 "
-            "and rebuild cached mha_batch_prefill modules before launch."
-        )
-    print("CK gfx942 prefill bounds/sink source checks passed (AITER PR #18)")
-PY_CHECK
-
-if [[ "${CHECK_ONLY:-0}" == "1" ]]; then
-  exit 0
-fi
 mkdir -p -- "${LOG_DIR}"
 "${server_cmd[@]}" 2>&1 | tee "${LOG_DIR}/${LOG_FILE}"

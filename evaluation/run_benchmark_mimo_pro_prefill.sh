@@ -23,8 +23,8 @@ host="${HOST:-0.0.0.0}"
 port="${PORT:-30001}"
 case "${benchmark_preset}" in
   customer)
-    default_tokens="4096"
-    default_small_concurrency="1"
+    default_tokens="4096 8192 16384 32768 65536 131068 262144 524284 786428 1047548"
+    default_small_concurrency="32"
     default_short_concurrency="16"
     default_long_concurrency="2"
     short_input_max_tokens=262144

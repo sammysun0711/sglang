@@ -657,6 +657,8 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
+    # Fuse compact-window request-table preparation without reading GPU sizes.
+    SGLANG_DFLASH_FUSED_COMPACT_KV = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

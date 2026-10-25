@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -42,6 +43,9 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
     _compute_dflash_accept_bonus_triton_unchecked,
+)
+from sglang.srt.speculative.triton_ops.dflash_compact_kv import (
+    compact_dflash_req_to_token,
 )
 from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
     _prepare_dflash_draft_block_unchecked,
@@ -244,6 +248,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._draft_compact_seq_lens_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
@@ -317,6 +322,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
+        self._use_fused_compact_kv = (
+            supports_gpu_triton and envs.SGLANG_DFLASH_FUSED_COMPACT_KV.get()
+        )
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None
@@ -483,6 +491,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             (new_cap, block_size), dtype=torch.int64, device=device
         )
         self._draft_block_end_buf = torch.empty(
+            (new_cap,), dtype=torch.int32, device=device
+        )
+        self._draft_compact_seq_lens_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
         self._draft_seq_lens_cpu_buf = torch.empty(
@@ -1495,37 +1506,55 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
-            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
-
-            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
-                torch.int64
-            )
-            suffix_cache_loc = self._gather_req_to_token_segments(
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                req_pool_indices=model_worker_batch.req_pool_indices,
-                start=suffix_start,
-                lengths=draft_prefix_lens,
-            )
-            assign_req_to_token_pool_func(
-                model_worker_batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
-                torch.zeros_like(draft_prefix_lens),
-                draft_prefix_lens,
-                suffix_cache_loc,
-                bs,
-            )
-
-            block_end = self._draft_block_end_buf[:bs]
-            torch.add(draft_prefix_lens, block_size, out=block_end)
-            assign_req_to_token_pool_func(
-                model_worker_batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
-                draft_prefix_lens,
-                block_end,
-                verify_out_cache_loc,
-                bs,
-            )
+            if self._use_fused_compact_kv:
+                draft_prefix_lens = self._draft_compact_seq_lens_buf[:bs]
+                compact_dflash_req_to_token(
+                    prefix_lens,
+                    model_worker_batch.req_pool_indices,
+                    self.model_runner.req_to_token_pool.req_to_token,
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    verify_out_cache_loc_2d,
+                    draft_prefix_lens,
+                    window_size=int(self.draft_window_size),
+                    page_size=int(self.page_size),
+                )
+                # The planner still consumes exact CPU lengths. Keep this
+                # transfer; fusion removes max().item(), nonzero and gather.
+                seq_lens_cpu.copy_(
+                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                )
+            else:
+                draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+                seq_lens_cpu.copy_(
+                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                )
+                suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                    torch.int64
+                )
+                suffix_cache_loc = self._gather_req_to_token_segments(
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    req_pool_indices=model_worker_batch.req_pool_indices,
+                    start=suffix_start,
+                    lengths=draft_prefix_lens,
+                )
+                assign_req_to_token_pool_func(
+                    model_worker_batch.req_pool_indices,
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    torch.zeros_like(draft_prefix_lens),
+                    draft_prefix_lens,
+                    suffix_cache_loc,
+                    bs,
+                )
+                block_end = self._draft_block_end_buf[:bs]
+                torch.add(draft_prefix_lens, block_size, out=block_end)
+                assign_req_to_token_pool_func(
+                    model_worker_batch.req_pool_indices,
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    draft_prefix_lens,
+                    block_end,
+                    verify_out_cache_loc,
+                    bs,
+                )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:

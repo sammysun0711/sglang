@@ -2471,7 +2471,11 @@ def forward_extend_vectorized_5d(
     else:
         slot_ids = metadata.kv_indices[:total_kv]
 
-    k_lin, v_lin = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
+    if not hasattr(backend, "_linear_kv_workspace"):
+        backend._linear_kv_workspace = {}
+    k_lin, v_lin = launch_gather_shuffle_5d_to_linear(
+        k_buf, v_buf, slot_ids, workspace=backend._linear_kv_workspace
+    )
     # k_lin / v_lin come out in ``store_dtype`` (uint8 for fp8 pools
     # because ``Tensor.index_put`` isn't implemented for fp8 — see
     # ``MHATokenToKVPool`` ctor). Reinterpret them back to the compute

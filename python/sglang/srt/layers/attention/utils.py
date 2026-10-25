@@ -741,6 +741,8 @@ def launch_gather_shuffle_5d_to_linear(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    *,
+    workspace: dict | None = None,
 ):
     """Inverse of :func:`launch_reshape_and_cache_shuffle_5d`.
 
@@ -755,6 +757,12 @@ def launch_gather_shuffle_5d_to_linear(
         value_cache: (num_blocks, num_heads, block_size // X, value_head_size, X)
         slot_mapping: (T,) per-token absolute slot id in
             ``[0, num_blocks * block_size)``
+        workspace: Optional scratch buffers owned by one attention backend.
+            Returned tensors alias this storage and are overwritten by the
+            next gather with the same layout. Use one workspace per execution
+            stream. Buffers grow geometrically to avoid allocator fragmentation
+            as chunked prefill extends the context. Graph capture uses separate
+            allocations so later workspace growth cannot invalidate a graph.
     """
     assert key_cache.dim() == 5 and value_cache.dim() == 5
     num_blocks, num_heads, kc_D_over_X, block_size, X = key_cache.shape
@@ -765,16 +773,46 @@ def launch_gather_shuffle_5d_to_linear(
     value_head_size = vc_D
 
     num_tokens = slot_mapping.numel()
-    key_out = torch.empty(
-        (num_tokens, num_heads, key_head_size),
-        dtype=key_cache.dtype,
-        device=key_cache.device,
+    if (
+        workspace is not None
+        and key_cache.device.type == "cuda"
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        workspace = None
+    layout = (
+        num_heads,
+        key_head_size,
+        value_head_size,
+        key_cache.dtype,
+        value_cache.dtype,
+        key_cache.device,
     )
-    value_out = torch.empty(
-        (num_tokens, num_heads, value_head_size),
-        dtype=value_cache.dtype,
-        device=value_cache.device,
-    )
+    buffers = workspace.get(layout) if workspace is not None else None
+    if buffers is None or buffers[0].shape[0] < num_tokens:
+        # Release the previous workspace before allocating its replacement.
+        if workspace is not None:
+            workspace.pop(layout, None)
+            buffers = None
+        capacity = (
+            triton.next_power_of_2(max(1, num_tokens))
+            if workspace is not None
+            else num_tokens
+        )
+        buffers = (
+            torch.empty(
+                (capacity, num_heads, key_head_size),
+                dtype=key_cache.dtype,
+                device=key_cache.device,
+            ),
+            torch.empty(
+                (capacity, num_heads, value_head_size),
+                dtype=value_cache.dtype,
+                device=value_cache.device,
+            ),
+        )
+        if workspace is not None:
+            workspace[layout] = buffers
+    key_out, value_out = (buffer[:num_tokens] for buffer in buffers)
 
     HEAD_BLOCK = min(4, triton.next_power_of_2(num_heads))
     KEY_BLOCK_D = triton.next_power_of_2(key_head_size)

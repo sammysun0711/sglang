@@ -1770,7 +1770,7 @@ def _run_vectorized_prefill_scale_case(
 
         return run
 
-    def fake_gather(k_buf, v_buf, slot_ids):
+    def fake_gather(k_buf, v_buf, slot_ids, *, workspace=None):
         captured["gather_slot_ids"] = slot_ids
         return (
             torch.zeros((1, 1, 192), dtype=torch.uint8),
@@ -1969,7 +1969,7 @@ def _run_flypa_prefill_case(
             (q.shape[0], q.shape[1], 128), dtype=torch.bfloat16, device=q.device
         )
 
-    def fake_gather(k_buf, v_buf, slot_ids):
+    def fake_gather(k_buf, v_buf, slot_ids, *, workspace=None):
         captured["gather_slot_ids"] = slot_ids
         return (
             torch.zeros((slot_ids.numel(), 1, 192), dtype=kv_dtype),

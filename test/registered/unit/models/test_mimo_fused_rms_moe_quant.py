@@ -12,9 +12,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import mimo_v2
 
 
-def _decoder_stub(weight_dtype: torch.dtype):
+def _decoder_stub(weight_dtype: torch.dtype, hidden_size: int = 6144):
     layer = mimo_v2.MiMoV2DecoderLayer.__new__(mimo_v2.MiMoV2DecoderLayer)
     nn.Module.__init__(layer)
+    layer.hidden_size = hidden_size
     layer.mlp = SimpleNamespace(
         _enable_a2a_moe=False,
         experts=SimpleNamespace(w13_weight=torch.empty(1, dtype=weight_dtype)),
@@ -60,6 +61,24 @@ def test_mimo_fused_rms_moe_quant_selector(
     layer = _decoder_stub(weight_dtype)
 
     with mimo_v2.envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.override(enabled):
+        assert layer._detect_fused_rms_moe_quant_format() == expected
+
+
+@pytest.mark.parametrize(
+    "hidden_size,expected", [(4096, "fp8_moe"), (6144, "fp8_moe"), (8192, "")]
+)
+def test_mimo_fused_moe_norm_requires_supported_hidden_size(
+    monkeypatch, hidden_size, expected
+):
+    monkeypatch.setattr(mimo_v2, "is_gfx942_supported", lambda: True)
+    monkeypatch.setattr(mimo_v2, "get_moe_expert_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        mimo_v2,
+        "get_moe_runner_backend",
+        lambda: SimpleNamespace(is_aiter=lambda: True, is_auto=lambda: False),
+    )
+    layer = _decoder_stub(torch.float8_e4m3fnuz, hidden_size)
+    with mimo_v2.envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.override(True):
         assert layer._detect_fused_rms_moe_quant_format() == expected
 
 

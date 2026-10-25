@@ -936,6 +936,7 @@ class MiMoV2DecoderLayer(nn.Module):
         # see _is_fused_rms_{moe,qkv}_quant_supported in layers/communicator.py.
         if (
             not envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.get()
+            or self.hidden_size not in (4096, 6144)
             or not (is_gfx95_supported() or is_gfx942_supported())
             or not (moe_backend.is_aiter() or moe_backend.is_auto())
             or get_moe_expert_parallel_world_size() != 1

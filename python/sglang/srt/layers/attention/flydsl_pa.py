@@ -9,8 +9,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.expr.typing import T, as_ir_value
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl._mlir.dialects import llvm, vector
+from flydsl.expr import arith, gpu, rocdl
+from flydsl._mlir.dialects import llvm
 from flydsl.expr.typing import Vector as Vec
 
 from . import flydsl_helpers as fxh
@@ -598,6 +598,7 @@ def PagedAttention(
         kv_last_page_lens: fx.Tensor,
         O_: fx.Tensor,
         work_counter: fx.Tensor,
+        q_row_stride: fx.Int64,
     ):
         tid = fx.thread_idx.x
 
@@ -692,10 +693,20 @@ def PagedAttention(
             #      Q_[query_start:query_end, head_qo, head_dim]
             #      O_[query_start:query_end, head_qo, head_dim]
             # q_descale[query_start:query_end, head_qo, 1]
-            q_tile = fx.make_view(fx.get_iter(Q_) + query_start * num_qo_heads * head_dim_qk,
-                                  fx.make_ordered_layout((BM, num_qo_heads, head_dim_qk),(2, 1, 0)))
+            # Q can be the strided query view of fused QKV. Preserve its token
+            # stride instead of requiring a full query copy at every layer.
+            q_tile = fx.make_view(
+                fx.get_iter(Q_) + fx.Int64(query_start) * q_row_stride,
+                fx.make_layout(
+                    (BM, num_qo_heads, head_dim_qk),
+                    (q_row_stride, head_dim_qk, 1),
+                ),
+            )
             q_tile = fx.rocdl.make_buffer_tensor(q_tile, max_size=False,
-                                                 num_records_bytes = query_len * num_qo_heads * head_dim_qk * (q_tile.dtype.width // 8))
+                num_records_bytes=fx.Int32(
+                    (fx.Int64(query_len - 1) * q_row_stride + num_qo_heads * head_dim_qk)
+                    * (q_tile.dtype.width // 8)
+                ))
             q_tile = q_tile[None, head_qo, None]
 
             if fx.const_expr(quant_query_mode == "per-token"):
@@ -801,6 +812,7 @@ def PagedAttention(
         out: fx.Tensor,
         work_counter: fx.Tensor,
         num_workgroups: fx.Int32,
+        q_row_stride: fx.Int64,
         stream: fx.Stream,
     ):
         num_query_tokens = Q.shape[0].to_py_value()
@@ -854,6 +866,7 @@ def PagedAttention(
             kv_last_page_lens,
             out,
             work_counter,
+            q_row_stride,
             value_attrs=value_attrs,
         ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
 
@@ -892,6 +905,8 @@ def PagedAttention(
         num_query_tokens, _num_qo_heads, _head_dim = Q.shape
         assert _num_qo_heads == num_qo_heads
         assert _head_dim == head_dim_qk
+        if Q.stride(2) != 1 or Q.stride(1) != head_dim_qk or Q.stride(0) < num_qo_heads * head_dim_qk:
+            raise ValueError("FlyPA Q requires packed heads and a nonoverlapping token stride")
         k_vector_size = 16 // K.element_size()
         num_physical_pages = V.shape[0]
         if key_layout == "linear":
@@ -1011,6 +1026,7 @@ def PagedAttention(
                 out,
                 work_counter,
                 multi_processor_count,
+                Q.stride(0),
                 stream,
             )
             compiled_cache[cache_key] = compiled
@@ -1031,6 +1047,7 @@ def PagedAttention(
                 out,
                 work_counter,
                 multi_processor_count,
+                Q.stride(0),
                 stream,
             )
         return out

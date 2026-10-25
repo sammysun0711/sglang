@@ -1408,7 +1408,7 @@ def can_build_mimo_paged_kv_metadata(
         and kv_cache_dtype in (fp8_dtype, torch.bfloat16)
         and q_dtype == torch.bfloat16
         and num_qo_heads == CK_MIMO_PREFILL_QUERY_HEADS
-        and num_kv_heads == CK_MIMO_PREFILL_KV_HEADS
+        and num_kv_heads in (CK_MIMO_PREFILL_KV_HEADS, 2)
         and head_dim == CK_MIMO_PREFILL_HEAD_DIM
     )
 
@@ -1624,7 +1624,9 @@ def run_mimo_flypa_swa_prefill(
         backend._mimo_flypa_prefill_unit_scale = unit_scale
 
     result = flydsl_paged_attention_swa_bf16(
-        q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        # The native SWA kernel accepts a strided token axis. Q is a view into
+        # fused QKV, so making it contiguous would copy the query at every layer.
+        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
         k_buf,
         v_buf,
         backend.qo_indptr[:bs0],
@@ -1677,11 +1679,14 @@ def run_mimo_flypa_prefill(
             raise RuntimeError("FlyPA FP8 prefill requires a scalar Q descale")
     else:
         q_local = q
-        unit = torch.ones((), dtype=torch.float32, device=q.device)
+        unit = getattr(backend, "_mimo_flypa_prefill_unit_scale", None)
+        if unit is None:
+            unit = torch.ones(1, dtype=torch.float32, device=q.device)
+            backend._mimo_flypa_prefill_unit_scale = unit
         q_descale_local = unit
         k_descale_local = unit
         v_descale_local = unit
-    q_paged = q_local.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+    q_paged = q_local.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
     o = flypa(
         num_qo_heads=layer.tp_q_head_num,
         num_kv_heads=layer.tp_k_head_num,
@@ -1863,6 +1868,9 @@ def _mimo_gfx942_paged_swa_prefill(
     per-request page counts, last-page lengths, sinks and prefill masking.
     """
     metadata = backend.forward_metadata
+    # Pro TP8 has one local KV head; Flash TP4 has two. The native BF16
+    # paged kernel handles both GQA ratios and derives the head stride from K/V.
+    num_kv_heads = layer.tp_k_head_num
     lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
     if getattr(metadata, "swa_page_table", None) is None:
         return None
@@ -1883,7 +1891,8 @@ def _mimo_gfx942_paged_swa_prefill(
             layer.qk_head_dim,
             layer.v_head_dim,
         )
-        != (16, 1, 1, 192, 192, 128)
+        != (16, num_kv_heads, num_kv_heads, 192, 192, 128)
+        or num_kv_heads not in (1, 2)
         or q.dtype != torch.bfloat16
         or q.ndim != 2
         or q.shape[1] != 16 * 192
@@ -1940,8 +1949,8 @@ def _mimo_gfx942_paged_swa_prefill(
         k_buf.ndim != 5
         or v_buf.ndim != 5
         or k_buf.shape[0] != v_buf.shape[0]
-        or tuple(k_buf.shape[1:]) != (1, 24, 64, 8)
-        or tuple(v_buf.shape[1:]) != (1, 8, 128, 8)
+        or tuple(k_buf.shape[1:]) != (num_kv_heads, 24, 64, 8)
+        or tuple(v_buf.shape[1:]) != (num_kv_heads, 8, 128, 8)
         or k_buf.dtype != torch.bfloat16
         or v_buf.dtype != torch.bfloat16
         or k_buf.device != q.device
@@ -1956,7 +1965,8 @@ def _mimo_gfx942_paged_swa_prefill(
     if not getattr(backend, "_logged_gfx942_mimo_paged_swa_prefill", False):
         logger.info(
             "Using gfx942 FlyPA MiMo BF16 SWA page-64 5D prefill "
-            "(window=%s, max_q=%d, max_kv=%d); no LINEAR K/V gather.",
+            "(kv_heads=%d, window=%s, max_q=%d, max_kv=%d); no LINEAR K/V gather.",
+            num_kv_heads,
             window_size,
             int(metadata.max_q_len),
             int(metadata.max_kv_len),

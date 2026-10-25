@@ -2260,9 +2260,12 @@ def test_gfx942_bf16_flypa_requires_paged_kv_metadata(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("q_row_padding", [0, 320])
 @pytest.mark.parametrize(
     "page_size,query_length,kv_length",
     [
+        (64, 1, 1),
+        (64, 1, 257),
         (32, 16, 23),
         (32, 65, 141),
         (64, 16, 23),
@@ -2273,7 +2276,7 @@ def test_gfx942_bf16_flypa_requires_paged_kv_metadata(monkeypatch):
     ],
 )
 def test_bf16_flypa_matches_torch_with_causal_partial_last_page(
-    page_size, query_length, kv_length
+    page_size, query_length, kv_length, q_row_padding
 ):
     arch = torch.cuda.get_device_properties(
         torch.cuda.current_device()
@@ -2300,6 +2303,14 @@ def test_bf16_flypa_matches_torch_with_causal_partial_last_page(
         )
         * 0.2
     ).to(torch.bfloat16)
+    if q_row_padding:
+        query_storage = torch.full(
+            (query_length, num_qo_heads * head_dim_qk + q_row_padding),
+            float("nan"), dtype=torch.bfloat16, device=device,
+        )
+        query_view = query_storage[:, :num_qo_heads * head_dim_qk].view_as(query)
+        query_view.copy_(query)
+        query = query_view
     key_valid = (
         torch.randn(
             kv_length,
@@ -2411,6 +2422,21 @@ def test_bf16_flypa_matches_torch_with_causal_partial_last_page(
     ).to(torch.bfloat16)
 
     torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+    if q_row_padding:
+        contiguous_output = aiter_utils.flypa(
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
+            page_size=page_size,
+            is_causal=True,
+            quant_query_mode="per-tensor",
+        )(
+            query.contiguous(), key_cache, value_cache, cu_seqlens_q, None,
+            kv_indptr, kv_page_indices, query_length, kv_length, True,
+            unit_scale, unit_scale, unit_scale, kv_last_page_lens,
+        )
+        assert torch.equal(output, contiguous_output)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -2580,6 +2606,9 @@ def test_paged_kv_metadata_enabled_for_bf16_and_fp8_shuffle_5d():
     assert aiter_utils.can_build_mimo_paged_kv_metadata(
         **_mimo_paged_metadata_kwargs(kv_cache_dtype=fp8_dtype)
     )
+    assert aiter_utils.can_build_mimo_paged_kv_metadata(
+        **_mimo_paged_metadata_kwargs(num_kv_heads=2)
+    )
 
 
 def test_paged_kv_metadata_rejected_outside_mimo_contract():
@@ -2593,7 +2622,7 @@ def test_paged_kv_metadata_rejected_outside_mimo_contract():
         **_mimo_paged_metadata_kwargs(kv_cache_dtype=torch.float16)
     )
     assert not aiter_utils.can_build_mimo_paged_kv_metadata(
-        **_mimo_paged_metadata_kwargs(num_kv_heads=2)
+        **_mimo_paged_metadata_kwargs(num_kv_heads=3)
     )
     assert not aiter_utils.can_build_mimo_paged_kv_metadata(
         **_mimo_paged_metadata_kwargs(num_qo_heads=8)

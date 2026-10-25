@@ -3,17 +3,9 @@ set -euo pipefail
 
 # MiMo-V2.6: convert checkpoint MXFP4 experts once at load time to FP8
 # 128x128 blockscale weights. Activations remain dynamically quantized.
-# Requires AITER's aiter.ops.flydsl.mxfp4_to_fp8_128block (PR #17),
-# FlyDSL 0.3.2, and the CK MiMo prefill patch including gfx942 bounds fixes
-# from AITER PR #18. Rebuild cached CK attention modules after patching CK.
-# Fused MoE RMSNorm also requires AITER's MiMo N=4096/6144 group-quant kernel;
-# rebuild module_rmsnorm_quant after updating that implementation.
-# This launcher never applies patches or changes the installed packages.
-#
 # The Flash baseline uses TP4 x DP2 with DFlash block 8.
 # Additional server options may be passed as positional arguments.
 # DRY_RUN=1 prints the command
-# AITER_ROOT may select a source checkout; otherwise use the installed AITER.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -126,7 +118,7 @@ echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; compact draft t
 echo "Configuration: tp=4, dp=2, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, ep=1, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, fresh-bf16-asm=${SGLANG_AITER_MIMO_FRESH_BF16_ASM}, fresh-bf16-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN}, fresh-bf16-swa-varlen=${SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN}, speculative=DFLASH, dflash-block=${DFLASH_BLOCK_SIZE}, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=${ENABLE_TWO_BATCH_OVERLAP}, tbo-min-isl=${SGLANG_TBO_MIM_SEQ_LEN}, overlap=enabled"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
-echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/gluon, draft-kv=bf16, draft-window=1024, acceptance=real"
+echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/${SGLANG_AITER_DFLASH_SWA_IMPL}, draft-kv=bf16, draft-window=1024, acceptance=real"
 
 
 cuda_graph_args=(--cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}")

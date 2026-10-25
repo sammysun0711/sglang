@@ -46,7 +46,8 @@ pip install flydsl==0.3.2
 
 ## 3. Run baseline single node prefill benchmark
 
-Baseline prefill keeps quick-reduce disabled, mixed router disabled, FlyDSL prefill disabled, Gluon decode, BF16 KV cache
+The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
+
 
 ### Launch TBO-off server
 
@@ -58,6 +59,8 @@ SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
 DISABLE_RADIX_CACHE=1 \
 ENABLE_TWO_BATCH_OVERLAP=0 \
+SGLANG_FLYPA_MIMO_PREFILL=1 \
+SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
 ```
 
@@ -68,7 +71,7 @@ cd /sgl-workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-MiMo-v2.6-Pro Flash DP2 x TP4 baseline defaults to `ENABLE_TWO_BATCH_OVERLAP=0`.
+MiMo-V2.6-Flash-MOPD DP2 x TP4 baseline defaults to `ENABLE_TWO_BATCH_OVERLAP=0`.
 To opt into prefill-only TBO, stop the existing server and launch with:
 
 ```bash
@@ -79,6 +82,8 @@ SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
 DISABLE_RADIX_CACHE=1 \
 ENABLE_TWO_BATCH_OVERLAP=1 \
+SGLANG_FLYPA_MIMO_PREFILL=1 \
+SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
 ```
 
@@ -86,11 +91,12 @@ Each DP replica overlaps its own TP4 collectives. DP attention remains disabled;
 ordinary prefill can use TBO, while DFlash draft/verify and decode retain their
 existing paths.
 
+
 ## 4. Run baseline single node decode benchmark with fake prefill
 
 The standalone fake-prefill launcher defines the Flash baseline settings:
 TP4 x DP2, EP1, DFlash block 8, load-time MXFP4-to-FP8 MoE conversion,
-Gluon attention, BF16 target/draft KV, and disabled Quick Reduce/mixed router.
+FlyDSL attention, BF16 target/draft KV, and disabled Quick Reduce/mixed router.
 It adds `--disaggregation-mode decode --disaggregation-transfer-backend fake`.
 Acceptance is simulated at length 4 using `SGLANG_SIMULATE_ACC_LEN=4` and
 `SGLANG_SIMULATE_ACC_METHOD=match-expected`, matching the Pro fake-prefill
@@ -121,6 +127,8 @@ MEM_FRACTION_STATIC=0.75 \
 DISABLE_RADIX_CACHE=1 \
 SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
+SGLANG_FLYPA_MIMO_PREFILL=1 \
+SGLANG_AITER_PA_DECODE_IMPL=flydsl \
   ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_decode_fake_prefill_baseline.sh
 ```
 
@@ -139,7 +147,7 @@ WARMUP_REQUESTS=32 \
 
 The client uses explicit token IDs, so no four-token subtraction is needed.
 At the 1M context boundary, reserve additional slots for the scheduler:
-use `CASE_SPECS='1047548|1047548|1m|18'` for 1,024 output tokens. An input
+use `CASE_SPECS='1047548|1047548|1m|10'` for 1,024 output tokens. An input
 length of 1,047,552 leaves no scheduler margin and is capped at 1,022 output
 tokens. This margin is separate from tokenizer special tokens.
 
@@ -148,18 +156,23 @@ tokens. This margin is separate from tokenizer special tokens.
 ```bash
 python3 analyze_server_output_throughput.py \
   <path-to-server-log> \
-  --target-bs <C> \
+  --dp-rank 0 \
+  --target-bs <C-per-replica> \
   --exact-bs \
   --min-tps 40 \
   --max-tpot 25
 ```
 
 Use the analyzer's filtered server median as the reported output throughput.
+Repeat with `--dp-rank 1` for the other replica. Each scheduler reports its own
+running requests and throughput: at balanced client concurrency 128, use
+`--target-bs 64` per replica. Verify residency in the log before choosing this value. The analyzer requires explicit replica selection for logs containing multiple DP ranks. Report both medians; their sum is an aggregate estimate, not a time-aligned node-wide median. 
+
 The analyzer reports the following median-consistent derived values:
 
 ```text
-TPS/request = filtered server median / C
-TPOT (ms)   = 1000 * C / filtered server median
+TPS/request = filtered replica median / C-per-replica
+TPOT (ms)   = 1000 * C-per-replica / filtered replica median
 ```
 
 The analyzer also retains `mean_tpot_ms` and `mean_tps_per_request` as explicit
@@ -176,13 +189,15 @@ cd /sgl-workspace/sglang/evaluation
 
 Use the real-prefill accuracy launcher with acceptance simulation disabled.
 The runner uses upstream `/server_info` statistics and requires no SGLang
-source changes. It rejects decode-only servers.
+source changes. It rejects decode-only servers. Stop the fake-prefill server
+and restart the real-prefill launcher from section 3 before this step.
+The runner automatically installs EvalScope 1.11.0 in a separate client virtual
+environment; no changes to the serving environment's dependencies are needed.
 
 Run one command for the complete
 GSM8K `main` test split, 4-shot prompting, and each worker's mean acceptance length >= 4:
 
 ```bash
-pip install evalscope==1.11.0
 cd /sgl-workspace/sglang/evaluation
 MODEL_PATH=/models/MiMo-V2.6-Flash-MOPD/ \
 MIN_ACCEPT_LENGTH=4.0 \

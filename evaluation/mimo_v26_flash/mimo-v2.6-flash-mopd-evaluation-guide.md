@@ -74,7 +74,7 @@ To opt into prefill-only TBO, stop the existing server and launch with:
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
 CHUNKED_PREFILL_SIZE=16384 \
-MEM_FRACTION_STATIC=0.70 \
+MEM_FRACTION_STATIC=0.75 \
 SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
 DISABLE_RADIX_CACHE=1 \
@@ -117,7 +117,7 @@ more than that reduces the full-token pool without increasing concurrency.
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
-MEM_FRACTION_STATIC=0.70 \
+MEM_FRACTION_STATIC=0.75 \
 DISABLE_RADIX_CACHE=1 \
 SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \

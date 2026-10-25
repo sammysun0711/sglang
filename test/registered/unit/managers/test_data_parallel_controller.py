@@ -11,9 +11,10 @@ if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
 is exercised as the real method, no mock.
 """
 
+import queue
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 
@@ -60,6 +61,68 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
     )
+
+
+class TestDPSchedulerStartup(CustomTestCase):
+    def test_worker_failure_reaches_controller(self):
+        ctl = _make_controller(dp_size=2)
+        error = EOFError("scheduler exited before readiness")
+        ctl.launch_tensor_parallel_group = MagicMock(side_effect=error)
+        results = queue.Queue()
+        ctl.launch_tensor_parallel_group_thread(None, None, 4, 1, results)
+        rank, reported = results.get_nowait()
+        self.assertEqual(rank, 1)
+        self.assertIs(reported, error)
+
+    def test_success_reports_ready_before_thread_keepalive(self):
+        ctl = _make_controller(dp_size=1)
+        ctl.launch_tensor_parallel_group = MagicMock()
+        results = queue.Queue()
+        # The successful launcher thread must remain alive for its children.
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.time.sleep",
+            side_effect=InterruptedError,
+        ):
+            with self.assertRaises(InterruptedError):
+                ctl.launch_tensor_parallel_group_thread(None, None, 0, 0, results)
+        self.assertEqual(results.get_nowait(), (0, None))
+
+    def test_later_replica_failure_does_not_wait_for_earlier_replica(self):
+        ctl = _make_controller(dp_size=2)
+        error = EOFError("DP1 startup pipe closed")
+        args = SimpleNamespace(
+            dp_size=2, tp_size=4, pp_size=1, gpu_id_step=1, node_rank=1
+        )
+        ports = SimpleNamespace(
+            tokenizer_ipc_name="tokenizer",
+            detokenizer_ipc_name="detokenizer",
+            instance_id="test",
+        )
+
+        def fake_thread(*, target, args):
+            # DP0 never becomes ready. Only DP1 reports a startup failure.
+            rank, results = args[3:]
+            thread = MagicMock()
+            if rank == 1:
+                thread.start.side_effect = lambda: results.put((rank, error))
+            return thread
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.PortArgs.init_new",
+                side_effect=lambda _: SimpleNamespace(nccl_port=12345),
+            ),
+            patch("sglang.srt.managers.data_parallel_controller.bind_port"),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.threading.Thread",
+                side_effect=fake_thread,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "DP1 scheduler initialization"
+            ) as cm:
+                ctl.launch_dp_schedulers(args, ports)
+        self.assertIs(cm.exception.__cause__, error)
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):

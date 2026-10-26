@@ -780,6 +780,10 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        # Keep the public entry behind reg_reduce_scatter_tensor so Dynamo sees
+        # one registered collective, just like the all-gather path.
+        if self._maybe_aiter_reduce_scatter(output, input):
+            return
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -800,6 +804,59 @@ class GroupCoordinator:
             self._reduce_scatter_tensor(output, input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
+
+    def _has_aiter_custom_reduce_scatter(self) -> bool:
+        if self._deterministic_collectives_enabled():
+            return False
+        ca_comm = self.ca_comm
+        return (
+            ca_comm is not None
+            and not getattr(ca_comm, "disabled", True)
+            and callable(getattr(ca_comm, "should_custom_ar", None))
+            and callable(getattr(ca_comm, "reduce_scatter", None))
+        )
+
+    def _maybe_aiter_reduce_scatter(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> bool:
+        if not (
+            is_hip()
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            and self._has_aiter_custom_reduce_scatter()
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and output.dtype == input.dtype
+            and output.device == input.device
+            and input.ndim > 0
+            and output.ndim == input.ndim
+            and input.shape[1:] == output.shape[1:]
+            and input.shape[0] == output.shape[0] * self.world_size
+        ):
+            return False
+        if input.numel() == 0:
+            return True
+        # Each rank's shard, not just the full input, must be vector-aligned.
+        if output.numel() * output.element_size() % 16:
+            return False
+        ca_comm = self.ca_comm
+        if not ca_comm.should_custom_ar(input):
+            return False
+        if getattr(ca_comm, "_IS_CAPTURING", False):
+            if torch.cuda.is_current_stream_capturing():
+                registered = not (
+                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                    or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                )
+                ca_comm.reduce_scatter(input, output, registered=registered)
+            elif is_in_tc_piecewise_cuda_graph():
+                ca_comm.reduce_scatter(input, output, registered=False)
+            else:
+                # Graph warmup must not introduce a different host collective.
+                output.zero_()
+            return True
+        ca_comm.reduce_scatter(input, output, registered=False)
+        return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
@@ -871,7 +928,13 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    ca_comm.all_gather_reg(input, out=output, dim=0)
+                    if (
+                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                    ):
+                        ca_comm.all_gather_unreg(input, out=output, dim=0)
+                    else:
+                        ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:

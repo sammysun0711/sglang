@@ -466,6 +466,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_draft_num_layers = None
         self.dflash_draft_model_config = None
         self.draft_parallel_layout = None
+        # Published by the loaded DFlash worker before target pool allocation.
+        self.dflash_draft_kv_budget = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker

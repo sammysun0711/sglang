@@ -212,7 +212,7 @@ def test_gfx942_swa_uses_5d_pages_and_caches_translation(monkeypatch, fresh, kv_
         assert q.data_ptr() == case.q.data_ptr()
         assert q.stride(0) == case.q.stride(0)
         torch.testing.assert_close(args[2], case.expected_pages)
-        assert kwargs["window_left"] == 128
+        assert kwargs["window_left"] == (127 if kv_heads == 2 else 128)
         assert kwargs["sink_ptr"] is case.sinks
         assert kwargs["softmax_scale"] == case.layer.scaling
         calls.append(kwargs)
@@ -338,10 +338,11 @@ def test_flash_swa_rejects_mismatched_cache_heads():
 def _reference(case):
     pieces = []
     qo = ko = 0
+    window_left = 127 if case.layer.tp_k_head_num == 2 else 128
     for nq, nk in zip(case.batch.extend_seq_lens_cpu, case.batch.seq_lens_cpu.tolist()):
         for start in range(0, nq, 128):
             stop = min(start + 128, nq)
-            ks, ke = max(0, nk - nq + start - 128), nk - nq + stop
+            ks, ke = max(0, nk - nq + start - window_left), nk - nq + stop
             q = case.q_reference[qo + start : qo + stop].transpose(0, 1)
             k = case.k_reference[ko + ks : ko + ke].transpose(0, 1)
             v = case.v_reference[ko + ks : ko + ke].transpose(0, 1)
@@ -350,7 +351,9 @@ def _reference(case):
             score = q @ k.transpose(-1, -2) * case.layer.scaling
             qp = nk - nq + torch.arange(start, stop, device=q.device)[:, None]
             kp = torch.arange(ks, ke, device=q.device)[None, :]
-            score.masked_fill_(~((kp <= qp) & (kp >= qp - 128))[None], -torch.inf)
+            score.masked_fill_(
+                ~((kp <= qp) & (kp >= qp - window_left))[None], -torch.inf
+            )
             logits = torch.cat(
                 [score, case.sinks[:, None, None].expand(-1, stop - start, 1)], -1
             )
@@ -358,6 +361,22 @@ def _reference(case):
         qo += nq
         ko += nk
     return torch.cat(pieces)
+
+
+@pytest.mark.parametrize(
+    "kv_heads,context_length,expected",
+    [(1, 128, 1 / 128), (1, 129, 1 / 129), (2, 128, 1 / 128), (2, 129, 0.0)],
+)
+def test_swa_reference_window_boundary(kv_heads, context_length, expected):
+    case = _case([1], [context_length], kv_heads=kv_heads)
+    case.q_reference.zero_()
+    case.k_reference.zero_()
+    case.v_reference.zero_()
+    case.v_reference[0].fill_(1)
+    case.sinks.fill_(-torch.inf)
+    # Uniform scores expose whether the oldest key is still in the window.
+    output = _reference(case)
+    torch.testing.assert_close(output, torch.full_like(output, expected))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires gfx942")

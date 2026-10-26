@@ -64,7 +64,7 @@ SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
 ```
 
-### Run prefill benchmark
+### Run TBO-off prefill benchmark
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/
@@ -85,6 +85,13 @@ ENABLE_TWO_BATCH_OVERLAP=1 \
 SGLANG_FLYPA_MIMO_PREFILL=1 \
 SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
+```
+
+### Run TBO-on prefill benchmark
+
+```bash
+cd /sgl-workspace/sglang/evaluation/
+./run_benchmark_mimo_pro_prefill.sh
 ```
 
 Each DP replica overlaps its own TP4 collectives. DP attention remains disabled;
@@ -108,13 +115,16 @@ The fake-prefill decode capacity must fit both the full-token and SWA-token
 pools:
 
 ```text
-(C + 1) * (ISL + OSL) <= max_total_num_tokens
+(C + 1) * (ISL + OSL) <= token_capacity
 (C + 1) * OSL         <= swa_layer_tokens
 ```
 
-Apply these bounds per DP replica, using its admitted request count. Read
-`max_total_num_tokens` from `/server_info` and `swa_layer_tokens` from
-the server initialization log. If SWA is the smaller bound for a short-ISL
+Apply these bounds per DP replica, using its admitted request count. Read each
+worker's `token_capacity` from
+`/server_info` -> `internal_states[].memory_usage.token_capacity`, and its
+`swa_layer_tokens` from the server initialization log.
+
+If SWA is the smaller bound for a short-ISL
 case, increase `SWA_FULL_TOKENS_RATIO` only until the SWA slot count is at
 least the full-token slot count (or the desired concurrency cap). Allocating
 more than that reduces the full-token pool without increasing concurrency.

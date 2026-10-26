@@ -2777,8 +2777,9 @@ def test_flydsl_swa_prepares_graph_stable_metadata(
 
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
 @pytest.mark.parametrize("query_length", [1, 8])
-def test_flydsl_target_swa_qlen8_compacts_full_context_table(
-    monkeypatch, num_kv_heads, query_length
+@pytest.mark.parametrize("context_length", [64, 65, 129, 65536])
+def test_flydsl_target_swa_compacts_context_table(
+    monkeypatch, num_kv_heads, query_length, context_length
 ):
     monkeypatch.delenv("SGLANG_AITER_VEC5D_SWA_VERIFY_QLEN1", raising=False)
     monkeypatch.setenv("SGLANG_AITER_TARGET_VERIFY_SWA_IMPL", "flydsl")
@@ -2797,7 +2798,8 @@ def test_flydsl_target_swa_qlen8_compacts_full_context_table(
         _flydsl_target_verify_swa_enabled=True,
         _flydsl_dflash_swa_enabled=False,
     )
-    page_table = torch.arange(1024, dtype=torch.int32).view(1, -1)
+    num_pages = math.ceil(context_length / 64)
+    page_table = torch.arange(num_pages, dtype=torch.int32).view(1, -1)
     backend.forward_metadata = SimpleNamespace(
         max_q_len=query_length,
         qo_indptr=torch.tensor([0, query_length], dtype=torch.int32),
@@ -2806,12 +2808,13 @@ def test_flydsl_target_swa_qlen8_compacts_full_context_table(
     )
     q = torch.zeros((query_length, 16 * 192), dtype=torch.bfloat16)
     output = torch.empty((query_length, 16 * 128), dtype=torch.bfloat16)
-    k_cache = torch.empty((1024, num_kv_heads, 24, 64, 8), dtype=torch.bfloat16)
-    v_cache = torch.empty((1024, num_kv_heads, 8, 128, 8), dtype=torch.bfloat16)
+    k_cache = torch.empty((num_pages, num_kv_heads, 24, 64, 8), dtype=torch.bfloat16)
+    v_cache = torch.empty((num_pages, num_kv_heads, 8, 128, 8), dtype=torch.bfloat16)
     forward_batch = SimpleNamespace(
         batch_size=batch_size,
         seq_lens=torch.tensor(
-            [65536 if query_length == 1 else 65528], dtype=torch.int64
+            [context_length if query_length == 1 else context_length - query_length],
+            dtype=torch.int64,
         ),
     )
     layer = SimpleNamespace(
@@ -2875,10 +2878,12 @@ def test_flydsl_target_swa_qlen8_compacts_full_context_table(
     args = captured["args"]
     assert captured["flatten_calls"] == 1
     assert captured["flydsl_calls"] == 2
-    expected_pages = 3 if query_length == 1 else 4
+    expected_pages = min(num_pages, 3 if query_length == 1 else 4)
     assert args[4].tolist() == [0, expected_pages]
-    assert args[5][:expected_pages].tolist() == list(range(1024 - expected_pages, 1024))
-    assert captured["kv_last_page_lens"].tolist() == [64]
+    assert args[5][:expected_pages].tolist() == list(
+        range(num_pages - expected_pages, num_pages)
+    )
+    assert captured["kv_last_page_lens"].tolist() == [(context_length - 1) % 64 + 1]
     assert args[7] == 128 + 63 + query_length
     assert captured["window_left"] == (127 if num_kv_heads == 2 else 128)
     assert torch.all(output == 5)

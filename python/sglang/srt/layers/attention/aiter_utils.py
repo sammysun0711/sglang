@@ -431,11 +431,8 @@ def prepare_flydsl_swa_forward_metadata(
     context_lens.mul_(backend.page_size)
     context_lens.add_(last_page_lens)
 
-    if block_tables.shape[1] < max_pages:
-        raise ValueError(
-            "DFlash FlyPA page table is narrower than the prepared SWA bound: "
-            f"{block_tables.shape[1]} < {max_pages}"
-        )
+    # max_pages is workspace capacity, not a minimum input width. The clamped
+    # page counts keep the masked gather within shorter eager-decode tables.
     page_indices = backend._flydsl_dflash_swa_kv_indices
     block_size = 32
     _flatten_page_table_to_csr_kernel[(batch_size, triton.cdiv(max_pages, block_size))](
@@ -1634,7 +1631,8 @@ def run_mimo_flypa_swa_prefill(
         paged_swa_kv_indices,
         int(metadata.max_q_len),
         int(metadata.max_kv_len),
-        window_left=int(layer.sliding_window_size),
+        # Match verification: Flash's two-head window includes the current key.
+        window_left=int(layer.sliding_window_size) - int(layer.tp_k_head_num == 2),
         kv_last_page_lens=metadata.paged_kv_last_page_len,
         q_descale=unit_scale,
         k_descale=unit_scale,

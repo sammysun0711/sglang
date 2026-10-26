@@ -464,8 +464,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def init_backends(self):
-        disable_cuda_graph = False
-        if is_cuda() and not self.server_args.disable_cuda_graph:
+        disable_cuda_graph = envs.SGLANG_DFLASH_DISABLE_DRAFT_CUDA_GRAPH.get()
+        if (
+            not disable_cuda_graph
+            and (is_cuda() or is_hip())
+            and not self.server_args.disable_cuda_graph
+        ):
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             disable_cuda_graph = available_mem < 1.0
             if disable_cuda_graph:
@@ -476,6 +480,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
+        logger.info(
+            "DFlash draft CUDA graphs: %s",
+            "disabled" if disable_cuda_graph else "enabled when supported",
+        )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""

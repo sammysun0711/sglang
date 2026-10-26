@@ -38,9 +38,11 @@ from __future__ import annotations
 
 import contextlib
 import sys
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -315,6 +317,131 @@ def test_graph_capture_includes_attention_tp_once(attention_aliases_tp):
             assert context is shared_context
     assert entered == (
         ["tp", "pp"] if attention_aliases_tp else ["tp", "pp", "attention"]
+    )
+
+
+@pytest.fixture
+def aiter_group(monkeypatch):
+    group = parallel_state.GroupCoordinator.__new__(parallel_state.GroupCoordinator)
+    group.world_size = 4
+    group.unique_name = "test_attention_tp"
+    group.ca_comm = SimpleNamespace(
+        disabled=False,
+        should_custom_ar=Mock(return_value=True),
+        reduce_scatter=Mock(),
+        should_custom_ag=Mock(return_value=True),
+        all_gather_reg=Mock(),
+        all_gather_unreg=Mock(),
+        _IS_CAPTURING=False,
+    )
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    for name, value in {
+        "SGLANG_DP_USE_REDUCE_SCATTER": "1",
+        "SGLANG_USE_AITER_AG": "1",
+        "SGLANG_USE_1STAGE_ALLREDUCE": "0",
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "0",
+        "SGLANG_AITER_CAPTURE_COPY_IN": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+    return group
+
+
+@pytest.mark.parametrize(
+    "capturing,live_capture,piecewise,copy_in,memory_saver,registered",
+    [
+        (False, False, False, False, False, False),
+        (True, True, False, False, False, True),
+        (True, True, False, True, False, False),
+        (True, True, False, False, True, False),
+        (True, False, True, False, False, False),
+        (True, False, False, False, False, None),
+    ],
+)
+def test_aiter_reduce_scatter_capture_modes(
+    aiter_group,
+    monkeypatch,
+    capturing,
+    live_capture,
+    piecewise,
+    copy_in,
+    memory_saver,
+    registered,
+):
+    aiter_group.ca_comm._IS_CAPTURING = capturing
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: live_capture)
+    monkeypatch.setattr(
+        parallel_state, "is_in_tc_piecewise_cuda_graph", lambda: piecewise
+    )
+    monkeypatch.setenv("SGLANG_AITER_CAPTURE_COPY_IN", str(int(copy_in)))
+    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", str(int(memory_saver)))
+    source = torch.ones((32, 16), dtype=torch.bfloat16)
+    output = torch.full((8, 16), float("nan"), dtype=source.dtype)
+    assert aiter_group._maybe_aiter_reduce_scatter(output, source)
+    if registered is None:
+        aiter_group.ca_comm.reduce_scatter.assert_not_called()
+        assert torch.count_nonzero(output) == 0
+    else:
+        aiter_group.ca_comm.reduce_scatter.assert_called_once_with(
+            source, output, registered=registered
+        )
+
+
+@pytest.mark.parametrize(
+    "reason", ["alignment", "shape", "dtype", "deterministic", "disabled", "size"]
+)
+def test_aiter_reduce_scatter_falls_back(aiter_group, monkeypatch, reason):
+    source = torch.ones((4, 8), dtype=torch.bfloat16)
+    output = torch.empty((1, 8), dtype=source.dtype)
+    if reason == "alignment":
+        # The full tensor is aligned, but each rank's shard is not.
+        source, output = source[:, :2].contiguous(), output[:, :2].contiguous()
+    elif reason == "shape":
+        output = torch.empty((1, 16), dtype=source.dtype)
+    elif reason == "dtype":
+        output = output.float()
+    elif reason == "deterministic":
+        monkeypatch.setenv("SGLANG_USE_1STAGE_ALLREDUCE", "1")
+    elif reason == "disabled":
+        monkeypatch.setenv("SGLANG_DP_USE_REDUCE_SCATTER", "0")
+    else:
+        aiter_group.ca_comm.should_custom_ar.return_value = False
+    assert not aiter_group._maybe_aiter_reduce_scatter(output, source)
+    aiter_group.ca_comm.reduce_scatter.assert_not_called()
+
+
+def test_aiter_reduce_scatter_empty_input_launches_no_kernel(aiter_group):
+    empty = torch.empty((0, 16), dtype=torch.bfloat16)
+    assert aiter_group._maybe_aiter_reduce_scatter(empty, empty)
+    aiter_group.ca_comm.reduce_scatter.assert_not_called()
+
+
+def test_reduce_scatter_keeps_registered_compile_boundary(aiter_group, monkeypatch):
+    registered_op = Mock()
+    monkeypatch.setattr(parallel_state, "_is_npu", False)
+    monkeypatch.setattr(parallel_state, "reg_reduce_scatter_tensor", registered_op)
+    source, output = torch.ones((4, 8)), torch.empty((1, 8))
+    aiter_group.reduce_scatter_tensor(output, source)
+    registered_op.assert_called_once_with(
+        output, source, group_name="test_attention_tp"
+    )
+    aiter_group.ca_comm.reduce_scatter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "memory_saver,copy_in", [(False, False), (False, True), (True, False)]
+)
+def test_aiter_all_gather_capture_copy_in(
+    aiter_group, monkeypatch, memory_saver, copy_in
+):
+    aiter_group.ca_comm._IS_CAPTURING = True
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", str(int(memory_saver)))
+    monkeypatch.setenv("SGLANG_AITER_CAPTURE_COPY_IN", str(int(copy_in)))
+    source, output = torch.ones((1, 8)), torch.empty((4, 8))
+    aiter_group._all_gather_into_tensor(output, source)
+    expected = "all_gather_unreg" if memory_saver or copy_in else "all_gather_reg"
+    getattr(aiter_group.ca_comm, expected).assert_called_once_with(
+        source, out=output, dim=0
     )
 
 

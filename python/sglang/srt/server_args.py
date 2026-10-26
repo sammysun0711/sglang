@@ -7813,7 +7813,9 @@ class ServerArgs:
         model_arch = architectures[0] if architectures else None
         supports_mimo_no_ep_tbo = (
             model_arch == "MiMoV2ForCausalLM"
-            and (self.tp_size, self.dp_size) in ((8, 1), (4, 2))
+            # TP4/DP1 is one independent replica of the TP4/DP2 deployment.
+            # With DP attention disabled, its collectives still span four ranks.
+            and (self.tp_size, self.dp_size) in ((8, 1), (4, 1), (4, 2))
             and self.ep_size == 1
             and self.pp_size == 1
             and self.attn_cp_size == 1
@@ -7822,7 +7824,8 @@ class ServerArgs:
         if not supports_mimo_no_ep_tbo:
             raise ValueError(
                 "Two batch overlap with moe_a2a_backend='none' is currently "
-                "supported only for MiMoV2ForCausalLM with TP8/DP1 or TP4/DP2, "
+                "supported only for MiMoV2ForCausalLM with TP8/DP1, TP4/DP1, "
+                "or TP4/DP2, "
                 "EP1/PP1, and no DP attention or attention context parallelism."
             )
 

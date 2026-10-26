@@ -92,6 +92,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_v2_utils import (
+    mimo_flydsl_target_verify_enabled,
     supports_native_mimo_vectorized_v_cache,
 )
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
@@ -161,7 +162,10 @@ def _mimo_needs_v_padding(
         not force_v_pad
         and head_dim == 192
         and v_head_dim == 128
-        and num_kv_heads == 1
+        and (
+            num_kv_heads == 1
+            or (num_kv_heads == 2 and mimo_flydsl_target_verify_enabled())
+        )
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
     )
     return not native_aiter_v_cache
@@ -932,6 +936,7 @@ class MiMoV2DecoderLayer(nn.Module):
         # see _is_fused_rms_{moe,qkv}_quant_supported in layers/communicator.py.
         if (
             not envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.get()
+            or self.hidden_size not in (4096, 6144)
             or not (is_gfx95_supported() or is_gfx942_supported())
             or not (moe_backend.is_aiter() or moe_backend.is_auto())
             or get_moe_expert_parallel_world_size() != 1

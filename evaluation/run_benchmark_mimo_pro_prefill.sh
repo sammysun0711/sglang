@@ -10,7 +10,7 @@ set -euo pipefail
 # DRY_RUN=1 prints commands without contacting the server or creating logs.
 # BENCHMARK_PRESET=sweep restores the previous matrix and prompt-count policy.
 # BENCHMARK_PRESET=simple uses 64 measured prompts per input, OSL=1, and
-# concurrency 16/16/12/3/2/1/1/1/1/1 for 4K/8K/16K/32K/64K/128K/256K/512K/768K/1M.
+# concurrency 16/16/12/3/2/2/2/2/2/2 for 4K/8K/16K/32K/64K/128K/256K/512K/768K/1M.
 # The 1M case uses 1048000 input tokens, as in the customer preset.
 # NUM_PROMPTS_OVERRIDE overrides all counts; SMALL_INPUT_NUM_PROMPTS_OVERRIDE
 # overrides counts for inputs <=8K. PROMPT_WAVES/MIN_NUM_PROMPTS are sweep-only.
@@ -40,7 +40,7 @@ case "${benchmark_preset}" in
     default_tokens="4096 8192 16384 32768 65536 131072 262144 524288 786432 1048000"
     default_small_concurrency="16"
     default_short_concurrency="12"
-    default_long_concurrency="1"
+    default_long_concurrency="2"
     short_input_max_tokens=65536
     default_small_num_prompts=64
     ;;

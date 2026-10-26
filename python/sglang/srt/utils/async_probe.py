@@ -106,6 +106,16 @@ def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: 
         return
     if indices is None or indices.numel() == 0:
         return
+    if (
+        envs.SGLANG_FUSED_ASYNC_OOB_CHECKS.get()
+        and indices.is_cuda
+        and indices.is_contiguous()
+        and indices.dtype in (torch.int32, torch.int64)
+    ):
+        from sglang.srt.utils.async_probe_kernels import check_index_bounds
+
+        check_index_bounds(indices, low, high, msg)
+        return
     torch._assert_async(
         indices.min() >= low,
         f"index < {low} (negative / unmasked sentinel?): {msg}",

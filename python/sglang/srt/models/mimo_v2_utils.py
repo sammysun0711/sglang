@@ -12,6 +12,21 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
+
+
+def mimo_flydsl_target_verify_enabled() -> bool:
+    """Both target attention families must support the Flash native-V cache."""
+    return (
+        os.environ.get("SGLANG_AITER_PA_DECODE_IMPL", "gluon").strip().lower()
+        == "flydsl"
+        and os.environ.get("SGLANG_AITER_TARGET_VERIFY_SWA_IMPL", "gluon")
+        .strip()
+        .lower()
+        == "flydsl"
+    )
+
+
 def supports_native_mimo_vectorized_v_cache(
     *,
     attention_backend: str,
@@ -32,5 +47,8 @@ def supports_native_mimo_vectorized_v_cache(
         and v_head_dim == 128
         and swa_v_head_dim == 128
         and full_num_kv_heads == 1
-        and swa_num_kv_heads == 1
+        and (
+            swa_num_kv_heads == 1
+            or (swa_num_kv_heads == 2 and mimo_flydsl_target_verify_enabled())
+        )
     )

@@ -47,7 +47,9 @@ def test_mimo_prepare_attn_forwards_selected_qkv_quant_format():
     layer = _decoder_stub(torch.float8_e4m3fn)
     layer._fused_rms_qkv_quant_format = "fp8"
     layer.layer_communicator = SimpleNamespace(
-        prepare_attn=lambda *args: (calls.append(args) or ("hidden", "residual"))
+        prepare_attn_and_capture_last_layer_outputs=lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or ("hidden", "residual")
+        )
     )
     state = State()
     forward_batch = object()
@@ -61,7 +63,12 @@ def test_mimo_prepare_attn_forwards_selected_qkv_quant_format():
         tbo_subbatch_index=2,
     )
 
-    assert calls == [("hidden_states", "residual", forward_batch, "fp8")]
+    assert calls == [
+        (
+            ("hidden_states", "residual", forward_batch),
+            {"captured_last_layer_outputs": None, "quant_format": "fp8"},
+        )
+    ]
     assert state.hidden_states_after_comm_pre_attn == "hidden"
     assert state.residual_after_input_ln == "residual"
     assert state.positions == "positions"

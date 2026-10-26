@@ -504,9 +504,10 @@ class AiterAttnBackend(AttentionBackend):
         self._ensure_flydsl_pa_decode_workspace(max_bs)
         logger.info(
             "Enabled MiMo FlyDSL PA decode on target worker: full "
-            "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=AITER, "
-            "ordinary decode=AITER; runtime=%s (%s), kernel=%s, "
+            "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=%s, "
+            "ordinary full decode=AITER; runtime=%s (%s), kernel=%s, "
             "partitions=%d, workspace_max_bs=%d",
+            "FlyDSL" if flydsl_target_verify_swa_enabled() else "AITER",
             kernels.version,
             kernels.runtime_path,
             kernels.kernel_path,
@@ -1658,9 +1659,15 @@ class AiterAttnBackend(AttentionBackend):
                     swa_out_cache_loc=swa_out_cache_loc,
                 )
 
-        if forward_batch.forward_mode.is_target_verify():
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_decode()
+        ):
             prepare_flydsl_swa_forward_metadata(
-                self, forward_batch.batch_size, forward_batch.seq_lens
+                self,
+                forward_batch.batch_size,
+                forward_batch.seq_lens,
+                context_includes_query=forward_batch.forward_mode.is_decode(),
             )
 
     def init_cuda_graph_state(
@@ -2266,8 +2273,10 @@ class AiterAttnBackend(AttentionBackend):
         else:
             raise ValueError("Invalid forward mode")
 
-        if forward_mode.is_target_verify():
-            prepare_flydsl_swa_forward_metadata(self, bs, seq_lens)
+        if forward_mode.is_target_verify() or forward_mode.is_decode():
+            prepare_flydsl_swa_forward_metadata(
+                self, bs, seq_lens, context_includes_query=forward_mode.is_decode()
+            )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1 if self.num_draft_tokens is None else self.num_draft_tokens

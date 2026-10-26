@@ -193,9 +193,13 @@ def _prepare_flydsl_swa(
         qk_head_dim,
         FLYDSL_MIMO_VALUE_HEAD_DIM,
     )
-    if shape != expected:
+    supported_shapes = [expected]
+    if getattr(backend, "is_draft_worker", False) and qk_head_dim == 128:
+        supported_shapes.append((16, 2, 128, 128))
+    if shape not in supported_shapes:
         raise ValueError(
-            f"{env_name}=flydsl requires per-rank Q/KV/QK/V={expected}, got {shape}"
+            f"{env_name}=flydsl requires per-rank Q/KV/QK/V in "
+            f"{supported_shapes}, got {shape}"
         )
     if query_length not in FLYDSL_MIMO_QUERY_LENGTHS:
         raise ValueError(
@@ -266,6 +270,35 @@ def prepare_flydsl_dflash_swa(
         128,
         DFLASH_SWA_IMPL_ENV,
     )
+    # Flash TP4 benefits from sharing the window across its GQA8 query rows.
+    # The one-KV-head draft path keeps its existing single-wave kernel.
+    if backend.num_kv_head == 2:
+        signature = (max_batch_size, query_length, torch.device(backend.device))
+        if getattr(backend, "_flydsl_draft_pa_signature", None) != signature:
+            if (
+                torch.device(backend.device).type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError(
+                    "DFlash PA workspaces cannot grow during graph capture"
+                )
+            parts = 8
+            scalars = max_batch_size * parts * query_length * backend.num_head
+            backend._flydsl_draft_pa_context = torch.empty(
+                max_batch_size, dtype=torch.int32, device=backend.device
+            )
+            backend._flydsl_draft_pa_max = torch.empty(
+                scalars, dtype=torch.float32, device=backend.device
+            )
+            backend._flydsl_draft_pa_sum = torch.empty_like(
+                backend._flydsl_draft_pa_max
+            )
+            backend._flydsl_draft_pa_out = torch.empty(
+                scalars * 128, dtype=torch.bfloat16, device=backend.device
+            )
+            backend._flydsl_draft_pa_parts = parts
+            backend._flydsl_draft_pa_signature = signature
+        backend._flydsl_draft_pa_enabled = True
 
 
 def prepare_flydsl_target_verify_swa(
@@ -312,7 +345,7 @@ def _use_flydsl_swa(
         and backend.kv_cache_dtype == torch.bfloat16
         and q.dtype == torch.bfloat16
         and layer.tp_q_head_num == FLYDSL_MIMO_QUERY_HEADS
-        and layer.tp_k_head_num == FLYDSL_MIMO_KV_HEADS
+        and layer.tp_k_head_num in (FLYDSL_MIMO_KV_HEADS, 2)
         and layer.qk_head_dim in (128, FLYDSL_MIMO_HEAD_DIM)
         and layer.v_head_dim == FLYDSL_MIMO_VALUE_HEAD_DIM
     )
@@ -322,6 +355,8 @@ def prepare_flydsl_swa_forward_metadata(
     backend: AiterAttnBackend,
     batch_size: int,
     seq_lens: torch.Tensor,
+    *,
+    context_includes_query: bool = False,
 ) -> None:
     """Build the shared FlyPA SWA metadata once for the current forward batch."""
     if not (
@@ -333,6 +368,13 @@ def prepare_flydsl_swa_forward_metadata(
     metadata = backend.forward_metadata
     query_length = int(metadata.max_q_len)
     batch_size = int(batch_size)
+    if getattr(backend, "_flydsl_draft_pa_enabled", False):
+        torch.add(
+            seq_lens[:batch_size],
+            0 if context_includes_query else query_length,
+            out=backend._flydsl_draft_pa_context[:batch_size],
+        )
+        return
     block_tables = (
         metadata.swa_page_table
         if metadata.swa_page_table is not None
@@ -354,7 +396,7 @@ def prepare_flydsl_swa_forward_metadata(
     context_lens = backend._flydsl_dflash_swa_context_lens[:batch_size]
     torch.add(
         seq_lens[:batch_size],
-        query_length,
+        0 if context_includes_query else query_length,
         out=context_lens,
     )
 
@@ -389,11 +431,8 @@ def prepare_flydsl_swa_forward_metadata(
     context_lens.mul_(backend.page_size)
     context_lens.add_(last_page_lens)
 
-    if block_tables.shape[1] < max_pages:
-        raise ValueError(
-            "DFlash FlyPA page table is narrower than the prepared SWA bound: "
-            f"{block_tables.shape[1]} < {max_pages}"
-        )
+    # max_pages is workspace capacity, not a minimum input width. The clamped
+    # page counts keep the masked gather within shorter eager-decode tables.
     page_indices = backend._flydsl_dflash_swa_kv_indices
     block_size = 32
     _flatten_page_table_to_csr_kernel[(batch_size, triton.cdiv(max_pages, block_size))](
@@ -433,6 +472,35 @@ def forward_target_verify_flydsl_swa_5d(
         )
 
     metadata = backend.forward_metadata
+    if getattr(backend, "_flydsl_draft_pa_enabled", False):
+        from aiter.ops.flydsl.pa_decode import pa_decode_tile
+
+        parts = backend._flydsl_draft_pa_parts
+        shape = (
+            batch_size,
+            layer.tp_k_head_num,
+            parts,
+            query_length * layer.tp_q_head_num // layer.tp_k_head_num,
+        )
+        count = batch_size * parts * query_length * layer.tp_q_head_num
+        pa_decode_tile(
+            output.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k_cache,
+            v_cache,
+            metadata.kv_indices,
+            backend._flydsl_draft_pa_context[:batch_size],
+            None,
+            None,
+            softmax_scale=layer.scaling,
+            num_partitions=parts,
+            pmax=backend._flydsl_draft_pa_max[:count].view(shape),
+            psum=backend._flydsl_draft_pa_sum[:count].view(shape),
+            pout=backend._flydsl_draft_pa_out[: count * 128].view(*shape, 128),
+            sliding_window=int(layer.sliding_window_size),
+            sinks=sinks,
+        )
+        return
     context_lens = getattr(metadata, "flydsl_swa_context_lens", None)
     page_indptr = getattr(metadata, "flydsl_swa_kv_indptr", None)
     page_indices = getattr(metadata, "flydsl_swa_kv_indices", None)
@@ -455,7 +523,9 @@ def forward_target_verify_flydsl_swa_5d(
         page_indices,
         query_length,
         int(backend._flydsl_dflash_swa_max_kv_len),
-        window_left=int(layer.sliding_window_size),
+        # Flash's two-head target/draft fallback keeps WINDOW keys including self.
+        # Preserve the existing one-head FlyPA window convention.
+        window_left=int(layer.sliding_window_size) - int(layer.tp_k_head_num == 2),
         kv_last_page_lens=last_page_lens,
         q_descale=one,
         k_descale=one,
@@ -1335,7 +1405,7 @@ def can_build_mimo_paged_kv_metadata(
         and kv_cache_dtype in (fp8_dtype, torch.bfloat16)
         and q_dtype == torch.bfloat16
         and num_qo_heads == CK_MIMO_PREFILL_QUERY_HEADS
-        and num_kv_heads == CK_MIMO_PREFILL_KV_HEADS
+        and num_kv_heads in (CK_MIMO_PREFILL_KV_HEADS, 2)
         and head_dim == CK_MIMO_PREFILL_HEAD_DIM
     )
 
@@ -1551,7 +1621,9 @@ def run_mimo_flypa_swa_prefill(
         backend._mimo_flypa_prefill_unit_scale = unit_scale
 
     result = flydsl_paged_attention_swa_bf16(
-        q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        # The native SWA kernel accepts a strided token axis. Q is a view into
+        # fused QKV, so making it contiguous would copy the query at every layer.
+        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
         k_buf,
         v_buf,
         backend.qo_indptr[:bs0],
@@ -1559,7 +1631,8 @@ def run_mimo_flypa_swa_prefill(
         paged_swa_kv_indices,
         int(metadata.max_q_len),
         int(metadata.max_kv_len),
-        window_left=int(layer.sliding_window_size),
+        # Match verification: Flash's two-head window includes the current key.
+        window_left=int(layer.sliding_window_size) - int(layer.tp_k_head_num == 2),
         kv_last_page_lens=metadata.paged_kv_last_page_len,
         q_descale=unit_scale,
         k_descale=unit_scale,
@@ -1604,11 +1677,14 @@ def run_mimo_flypa_prefill(
             raise RuntimeError("FlyPA FP8 prefill requires a scalar Q descale")
     else:
         q_local = q
-        unit = torch.ones((), dtype=torch.float32, device=q.device)
+        unit = getattr(backend, "_mimo_flypa_prefill_unit_scale", None)
+        if unit is None:
+            unit = torch.ones(1, dtype=torch.float32, device=q.device)
+            backend._mimo_flypa_prefill_unit_scale = unit
         q_descale_local = unit
         k_descale_local = unit
         v_descale_local = unit
-    q_paged = q_local.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+    q_paged = q_local.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
     o = flypa(
         num_qo_heads=layer.tp_q_head_num,
         num_kv_heads=layer.tp_k_head_num,
@@ -1790,6 +1866,9 @@ def _mimo_gfx942_paged_swa_prefill(
     per-request page counts, last-page lengths, sinks and prefill masking.
     """
     metadata = backend.forward_metadata
+    # Pro TP8 has one local KV head; Flash TP4 has two. The native BF16
+    # paged kernel handles both GQA ratios and derives the head stride from K/V.
+    num_kv_heads = layer.tp_k_head_num
     lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
     if getattr(metadata, "swa_page_table", None) is None:
         return None
@@ -1810,7 +1889,8 @@ def _mimo_gfx942_paged_swa_prefill(
             layer.qk_head_dim,
             layer.v_head_dim,
         )
-        != (16, 1, 1, 192, 192, 128)
+        != (16, num_kv_heads, num_kv_heads, 192, 192, 128)
+        or num_kv_heads not in (1, 2)
         or q.dtype != torch.bfloat16
         or q.ndim != 2
         or q.shape[1] != 16 * 192
@@ -1867,8 +1947,8 @@ def _mimo_gfx942_paged_swa_prefill(
         k_buf.ndim != 5
         or v_buf.ndim != 5
         or k_buf.shape[0] != v_buf.shape[0]
-        or tuple(k_buf.shape[1:]) != (1, 24, 64, 8)
-        or tuple(v_buf.shape[1:]) != (1, 8, 128, 8)
+        or tuple(k_buf.shape[1:]) != (num_kv_heads, 24, 64, 8)
+        or tuple(v_buf.shape[1:]) != (num_kv_heads, 8, 128, 8)
         or k_buf.dtype != torch.bfloat16
         or v_buf.dtype != torch.bfloat16
         or k_buf.device != q.device
@@ -1883,7 +1963,8 @@ def _mimo_gfx942_paged_swa_prefill(
     if not getattr(backend, "_logged_gfx942_mimo_paged_swa_prefill", False):
         logger.info(
             "Using gfx942 FlyPA MiMo BF16 SWA page-64 5D prefill "
-            "(window=%s, max_q=%d, max_kv=%d); no LINEAR K/V gather.",
+            "(kv_heads=%d, window=%s, max_q=%d, max_kv=%d); no LINEAR K/V gather.",
+            num_kv_heads,
             window_size,
             int(metadata.max_q_len),
             int(metadata.max_kv_len),
@@ -2388,7 +2469,11 @@ def forward_extend_vectorized_5d(
     else:
         slot_ids = metadata.kv_indices[:total_kv]
 
-    k_lin, v_lin = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
+    if not hasattr(backend, "_linear_kv_workspace"):
+        backend._linear_kv_workspace = {}
+    k_lin, v_lin = launch_gather_shuffle_5d_to_linear(
+        k_buf, v_buf, slot_ids, workspace=backend._linear_kv_workspace
+    )
     # k_lin / v_lin come out in ``store_dtype`` (uint8 for fp8 pools
     # because ``Tensor.index_put`` isn't implemented for fp8 — see
     # ``MHATokenToKVPool`` ctor). Reinterpret them back to the compute
@@ -2476,6 +2561,12 @@ def forward_decode_vectorized_5d(
     Writes the attention output into ``o`` in place (via a stride-0
     safe ``o.view``).
     """
+    if _use_flydsl_swa(backend, q, layer, sinks):
+        forward_target_verify_flydsl_swa_5d(
+            backend, q, layer, forward_batch, k_cache, v_cache, o, sinks
+        )
+        return
+
     bs = forward_batch.batch_size
     num_kv_heads = layer.tp_k_head_num
     num_q_heads = layer.tp_q_head_num
@@ -3016,7 +3107,7 @@ def forward_target_verify_vectorized_5d(
             f"{equivalent_group_size} > 64"
         )
     asymmetric_mimo = (
-        num_kv_heads == FLYDSL_MIMO_KV_HEADS
+        (num_kv_heads == FLYDSL_MIMO_KV_HEADS or use_flydsl_swa)
         and layer.qk_head_dim == FLYDSL_MIMO_HEAD_DIM
         and layer.v_head_dim == FLYDSL_MIMO_VALUE_HEAD_DIM
     )
@@ -3079,7 +3170,7 @@ def forward_target_verify_vectorized_5d(
     ) and is_swa_layer:
         raise RuntimeError(
             "FlyDSL DFlash SWA was requested but the live attention call does not "
-            "match its BF16 H16/HK1/D128-or-D192/V128/page64/sink contract: "
+            "match its BF16 H16/HK1-or-HK2/D128-or-D192/V128/page64/sink contract: "
             f"q_dtype={q.dtype}, Q/KV/QK/V="
             f"{num_q_heads}/{num_kv_heads}/{layer.qk_head_dim}/{layer.v_head_dim}, "
             f"page_size={backend.page_size}, sink_dtype="

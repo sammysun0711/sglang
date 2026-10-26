@@ -14,19 +14,26 @@ def enable_flypa(monkeypatch):
     monkeypatch.setenv(aiter_utils.FLYPA_MIMO_PREFILL_ENV, "1")
 
 
-def _case(q_lens, kv_lens, *, device="cpu", padded=0, evict=False):
+def _case(
+    q_lens, kv_lens, *, device="cpu", padded=0, evict=False, kv_heads=1, q_row_padding=0
+):
     torch.manual_seed(917)
     device = torch.device(device)
     live = sum(q_lens)
     q = torch.full(
-        (live + padded, 16 * 192), float("nan"), dtype=torch.bfloat16, device=device
-    )
+        (live + padded, 16 * 192 + q_row_padding),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )[:, : 16 * 192]
     q[:live] = torch.randn((live, 16 * 192), dtype=torch.bfloat16, device=device) * 0.7
     keys = (
-        torch.randn((sum(kv_lens), 1, 192), dtype=torch.bfloat16, device=device) * 0.7
+        torch.randn((sum(kv_lens), kv_heads, 192), dtype=torch.bfloat16, device=device)
+        * 0.7
     )
     values = (
-        torch.randn((sum(kv_lens), 1, 128), dtype=torch.bfloat16, device=device) * 0.3
+        torch.randn((sum(kv_lens), kv_heads, 128), dtype=torch.bfloat16, device=device)
+        * 0.3
     )
     q_reference = q[:live].view(-1, 16, 192).float()
     k_scale = v_scale = None
@@ -39,10 +46,10 @@ def _case(q_lens, kv_lens, *, device="cpu", padded=0, evict=False):
     storage_dtype = keys.dtype
     poison = float("nan")
     k_pages = torch.full(
-        (total_pages + 1, 64, 1, 192), poison, dtype=storage_dtype, device=device
+        (total_pages + 1, 64, kv_heads, 192), poison, dtype=storage_dtype, device=device
     )
     v_pages = torch.full(
-        (total_pages + 1, 64, 1, 128), poison, dtype=storage_dtype, device=device
+        (total_pages + 1, 64, kv_heads, 128), poison, dtype=storage_dtype, device=device
     )
     full_to_swa = torch.zeros((total_pages + 1) * 64, dtype=torch.int64, device=device)
     slots = []
@@ -74,10 +81,14 @@ def _case(q_lens, kv_lens, *, device="cpu", padded=0, evict=False):
         page_offset += n_pages
     pack = 8
     k_buf = (
-        k_pages.view(-1, 64, 1, 192 // pack, pack).permute(0, 2, 3, 1, 4).contiguous()
+        k_pages.view(-1, 64, kv_heads, 192 // pack, pack)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
     )
     v_buf = (
-        v_pages.view(-1, 64 // pack, pack, 1, 128).permute(0, 3, 1, 4, 2).contiguous()
+        v_pages.view(-1, 64 // pack, pack, kv_heads, 128)
+        .permute(0, 3, 1, 4, 2)
+        .contiguous()
     )
     sub_pool = SimpleNamespace(
         dtype=torch.bfloat16,
@@ -130,8 +141,8 @@ def _case(q_lens, kv_lens, *, device="cpu", padded=0, evict=False):
         layer_id=0,
         sliding_window_size=128,
         tp_q_head_num=16,
-        tp_k_head_num=1,
-        tp_v_head_num=1,
+        tp_k_head_num=kv_heads,
+        tp_v_head_num=kv_heads,
         qk_head_dim=192,
         head_dim=192,
         v_head_dim=128,
@@ -170,8 +181,8 @@ def _run(case, **kwargs):
     return aiter_utils.forward_extend_vectorized_5d(
         case.backend,
         case.q,
-        case.q.new_zeros((case.q.shape[0], 1, 192)),
-        case.q.new_zeros((case.q.shape[0], 1, 128)),
+        case.q.new_zeros((case.q.shape[0], case.layer.tp_k_head_num, 192)),
+        case.q.new_zeros((case.q.shape[0], case.layer.tp_v_head_num, 128)),
         case.layer,
         case.batch,
         len(case.batch.extend_seq_lens_cpu) + 1,
@@ -182,16 +193,26 @@ def _run(case, **kwargs):
 
 
 @pytest.mark.parametrize("fresh", [False, True])
-def test_gfx942_swa_uses_5d_pages_and_caches_translation(monkeypatch, fresh):
-    case = _case([7, 65], [7, 65] if fresh else [71, 193], padded=8)
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_gfx942_swa_uses_5d_pages_and_caches_translation(monkeypatch, fresh, kv_heads):
+    case = _case(
+        [7, 65],
+        [7, 65] if fresh else [71, 193],
+        padded=8,
+        kv_heads=kv_heads,
+        q_row_padding=kv_heads * (192 + 128),
+    )
     calls = []
 
     def flypa(q, k, v, *args, **kwargs):
         assert k.data_ptr() == case.k_buf.data_ptr() and k.ndim == 5
         assert v.data_ptr() == case.v_buf.data_ptr() and v.ndim == 5
+        assert k.shape[1] == v.shape[1] == kv_heads
         assert q.shape[0] == 72
+        assert q.data_ptr() == case.q.data_ptr()
+        assert q.stride(0) == case.q.stride(0)
         torch.testing.assert_close(args[2], case.expected_pages)
-        assert kwargs["window_left"] == 128
+        assert kwargs["window_left"] == (127 if kv_heads == 2 else 128)
         assert kwargs["sink_ptr"] is case.sinks
         assert kwargs["softmax_scale"] == case.layer.scaling
         calls.append(kwargs)
@@ -290,20 +311,49 @@ def test_missing_paged_metadata_is_not_selected(missing):
     )
 
 
+def test_flash_swa_rejects_mismatched_value_heads():
+    case = _case([7], [71], kv_heads=2)
+    case.layer.tp_v_head_num = 1
+    assert (
+        aiter_utils._mimo_gfx942_paged_swa_prefill(
+            case.backend, case.q, case.layer, case.batch, 2, (128, -1), case.sinks
+        )
+        is None
+    )
+
+
+def test_flash_swa_rejects_mismatched_cache_heads():
+    case = _case([7], [71], kv_heads=2)
+    case.backend.token_to_kv_pool.swa_kv_pool.k_buffer[0] = case.k_buf[
+        :, :1
+    ].contiguous()
+    assert (
+        aiter_utils._mimo_gfx942_paged_swa_prefill(
+            case.backend, case.q, case.layer, case.batch, 2, (128, -1), case.sinks
+        )
+        is None
+    )
+
+
 def _reference(case):
     pieces = []
     qo = ko = 0
+    window_left = 127 if case.layer.tp_k_head_num == 2 else 128
     for nq, nk in zip(case.batch.extend_seq_lens_cpu, case.batch.seq_lens_cpu.tolist()):
         for start in range(0, nq, 128):
             stop = min(start + 128, nq)
-            ks, ke = max(0, nk - nq + start - 128), nk - nq + stop
+            ks, ke = max(0, nk - nq + start - window_left), nk - nq + stop
             q = case.q_reference[qo + start : qo + stop].transpose(0, 1)
             k = case.k_reference[ko + ks : ko + ke].transpose(0, 1)
             v = case.v_reference[ko + ks : ko + ke].transpose(0, 1)
+            k = k.repeat_interleave(16 // case.layer.tp_k_head_num, dim=0)
+            v = v.repeat_interleave(16 // case.layer.tp_v_head_num, dim=0)
             score = q @ k.transpose(-1, -2) * case.layer.scaling
             qp = nk - nq + torch.arange(start, stop, device=q.device)[:, None]
             kp = torch.arange(ks, ke, device=q.device)[None, :]
-            score.masked_fill_(~((kp <= qp) & (kp >= qp - 128))[None], -torch.inf)
+            score.masked_fill_(
+                ~((kp <= qp) & (kp >= qp - window_left))[None], -torch.inf
+            )
             logits = torch.cat(
                 [score, case.sinks[:, None, None].expand(-1, stop - start, 1)], -1
             )
@@ -313,7 +363,24 @@ def _reference(case):
     return torch.cat(pieces)
 
 
+@pytest.mark.parametrize(
+    "kv_heads,context_length,expected",
+    [(1, 128, 1 / 128), (1, 129, 1 / 129), (2, 128, 1 / 128), (2, 129, 0.0)],
+)
+def test_swa_reference_window_boundary(kv_heads, context_length, expected):
+    case = _case([1], [context_length], kv_heads=kv_heads)
+    case.q_reference.zero_()
+    case.k_reference.zero_()
+    case.v_reference.zero_()
+    case.v_reference[0].fill_(1)
+    case.sinks.fill_(-torch.inf)
+    # Uniform scores expose whether the oldest key is still in the window.
+    output = _reference(case)
+    torch.testing.assert_close(output, torch.full_like(output, expected))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires gfx942")
+@pytest.mark.parametrize("kv_heads", [1, 2])
 @pytest.mark.parametrize(
     "q_lens,kv_lens,padded,evict",
     [
@@ -327,10 +394,14 @@ def _reference(case):
         ([32768], [65536], 0, False),
     ],
 )
-def test_gpu_paged_swa_matches_reference(monkeypatch, q_lens, kv_lens, padded, evict):
+def test_gpu_paged_swa_matches_reference(
+    monkeypatch, q_lens, kv_lens, padded, evict, kv_heads
+):
     if not aiter_utils.is_gfx942():
         pytest.skip("gfx942-only routing change")
-    case = _case(q_lens, kv_lens, device="cuda", padded=padded, evict=evict)
+    case = _case(
+        q_lens, kv_lens, device="cuda", padded=padded, evict=evict, kv_heads=kv_heads
+    )
     import aiter.ops.flydsl as flydsl_ops
 
     original = flydsl_ops.flydsl_paged_attention_swa_bf16
@@ -358,10 +429,13 @@ def test_gpu_paged_swa_matches_reference(monkeypatch, q_lens, kv_lens, padded, e
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires gfx942")
-def test_gpu_paged_swa_replays_graph():
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_gpu_paged_swa_replays_graph(kv_heads):
     if not aiter_utils.is_gfx942():
         pytest.skip("gfx942-only routing change")
-    case = _case([7, 63, 129], [73, 192, 257], device="cuda", padded=57)
+    case = _case(
+        [7, 63, 129], [73, 192, 257], device="cuda", padded=57, kv_heads=kv_heads
+    )
     _run(case)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -375,3 +449,37 @@ def test_gpu_paged_swa_replays_graph():
             output[:199].float(), _reference(case), atol=0.02, rtol=0.02
         )
         assert torch.all(output[199:] == 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires gfx942")
+def test_gpu_flash_swa_reads_strided_qkv_query_without_copy(monkeypatch):
+    if not aiter_utils.is_gfx942():
+        pytest.skip("gfx942-only routing change")
+    case = _case(
+        [7, 129],
+        [193, 961],
+        device="cuda",
+        padded=8,
+        evict=True,
+        kv_heads=2,
+        q_row_padding=2 * (192 + 128),
+    )
+    import aiter.ops.flydsl as flydsl_ops
+
+    original = flydsl_ops.flydsl_paged_attention_swa_bf16
+
+    def check_view(q, *args, **kwargs):
+        assert q.data_ptr() == case.q.data_ptr()
+        assert q.stride(0) == 3712
+        return original(q, *args, **kwargs)
+
+    monkeypatch.setattr(flydsl_ops, "flydsl_paged_attention_swa_bf16", check_view)
+    output = _run(case).view(-1, 16, 128)
+    torch.testing.assert_close(
+        output[:136].float(), _reference(case), atol=0.02, rtol=0.02
+    )
+    assert torch.all(output[136:] == 0)
+    monkeypatch.setattr(flydsl_ops, "flydsl_paged_attention_swa_bf16", original)
+    case.q = case.q.contiguous()
+    contiguous_output = _run(case).view(-1, 16, 128)
+    assert torch.equal(output, contiguous_output)

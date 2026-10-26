@@ -8,7 +8,7 @@ filtering to produce reproducible, comparable performance metrics.
 
 Pipeline:
   1. Parse all "Decode batch" lines + detect cache flush section boundaries
-  2. TP rank filter (single scheduler)
+  2. DP and TP rank filters (single scheduler)
   3. Split into sections (by cache flush markers)
   4. Per-section full-load filter (running_req >= ceil(target_bs * ratio))
   5. Per-section round detection (time-gap method) + warmup/drain trim
@@ -91,6 +91,9 @@ class RoundStats:
 @dataclass
 class FilteringReport:
     total_decode_lines: int = 0
+    after_dp_filter: int = 0
+    dp_removed: int = 0
+    dp_rank_used: str = ""
     after_tp_filter: int = 0
     tp_removed: int = 0
     tp_rank_used: str = ""
@@ -168,6 +171,28 @@ def parse_log(filepath: str) -> Tuple[List[DecodeSample], List[int]]:
 # ---------------------------------------------------------------------------
 # Filtering pipeline
 # ---------------------------------------------------------------------------
+
+
+def filter_dp_rank(
+    samples: List[DecodeSample],
+    dp_rank: Optional[int],
+    report: FilteringReport,
+) -> List[DecodeSample]:
+    """Select one replica; independent scheduler rates must not be pooled."""
+    ranks = sorted({s.dp_rank for s in samples})
+    if dp_rank is None and len(ranks) > 1:
+        raise ValueError(
+            f"Multiple DP ranks found: {ranks}. Select --dp-rank and set "
+            "--target-bs to that replica's running request count."
+        )
+    chosen = ranks[0] if dp_rank is None else dp_rank
+    if chosen not in ranks:
+        raise ValueError(f"DP{chosen} not found. Available DP ranks: {ranks}")
+    filtered = [s for s in samples if s.dp_rank == chosen]
+    report.dp_rank_used = f"DP{chosen}"
+    report.dp_removed = len(samples) - len(filtered)
+    report.after_dp_filter = len(filtered)
+    return filtered
 
 
 def filter_tp_rank(
@@ -464,7 +489,8 @@ def run_pipeline(args: argparse.Namespace) -> Tuple[
     report.total_decode_lines = len(samples)
     total_raw = len(samples)
 
-    # Step 1: TP rank filter
+    # Step 1: Select a single scheduler before calculating rates or intervals.
+    samples = filter_dp_rank(samples, args.dp_rank, report)
     samples = filter_tp_rank(samples, args.tp_rank, report)
 
     # Step 2: Split into sections
@@ -657,6 +683,14 @@ def format_text_report(
     lines.append(fmt.format(
         "Raw Decode lines", str(report.total_decode_lines), "-", "",
     ))
+    lines.append(
+        fmt.format(
+            f"DP rank filter ({report.dp_rank_used})",
+            str(report.after_dp_filter),
+            str(report.dp_removed),
+            "",
+        )
+    )
     lines.append(fmt.format(
         f"TP rank filter ({report.tp_rank_used})",
         str(report.after_tp_filter), str(report.tp_removed), "",
@@ -891,6 +925,8 @@ def format_json_report(
         },
         "filtering": {
             "total_decode_lines": report.total_decode_lines,
+            "after_dp_filter": report.after_dp_filter,
+            "dp_rank_used": report.dp_rank_used,
             "after_tp_filter": report.after_tp_filter,
             "tp_rank_used": report.tp_rank_used,
             "num_sections": report.num_sections,
@@ -968,8 +1004,10 @@ def main():
     )
     parser.add_argument("log_file", help="Path to the decode log file")
     parser.add_argument(
-        "--target-bs", type=int, required=True,
-        help="Target batch size (required).",
+        "--target-bs",
+        type=int,
+        required=True,
+        help="Target running request count per DP replica (required).",
     )
     parser.add_argument(
         "--full-load-ratio", type=float, default=1.00,
@@ -1013,6 +1051,12 @@ def main():
         help="Enable linear regression drift detection.",
     )
     parser.add_argument(
+        "--dp-rank",
+        type=int,
+        default=None,
+        help="DP replica to analyze (required when the log contains multiple replicas).",
+    )
+    parser.add_argument(
         "--tp-rank", type=int, default=None,
         help="TP rank to filter (default: auto).",
     )
@@ -1031,8 +1075,19 @@ def main():
 
     args = parser.parse_args()
 
-    report, stats, round_stats, drift, interval_ms, total_raw, threshold, \
-        section_stats_list = run_pipeline(args)
+    try:
+        (
+            report,
+            stats,
+            round_stats,
+            drift,
+            interval_ms,
+            total_raw,
+            threshold,
+            section_stats_list,
+        ) = run_pipeline(args)
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.output == "json":
         print(format_json_report(

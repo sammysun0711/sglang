@@ -1,11 +1,43 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe import topk
+from sglang.srt.layers.moe.token_dispatcher import moriep
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+
+
+@pytest.mark.parametrize(
+    "configured,recording,capturing,expected",
+    [
+        (False, False, False, False),
+        (False, False, True, False),
+        (True, False, False, False),
+        (True, False, True, True),
+        (True, True, False, True),
+        (True, True, True, True),
+    ],
+)
+def test_mori_counts_only_for_configured_or_active_recorder(
+    monkeypatch, configured, recording, capturing, expected
+):
+    recorder = (
+        SimpleNamespace(recording=recording)
+        if configured
+        else moriep._ExpertDistributionRecorderNoop()
+    )
+    monkeypatch.setattr(
+        moriep, "get_global_expert_distribution_recorder", lambda: recorder
+    )
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda: SimpleNamespace(is_current_stream_capturing=lambda: capturing),
+    )
+    assert moriep._should_record_expert_distribution() is expected
 
 
 def test_hip_masks_padded_expert_ids_without_eplb(monkeypatch):

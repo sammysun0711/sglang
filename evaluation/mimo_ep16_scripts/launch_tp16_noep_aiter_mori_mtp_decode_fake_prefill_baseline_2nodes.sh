@@ -19,6 +19,10 @@ export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-112}"
 # ProcessGroupNCCL watchdog/HIP Graph capture conflict (hipErrorCapturedEvent).
 export TORCH_NCCL_BLOCKING_WAIT=1
 export HIP_FORCE_DEV_KERNARG="${HIP_FORCE_DEV_KERNARG:-1}"
+# enable it only for rocm 7.0.0 alpha
+# default is 1 for rocm docker image
+# export SGLANG_USE_ROCM700A=0
+
 
 export SGLANG_USE_AITER=1
 export SGLANG_MOE_PADDING=1

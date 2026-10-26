@@ -58,6 +58,8 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        defer_metadata_init: bool = False,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
@@ -74,6 +76,10 @@ class DFlashVerifyInput(SpecInput):
         )
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        if defer_metadata_init:
+            # The runner owns the final graph decision and padded attention plan.
+            return verify_forward_batch, False
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner

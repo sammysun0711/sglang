@@ -2025,8 +2025,7 @@ def initialize_model_parallel(
             # DP attention reductions and DP LM-head gathers run during graph
             # capture even when sampling does not need token-ID synchronization.
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem or attn_dp_size > 1,
-            use_mscclpp_allreduce=False,
-            use_custom_allreduce=False,
+            use_custom_allreduce=None,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",

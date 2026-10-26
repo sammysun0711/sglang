@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Prefill-only client benchmark.
-# Current customer-aligned server setting: CHUNKED_PREFILL_SIZE=65536. Run the
+# The legacy customer preset's server reference is CHUNKED_PREFILL_SIZE=65536. Run the
 # same client matrix against separately launched TBO/radix-cache configurations
 # and record those server-side settings with each result.
 # --flush-cache below does not disable the server's radix cache.
@@ -12,6 +12,10 @@ set -euo pipefail
 # BENCHMARK_PRESET=simple uses 64 measured prompts per input, OSL=1, and
 # concurrency 16/16/12/3/2/2/2/2/2/2 for 4K/8K/16K/32K/64K/128K/256K/512K/768K/1M.
 # The 1M case uses 1048000 input tokens, as in the customer preset.
+# BENCHMARK_PRESET=mimo_v26_flash uses the client matrix from
+# mimo_v26_flash/h200_reference/MiMo-v2.6-Flash-H200-prefill-data.csv (K=1024).
+# Select rows with TOKEN_LIST_OVERRIDE, e.g. 65536 for 64K/1, 256 prompts, C32.
+# Server topology, chunk size, quantization and backends are configured separately.
 # NUM_PROMPTS_OVERRIDE overrides all counts; SMALL_INPUT_NUM_PROMPTS_OVERRIDE
 # overrides counts for inputs <=8K. PROMPT_WAVES/MIN_NUM_PROMPTS are sweep-only.
 benchmark_preset="${BENCHMARK_PRESET:-simple}"
@@ -44,8 +48,33 @@ case "${benchmark_preset}" in
     short_input_max_tokens=65536
     default_small_num_prompts=64
     ;;
+  mimo_v26_flash)
+    short_input_max_tokens=65536
+    default_tokens=""
+    declare -A flash_output_tokens flash_num_prompts flash_concurrency
+    # ISL     OSL  measured prompts  global concurrency
+    while read -r flash_isl flash_osl flash_prompts flash_c; do
+      default_tokens+="${default_tokens:+ }${flash_isl}"
+      flash_output_tokens["${flash_isl}"]="${flash_osl}"
+      flash_num_prompts["${flash_isl}"]="${flash_prompts}"
+      flash_concurrency["${flash_isl}"]="${flash_c}"
+    done <<'MIMO_V26_FLASH_MATRIX'
+8192      1    1024    32
+16384     1    1024    32
+32768     1    512     32
+65536     1    256     32
+131072    1    128     16
+262144    1    64      8
+524288    1    32      4
+983040    1    16      4
+MIMO_V26_FLASH_MATRIX
+    default_small_concurrency="${flash_concurrency[8192]}"
+    default_short_concurrency="${flash_concurrency[16384]}"
+    default_long_concurrency="${flash_concurrency[983040]}"
+    default_small_num_prompts="${flash_num_prompts[8192]}"
+    ;;
   *)
-    echo "BENCHMARK_PRESET must be customer, sweep, or simple, observed '${benchmark_preset}'" >&2
+    echo "BENCHMARK_PRESET must be customer, sweep, simple, or mimo_v26_flash, observed '${benchmark_preset}'" >&2
     exit 2
     ;;
 esac
@@ -96,6 +125,12 @@ concurrency_spec_for_input() {
     echo "${CONCURRENCY_LIST_OVERRIDE}"
   elif (( input_tokens <= 8192 )); then
     echo "${small_input_concurrency_list}"
+  elif [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    if (( input_tokens <= short_input_max_tokens )); then
+      echo "${SHORT_CONCURRENCY_LIST_OVERRIDE:-${flash_concurrency[${input_tokens}]}}"
+    else
+      echo "${LONG_CONCURRENCY_LIST_OVERRIDE:-${flash_concurrency[${input_tokens}]}}"
+    fi
   elif [[ "${benchmark_preset}" == "simple" ]] && (( input_tokens <= 65536 )); then
     if (( input_tokens <= 16384 )); then
       echo "${short_concurrency_list}"
@@ -117,6 +152,8 @@ num_prompts_for_input() {
     echo "${NUM_PROMPTS_OVERRIDE}"
   elif (( input_tokens <= 8192 )); then
     echo "${small_input_num_prompts}"
+  elif [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    echo "${flash_num_prompts[${input_tokens}]}"
   elif [[ "${benchmark_preset}" == "simple" ]]; then
     echo 64
   elif [[ "${benchmark_preset}" == "customer" ]]; then
@@ -145,6 +182,14 @@ if (( ${#TOKEN_LIST[@]} == 0 )); then
 fi
 for input_tokens in "${TOKEN_LIST[@]}"; do
   require_positive_integer "Input length" "${input_tokens}"
+  if [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    if [[ -z "${flash_num_prompts[${input_tokens}]+set}" ]]; then
+      echo "mimo_v26_flash has no row for input ${input_tokens}; select from: ${default_tokens}" >&2
+      exit 2
+    fi
+    require_positive_integer "Output length" "${flash_output_tokens[${input_tokens}]}"
+    require_positive_integer "Measured prompts" "${flash_num_prompts[${input_tokens}]}"
+  fi
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   if (( ${#concurrency_list[@]} == 0 )); then
     echo "Concurrency list for input ${input_tokens} must not be empty" >&2
@@ -156,6 +201,10 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
 done
 
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
+if [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+  echo "Client matrix: MiMo-v2.6-Flash-H200-prefill-data.csv; input K=1024 tokens."
+  echo "Record actual server topology, effective chunk size, TBO, quantization, and backends with results."
+fi
 if [[ "${benchmark_preset}" == "customer" ]]; then
   echo "Required customer server setting: chunked_prefill_size=65536"
   echo "Record TBO and radix-cache modes from the server log for this run."
@@ -169,11 +218,14 @@ if [[ "${dry_run}" == "0" ]]; then
 fi
 
 for input_tokens in "${TOKEN_LIST[@]}"; do
+  if [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    output_tokens="${flash_output_tokens[${input_tokens}]}"
+  fi
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
     echo -e "\n============================================================"
-    echo "Testing: Input Token = ${input_tokens}, Concurrency = ${concurrency} | Run 1"
+    echo "Testing: Input Token = ${input_tokens}, Output Token = ${output_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${warmup_requests}"
     echo "Log file: benchmark_${input_tokens}_con${concurrency}.log"
     echo "============================================================"

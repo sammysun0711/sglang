@@ -10,10 +10,9 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -37,6 +36,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.utils import is_npu, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
 
 _is_npu = is_npu()
 if _is_npu:
@@ -73,8 +73,7 @@ class DFlashAttention(nn.Module):
     def __init__(self, config, layer_id: int) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
-        tp_rank = get_attention_tp_rank()
-        tp_size = get_attention_tp_size()
+        tp_size = get_tensor_model_parallel_world_size()
         total_num_heads = int(config.num_attention_heads)
         total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", total_num_heads)
@@ -114,17 +113,12 @@ class DFlashAttention(nn.Module):
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
             prefix="qkv_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
             prefix="o_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            use_dp_attention_reduce=True,
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -271,8 +265,6 @@ class DFlashMLP(nn.Module):
         super().__init__()
         hidden_size = int(config.hidden_size)
         intermediate_size = int(getattr(config, "intermediate_size", 0))
-        tp_rank = get_attention_tp_rank()
-        tp_size = get_attention_tp_size()
         if intermediate_size <= 0:
             raise ValueError(
                 f"Invalid intermediate_size={intermediate_size} for DFlash MLP."
@@ -284,8 +276,6 @@ class DFlashMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix="gate_up_proj" if not prefix else f"{prefix}.gate_up_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -293,9 +283,6 @@ class DFlashMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix="down_proj" if not prefix else f"{prefix}.down_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            use_dp_attention_reduce=True,
         )
         hidden_act = getattr(config, "hidden_act", "silu")
         if hidden_act != "silu":
@@ -360,6 +347,8 @@ class DFlashDraftModel(nn.Module):
       - `fc.weight`, `hidden_norm.weight` for projecting target context features
       - `norm.weight` for final normalization
     """
+
+    draft_parallel_spec = DraftParallelSpec(DraftTPExecution.SINGLE_GROUP)
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()

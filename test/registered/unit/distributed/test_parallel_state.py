@@ -36,6 +36,7 @@ not the per-rank group membership logic.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from unittest.mock import Mock, patch
 
@@ -50,7 +51,8 @@ register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
 
 
-def test_parallel_group_construction_tp8_attn_cp2():
+@pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
+def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
     """
     Test parallel group construction for 8 GPU configuration with:
     - tensor_model_parallel_size = 8
@@ -79,18 +81,20 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch.object(parallel_state, "_ATTN_CP", None),
         patch.object(parallel_state, "_ATTN_TP", None),
         patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_ENABLE_CUSTOM_ALL_REDUCE", custom_allreduce_enabled),
+        patch.object(parallel_state, "_ENABLE_MSCCLPP_ALL_REDUCE", custom_allreduce_enabled),
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=world_size),
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
 
-        # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
+        created_policies = {}
 
-        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
-            group_name = kwargs.get("group_name", "unknown")
+        def mock_group_coordinator(*, group_ranks, group_name, use_custom_allreduce, use_pymscclpp, **kwargs):
             created_groups[group_name] = group_ranks
+            created_policies[group_name] = (use_custom_allreduce, use_pymscclpp)
 
             # Create a mock group object
             mock_group = Mock()
@@ -100,8 +104,8 @@ def test_parallel_group_construction_tp8_attn_cp2():
         with (
             patch.object(
                 parallel_state,
-                "init_model_parallel_group",
-                side_effect=mock_init_model_parallel_group,
+                "GroupCoordinator",
+                side_effect=mock_group_coordinator,
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
@@ -149,6 +153,10 @@ def test_parallel_group_construction_tp8_attn_cp2():
             ), f"Wrong ATTN_CP groups: {attn_cp_groups}"
 
             print("TP=8, Attn CP=2 group construction verified")
+            assert created_policies["attention_tp"] == (
+                custom_allreduce_enabled,
+                custom_allreduce_enabled,
+            )
 
             # Cleanup
             parallel_state.destroy_model_parallel()
@@ -268,12 +276,43 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("attention_aliases_tp", [False, True])
+def test_graph_capture_includes_attention_tp_once(attention_aliases_tp):
+    entered = []
+    shared_context = object()
+
+    class CaptureGroup:
+        def __init__(self, name):
+            self.name = name
+
+        @contextlib.contextmanager
+        def graph_capture(self, context=None, stream=None):
+            entered.append(self.name)
+            yield shared_context
+
+    tp_group = CaptureGroup("tp")
+    pp_group = CaptureGroup("pp")
+    attention_group = tp_group if attention_aliases_tp else CaptureGroup("attention")
+    with (
+        patch.multiple(
+            parallel_state, _TP=tp_group, _PP=pp_group, _ATTN_TP=attention_group,
+            _MOE_EP=attention_group, _MOE_TP=tp_group,
+        ),
+        patch.object(parallel_state, "get_tp_group", return_value=tp_group),
+        patch.object(parallel_state, "get_pp_group", return_value=pp_group),
+    ):
+        with parallel_state.graph_capture() as context:
+            assert context is shared_context
+    assert entered == (["tp", "pp"] if attention_aliases_tp else ["tp", "pp", "attention"])
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys
 
     try:
-        test_parallel_group_construction_tp8_attn_cp2()
+        test_parallel_group_construction_tp8_attn_cp2(False)
+        test_parallel_group_construction_tp8_attn_cp2(True)
         test_parallel_group_construction_tp8_moe_ep4_cp2()
 
         sys.exit(0)

@@ -79,6 +79,7 @@ class AiterRunnerInput(RunnerInput):
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    num_tokens_before_dispatch: Optional[int] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -136,6 +137,13 @@ def _aiter_fused_moe_supports_transposed_a1_scale() -> bool:
     return "a1_scale_is_transposed" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_dispatch_token_hint() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "num_tokens_before_dispatch" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -179,6 +187,11 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        if (
+            runner_input.num_tokens_before_dispatch is not None
+            and _aiter_fused_moe_supports_dispatch_token_hint()
+        ):
+            extra["num_tokens_before_dispatch"] = runner_input.num_tokens_before_dispatch
         if runner_input.a1_scale_is_transposed:
             if not _aiter_fused_moe_supports_transposed_a1_scale():
                 raise NotImplementedError(
@@ -434,6 +447,9 @@ def _pre_permute_deepep_to_aiter(
         a1_scale=a1_scale,
         num_local_tokens=num_local_tokens,
         output_dtype=output_dtype,
+        num_tokens_before_dispatch=(
+            dispatch_output.origin_topk_ids.shape[0] if is_mori else None
+        ),
     )
 
 

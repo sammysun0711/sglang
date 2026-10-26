@@ -312,9 +312,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.enable_tbo_cuda_graph = is_tbo_cuda_graph_enabled(
-            model_runner.server_args
-        )
+        if model_runner.is_draft_worker and model_runner.spec_algorithm.is_dflash():
+            # DFlash's dense draft runs entirely within the attention TP group.
+            # Only target verification synchronizes MoE tokens across DP groups;
+            # draft batches (including an absent batch) can run independently.
+            self.require_gathered_buffer = False
+            self.require_mlp_tp_gather = False
+            self.require_mlp_sync = False
+            self.require_attn_tp_gather = False
+        self.enable_tbo_cuda_graph = is_tbo_cuda_graph_enabled(model_runner.server_args)
         self.use_ngram_embedding = model_runner.use_ngram_embedding
         if self.use_ngram_embedding:
             hf_config = model_runner.model_config.hf_config

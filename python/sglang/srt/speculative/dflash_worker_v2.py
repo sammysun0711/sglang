@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -702,7 +703,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
-        tp_group = get_tp_group()
+        tp_group = (
+            get_attention_tp_group()
+            if getattr(lm_head, "use_attn_tp_group", False)
+            else get_tp_group()
+        )
         tp_size = int(tp_group.world_size)
 
         if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
@@ -1299,6 +1304,53 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         self._validate_phase1_sampling_support(model_worker_batch)
 
+        if model_worker_batch.forward_mode.is_idle():
+            empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
+            empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
+            can_run_cuda_graph = False
+            if self.server_args.enable_dp_attention:
+                # The dense draft is attention-local, but an idle DP group must
+                # still participate in the target's global MoE collectives.
+                if model_worker_batch.is_extend_in_batch:
+                    model_worker_batch.spec_info = None
+                    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+                    forward_batch = ForwardBatch.init_new(
+                        model_worker_batch, self.target_worker.model_runner
+                    )
+                else:
+                    verify_input = DFlashVerifyInput(
+                        draft_token=empty_ids,
+                        positions=empty_ids,
+                        draft_token_num=int(self.block_size),
+                    )
+                    forward_batch, _ = verify_input.prepare_for_verify(
+                        model_worker_batch, self.target_worker
+                    )
+                target_out = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=forward_batch,
+                    is_verify=True,
+                )
+                can_run_cuda_graph = target_out.can_run_cuda_graph
+            next_draft_input = self._make_next_draft_input_decode(
+                verified_id=torch.empty((0,), device=self.device, dtype=torch.int32),
+                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
+            )
+            if on_publish is not None:
+                on_publish(next_draft_input.new_seq_lens)
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+            next_draft_input.verify_done = verify_done
+            return GenerationBatchResult(
+                logits_output=None,
+                next_token_ids=empty_ids,
+                accept_lens=empty_lens,
+                next_draft_input=next_draft_input,
+                can_run_cuda_graph=can_run_cuda_graph,
+                speculative_num_draft_tokens=int(self.block_size),
+                new_seq_lens=next_draft_input.new_seq_lens,
+            )
+
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -1386,28 +1438,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not isinstance(draft_input, DFlashDraftInputV2):
             raise RuntimeError(
                 "DFLASH spec-v2 expected DFlashDraftInputV2 state on the running batch."
-            )
-
-        if model_worker_batch.forward_mode.is_idle():
-            empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
-            empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
-            next_draft_input = self._make_next_draft_input_decode(
-                verified_id=torch.empty((0,), device=self.device, dtype=torch.int32),
-                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
-            )
-            if on_publish is not None:
-                on_publish(next_draft_input.new_seq_lens)
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
-            next_draft_input.verify_done = verify_done
-            return GenerationBatchResult(
-                logits_output=None,
-                next_token_ids=empty_ids,
-                accept_lens=empty_lens,
-                next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
-                speculative_num_draft_tokens=int(self.block_size),
-                new_seq_lens=next_draft_input.new_seq_lens,
             )
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
@@ -1655,7 +1685,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph

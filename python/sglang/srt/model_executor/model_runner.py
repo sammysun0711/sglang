@@ -464,6 +464,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.dflash_draft_model_config = None
+        self.draft_parallel_layout = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker
@@ -513,6 +515,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
+            self.dflash_draft_model_config = draft_model_config
             dflash_draft_config = parse_dflash_draft_config(
                 draft_hf_config=draft_model_config.hf_config
             )

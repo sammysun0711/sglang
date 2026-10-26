@@ -11,6 +11,10 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.draft_kv_budget import (
+    DFlashKVCacheBudget,
+    dflash_draft_cell_size_per_token,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -218,6 +222,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model = self.draft_model_runner.model
         self.draft_model_runner.draft_parallel_layout = self.draft_parallel_layout
         self.model_runner.draft_parallel_layout = self.draft_parallel_layout
+        draft_cell_size = dflash_draft_cell_size_per_token(
+            model_config=self.draft_model_runner.model_config,
+            num_layers=self.draft_model_runner.num_effective_layers,
+            kv_cache_dtype=self.draft_model_runner.kv_cache_dtype,
+            layout=self.draft_parallel_layout,
+        )
+        # MHA pools allocate one additional page for padding/sentinel writes.
+        draft_fixed_bytes = draft_cell_size * self.page_size
+        logger.info(
+            "DFlash draft placement: ranks=%s, attention_tp=%s, KV bytes/token=%s, padding bytes=%s",
+            self.draft_parallel_layout.tp_group.ranks,
+            self.draft_parallel_layout.attn_tp_size,
+            draft_cell_size,
+            draft_fixed_bytes,
+        )
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -246,6 +265,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id_override,
         )
         self._maybe_merge_trained_mask_embedding()
+        self.model_runner.dflash_draft_kv_budget = DFlashKVCacheBudget(
+            self.draft_parallel_layout, draft_cell_size, draft_fixed_bytes
+        )
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -406,6 +428,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                     None if self.use_compact_draft_cache else req_to_token_pool
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        pool = self.draft_model_runner.token_to_kv_pool
+        if hasattr(pool, "get_kv_size_bytes"):
+            allocated_bytes = pool.get_kv_size_bytes()
+            if isinstance(allocated_bytes, tuple):
+                allocated_bytes = sum(allocated_bytes)
+            expected_bytes = self.model_runner.dflash_draft_kv_budget.cell_size * (
+                self.draft_model_runner.max_total_num_tokens + self.page_size
+            )
+            logger.info(
+                "DFlash draft KV allocation: token_capacity=%s, bytes=%s, reserved_bytes=%s",
+                self.draft_model_runner.max_total_num_tokens,
+                allocated_bytes,
+                expected_bytes,
             )
 
     def init_backends(self):

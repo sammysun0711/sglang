@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import List, Optional
 
 import torch
+import torch.nn.functional as F
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_group
@@ -25,6 +26,7 @@ from sglang.srt.server_args import (
     ServerArgs,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -122,6 +124,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._full_embed_gpu = None
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             self.model_runner.dflash_draft_model_config,
             enable_dp_attention=server_args.enable_dp_attention,
@@ -265,6 +268,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id_override,
         )
         self._maybe_merge_trained_mask_embedding()
+        self._draft_embedding = (
+            self._target_worker.model_runner.model.get_input_embeddings()
+        )
+        draft_embedding_getter = getattr(self.draft_model, "get_input_embeddings", None)
+        if draft_embedding_getter is not None:
+            draft_embedding = draft_embedding_getter()
+            if draft_embedding is not None:
+                self._draft_embedding = draft_embedding
+        if server_args.enable_dp_attention:
+            self._full_embed_gpu = gather_draft_embedding(
+                self._draft_embedding, self.draft_parallel_layout.tp_group
+            )
+            if self._full_embed_gpu is not None:
+                draft_fixed_bytes += (
+                    self._full_embed_gpu.numel() * self._full_embed_gpu.element_size()
+                )
         self.model_runner.dflash_draft_kv_budget = DFlashKVCacheBudget(
             self.draft_parallel_layout, draft_cell_size, draft_fixed_bytes
         )
@@ -307,6 +326,36 @@ class DFlashWorkerV2(BaseSpecWorker):
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+
+        self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gather_cap: int = 0
+        self._draft_greedy_local_max_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_arg_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_cap: int = 0
+        self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_index_cap: int = 0
+        self._use_fused_kv_materialize = is_cuda() or is_hip()
+        self._fused_kv_helper: Optional[object] = None
+        if self._use_fused_kv_materialize:
+            with self._draft_context():
+                self._init_fused_kv_helper()
+
+        supports_gpu_triton = is_cuda() or is_hip()
+        self._use_triton_prepare_block = supports_gpu_triton
+        self._use_triton_accept_bonus = supports_gpu_triton
+        self._use_fused_compact_kv = (
+            supports_gpu_triton and envs.SGLANG_DFLASH_FUSED_COMPACT_KV.get()
+        )
+        self._accept_bonus_buffer_cap: int = 0
+        self._accept_bonus_buffer_slot: int = 0
+        self._accept_len_buf: Optional[torch.Tensor] = None
+        self._commit_lens_bufs: List[torch.Tensor] = []
+        self._bonus_id_bufs: List[torch.Tensor] = []
+        self._out_tokens_bufs: List[torch.Tensor] = []
+        self._new_seq_lens_bufs: List[torch.Tensor] = []
 
     def _maybe_merge_trained_mask_embedding(self) -> None:
         """Install the checkpoint-trained mask row into the target embedding."""
@@ -354,36 +403,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 token_id,
                 mask_embedding_path,
             )
-
-        self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_gather_cap: int = 0
-        self._draft_greedy_local_max_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_local_arg_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_local_cap: int = 0
-        self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip()
-        self._fused_kv_helper: Optional[object] = None
-        if self._use_fused_kv_materialize:
-            with self._draft_context():
-                self._init_fused_kv_helper()
-
-        supports_gpu_triton = is_cuda() or is_hip()
-        self._use_triton_prepare_block = supports_gpu_triton
-        self._use_triton_accept_bonus = supports_gpu_triton
-        self._use_fused_compact_kv = (
-            supports_gpu_triton and envs.SGLANG_DFLASH_FUSED_COMPACT_KV.get()
-        )
-        self._accept_bonus_buffer_cap: int = 0
-        self._accept_bonus_buffer_slot: int = 0
-        self._accept_len_buf: Optional[torch.Tensor] = None
-        self._commit_lens_bufs: List[torch.Tensor] = []
-        self._bonus_id_bufs: List[torch.Tensor] = []
-        self._out_tokens_bufs: List[torch.Tensor] = []
-        self._new_seq_lens_bufs: List[torch.Tensor] = []
 
     def _draft_context(self):
         return draft_parallel_context(
@@ -1398,6 +1417,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     forward_batch, _ = verify_input.prepare_for_verify(
                         model_worker_batch,
                         self.target_worker,
+                        defer_metadata_init=True,
                     )
                 target_out = self.target_worker.forward_batch_generation(
                     batch=None,
@@ -1524,7 +1544,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
+        embed_module = self._draft_embedding
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError(
@@ -1600,7 +1620,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = embed_module(block_ids)
+        noise_embedding = (
+            F.embedding(block_ids, self._full_embed_gpu)
+            if self._full_embed_gpu is not None
+            else embed_module(block_ids)
+        )
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
@@ -1751,6 +1775,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch,
             self.target_worker,
+            defer_metadata_init=self.server_args.enable_dp_attention,
         )
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup

@@ -2,11 +2,11 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-input_tokens="${INPUT_TOKENS:-8192}"
-output_tokens="${OUTPUT_TOKENS:-20}"
-num_prompts="${NUM_PROMPTS:-4}"
-warmup_requests="${WARMUP_REQUESTS:-4}"
-max_concurrency="${MAX_CONCURRENCY:-1}"
+input_tokens="${INPUT_TOKENS:-65536}"
+output_tokens="${OUTPUT_TOKENS:-1}"
+num_prompts="${NUM_PROMPTS:-32}"
+warmup_requests="${WARMUP_REQUESTS:-16}"
+max_concurrency="${MAX_CONCURRENCY:-16}"
 model_path="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD}"
 served_model_name="${SERVED_MODEL_NAME:-}"
 host="${HOST:-0.0.0.0}"

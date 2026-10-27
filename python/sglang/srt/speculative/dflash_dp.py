@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
@@ -10,6 +11,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+
 from torch import nn
 
 

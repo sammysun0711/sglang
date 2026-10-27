@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 

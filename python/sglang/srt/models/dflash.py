@@ -10,6 +10,8 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
@@ -36,7 +38,6 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.utils import is_npu, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from torch import nn
 
 _is_npu = is_npu()
 if _is_npu:

@@ -20,6 +20,43 @@ def _maxnumf(a, b):
     return type(a)(arith.maxnumf(arith.unwrap(a), arith.unwrap(b)))
 
 @flyc.jit
+def _mask_kv_tail_values(frag_v, block_n, kv_len, block_size: fx.Constexpr[int]):
+    """Zero unused V lanes; a zero probability does not suppress 0 * NaN."""
+    block_start = fx.Int32(block_n * block_size)
+    key_length = fx.Int32(kv_len)
+    if block_start + fx.Int32(block_size) > key_length:
+        # create_thr_mma packs two K-lane groups into 128-bit vector loads.
+        # Its register layout is (atom values, M tiles, (packed K, outer K)).
+        shape = frag_v.shape.to_py_value()
+        atom_values = shape[0]
+        head_tiles = shape[1]
+        if fx.const_expr(isinstance(shape[2], tuple)):
+            packed_k, outer_k = shape[2]
+        else:
+            # FP8's wider K atom consumes the whole BN tile in one outer step.
+            packed_k, outer_k = shape[2], 1
+        vector_values = 128 // frag_v.dtype.width
+        assert atom_values * packed_k == vector_values
+        assert 2 * vector_values * outer_k == block_size
+        count = atom_values * head_tiles * packed_k * outer_k
+        # Integer selects preserve valid FP8/BF16 bits and avoid FP8 scalar casts.
+        mask_type = {8: fx.Uint8, 16: fx.Uint16, 32: fx.Uint32}[frag_v.dtype.width]
+        values = Vec(frag_v.load(), (count,), frag_v.dtype).bitcast(mask_type)
+        masked = []
+        lane_k = fx.Int32((fx.thread_idx.x % 64) // 32)
+        for i in fx.range_constexpr(count):
+            k_i = i // (atom_values * head_tiles)
+            column = (
+                lane_k * fx.Int32(vector_values)
+                + fx.Int32((k_i % packed_k) * atom_values)
+                + fx.Int32((k_i // packed_k) * 2 * vector_values)
+                + fx.Int32(i % atom_values)
+            )
+            valid = block_start + column < key_length
+            masked.append(valid.select(values[i], mask_type(0)))
+        frag_v.store(Vec.from_elements(masked, mask_type).bitcast(frag_v.dtype))
+
+@flyc.jit
 def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
                    q_pos0, kv_block_n, kv_len, qo_len,
                    is_all_kv_valid: fx.Constexpr[bool],
@@ -425,6 +462,8 @@ def PagedAttention(
                         prob_operand.store(packed_fp8)
                         probability_operand = prob_operand
                     fxh.s_waitcnt(vmcnt=0)
+                    if fx.const_expr(not is_all_kv_valid):
+                        _mask_kv_tail_values(fragV, block_n, kv_len, BN)
                     fx.gemm(tmma2, fragO, fragV, probability_operand, fragO)
 
                 if fx.const_expr(is_valid_block_n(block_n + 1)):

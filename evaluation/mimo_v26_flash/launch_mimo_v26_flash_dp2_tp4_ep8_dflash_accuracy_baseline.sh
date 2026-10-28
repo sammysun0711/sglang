@@ -119,7 +119,13 @@ export SGLANG_AITER_MIMO_FRESH_BF16_ASM=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=0
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
 
-export MORI_EP_LAUNCH_CONFIG_MODE="${MORI_EP_LAUNCH_CONFIG_MODE:-MANUAL}"
+# AUTO loads the bundled gfx942 EP8 tuning rules. Use MANUAL for a baseline.
+export MORI_EP_LAUNCH_CONFIG_MODE="${MORI_EP_LAUNCH_CONFIG_MODE:-AUTO}"
+export MORI_EP_TUNING_CONFIG="${MORI_EP_TUNING_CONFIG:-${SCRIPT_DIR}/gfx942_mimo_v26_flash_ep8_mori_a2a.json}"
+if [[ "${MORI_EP_LAUNCH_CONFIG_MODE}" == "AUTO" && ! -r "${MORI_EP_TUNING_CONFIG}" ]]; then
+  echo "MORI tuning config is not readable: ${MORI_EP_TUNING_CONFIG}" >&2
+  exit 2
+fi
 export MORI_SHMEM_MODE="${MORI_SHMEM_MODE:-ISOLATION}"
 export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-0}"
 export SGLANG_MORI_DISPATCH_DTYPE="${SGLANG_MORI_DISPATCH_DTYPE:-fp8}"
@@ -193,6 +199,9 @@ echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; fused bounds ch
 
 echo "Configuration: global-tp=8, attention-tp=4, dp=2, ep=8, moe-a2a=mori, max-running=${MAX_RUNNING_REQUESTS}, requested-max-running-per-dp=${requested_max_running_per_dp}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, effective-prefill-per-dp=${effective_prefill_chunk}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, speculative=${speculative_status}, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=0, overlap=enabled"
 echo "MORI: launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, dispatch=${SGLANG_MORI_DISPATCH_DTYPE}, combine=${SGLANG_MORI_COMBINE_DTYPE}, capacity-per-rank=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}, shmem=${MORI_SHMEM_MODE}, sdma=${MORI_ENABLE_SDMA}"
+if [[ "${MORI_EP_LAUNCH_CONFIG_MODE}" == "AUTO" ]]; then
+  echo "MORI tuning config: ${MORI_EP_TUNING_CONFIG}"
+fi
 echo "Performance mode: ${PERFORMANCE_MODE} (1=fake routing; 0=real routing; both use ordinary serving)"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"

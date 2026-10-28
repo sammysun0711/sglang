@@ -371,6 +371,11 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        compact_layout = (
+            getattr(self, "dflash_compact_layout", None)
+            if self.is_draft_worker
+            else None
+        )
 
         # SHUFFLE 5D is consumed by the target model's AITER prefill/decode and
         # Gluon verification kernels. Multi-layer EAGLE draft extend still
@@ -397,7 +402,14 @@ class ModelRunnerKVCacheMixin:
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
-            if self.server_args.disaggregation_mode == "decode":
+            if compact_layout is not None:
+                self.req_to_token_pool = ReqToTokenPool(
+                    size=compact_layout.owner_count,
+                    max_context_len=compact_layout.bank_rows,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
+            elif self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
                     DecodeReqToTokenPool,
                     HybridMambaDecodeReqToTokenPool,
@@ -407,9 +419,11 @@ class ModelRunnerKVCacheMixin:
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
 
                 pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-                pre_alloc_size = (
-                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
+                from sglang.srt.speculative.dflash_compact_layout import (
+                    decode_preallocation_size,
                 )
+
+                pre_alloc_size = decode_preallocation_size(max_num_reqs, pre_alloc_size)
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
@@ -845,7 +859,15 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if current_platform.is_out_of_tree():
+            if compact_layout is not None:
+                from sglang.srt.speculative.dflash_compact_cache import (
+                    FixedDFlashAllocator,
+                )
+
+                self.token_to_kv_pool_allocator = FixedDFlashAllocator(
+                    self.token_to_kv_pool
+                )
+            elif current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 self.token_to_kv_pool_allocator = AllocatorCls(
                     self.max_total_num_tokens,

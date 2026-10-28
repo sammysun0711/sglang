@@ -2,6 +2,7 @@ import logging
 import math
 import os
 from copy import deepcopy
+from dataclasses import replace
 from typing import List, Optional
 
 import torch
@@ -108,6 +109,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
+        self.compact_physical_cache = None
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -351,6 +353,43 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if self.server_args.speculative_dflash_compact_cache:
+            from sglang.srt.speculative.dflash_compact_cache import CompactDFlashCache
+
+            layout = memory_pool_config.dflash_compact_layout
+            if (
+                layout is None
+                or req_to_token_pool.req_to_token.shape[0] != layout.request_rows
+            ):
+                raise ValueError(
+                    "compact draft owner count differs from the target request pool"
+                )
+            self.draft_model_runner.dflash_compact_layout = layout
+            draft_config = replace(
+                memory_pool_config, max_total_num_tokens=layout.physical_tokens
+            )
+            self._draft_worker.alloc_memory_pool(memory_pool_config=draft_config)
+            self.compact_physical_cache = CompactDFlashCache(
+                layout,
+                self.draft_model_runner.token_to_kv_pool,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+            )
+            description = self.compact_physical_cache.describe()
+            actual_bytes = (
+                description["kv_bytes"] + description["persistent_metadata_bytes"]
+            )
+            if actual_bytes != memory_pool_config.dflash_compact_fixed_bytes:
+                raise RuntimeError(
+                    f"compact draft budget/allocation disagreement: {actual_bytes} != {memory_pool_config.dflash_compact_fixed_bytes}"
+                )
+            logger.info(
+                "DFLASH bounded physical KV: %s; target_full_tokens=%d, target_swa_tokens=%d",
+                description,
+                memory_pool_config.full_max_total_num_tokens,
+                memory_pool_config.swa_max_total_num_tokens,
+            )
+            return
+
         # Without draft windowing, the draft worker aliases the target
         # request->token mapping and allocation state. With draft windowing
         # enabled, the draft worker keeps a private compact req->token table
@@ -502,7 +541,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
-        pass
+        if self.compact_physical_cache is not None:
+            self.compact_physical_cache.clear()
 
     def _gather_req_to_token_masked(
         self,
@@ -1282,6 +1322,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         model_worker_batch: ScheduleBatch,
         on_publish=None,
     ) -> GenerationBatchResult:
+        if (
+            self.compact_physical_cache is not None
+            and not model_worker_batch.sampling_info.is_all_greedy
+        ):
+            raise ValueError("compact DFlash currently requires greedy sampling")
         if getattr(model_worker_batch, "return_logprob", False):
             raise ValueError(
                 "DFLASH speculative decoding does not support return_logprob yet."
@@ -1346,11 +1391,30 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(model_worker_batch.extend_lens)),
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=model_worker_batch.out_cache_loc,
-                positions=positions,
-            )
+            if self.compact_physical_cache is not None:
+                owners, ends, hidden_indices, physical_locs = (
+                    self.compact_physical_cache.prepare_prefill(
+                        model_worker_batch.reqs,
+                        model_worker_batch.prefix_lens,
+                        model_worker_batch.extend_lens,
+                    )
+                )
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=logits_output.hidden_states.index_select(
+                        0, hidden_indices
+                    ),
+                    cache_loc=physical_locs,
+                    positions=positions.index_select(0, hidden_indices),
+                )
+                self.compact_physical_cache.finish(
+                    model_worker_batch.reqs, owners, ends
+                )
+            else:
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=logits_output.hidden_states,
+                    cache_loc=model_worker_batch.out_cache_loc,
+                    positions=positions,
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -1493,7 +1557,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        if self.use_compact_draft_cache:
+        draft_physical_locs = verify_out_cache_loc_2d
+        if self.compact_physical_cache is not None:
+            compact_owners, draft_prefix_lens, draft_physical_locs = (
+                self.compact_physical_cache.prepare_decode(
+                    model_worker_batch.reqs,
+                    prefix_lens,
+                )
+            )
+            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+            draft_seq_lens = draft_prefix_lens
+            draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+        elif self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
@@ -1556,7 +1631,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=model_worker_batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_physical_locs.reshape(-1),
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -1758,11 +1833,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=draft_physical_locs.reshape(-1),
+            cache_loc_2d=draft_physical_locs,
             positions=positions,
             commit_lens=commit_lens,
         )
+        if self.compact_physical_cache is not None:
+            self.compact_physical_cache.finish(
+                model_worker_batch.reqs, compact_owners, new_seq_lens
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

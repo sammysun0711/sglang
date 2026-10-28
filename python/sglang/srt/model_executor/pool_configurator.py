@@ -28,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.speculative.dflash_compact_layout import CompactDFlashLayout
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 
@@ -39,6 +40,9 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    dflash_compact_layout: Optional[CompactDFlashLayout] = None
+    dflash_compact_fixed_bytes: int = 0
+    dflash_compact_target_accounted_bytes: int = 0
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -236,6 +240,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, mr: ModelRunner):
+        self._compact_layout = None
+        self._compact_fixed_bytes = 0
+        if getattr(mr.server_args, "speculative_dflash_compact_cache", False) is True:
+            self._compact_layout = mr.dflash_compact_layout
+            if not isinstance(self._compact_layout, CompactDFlashLayout):
+                raise ValueError(
+                    "compact DFlash layout must be resolved before target pool sizing"
+                )
+            self._compact_fixed_bytes = self._compact_layout.tensor_bytes(
+                mr.dflash_draft_cell_size_per_token
+            ) + self._compact_layout.metadata_bytes(mr.dflash_draft_num_layers)
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -262,6 +277,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             * kv_size
         )
+        if self._compact_layout is not None:
+            from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+
+            self._compact_target_table_bytes = (
+                self._compact_layout.request_rows
+                * (
+                    model_config.context_len
+                    + get_req_to_token_extra_context_len(mr.server_args)
+                )
+                * 4
+            )
 
         # Bytes per token of max_total_num_tokens.
         #
@@ -317,11 +343,66 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            dflash_compact_layout=self._compact_layout,
+            dflash_compact_fixed_bytes=self._compact_fixed_bytes,
+            dflash_compact_target_accounted_bytes=(
+                self._compact_allocation_bytes(full_tokens, page_size)
+                - self._compact_fixed_bytes
+                if self._compact_layout is not None
+                else 0
+            ),
         )
+
+    def _compact_allocation_bytes(self, full_tokens: int, page_size: int) -> int:
+        swa_tokens = (
+            int(full_tokens * self._swa_full_tokens_ratio) // page_size * page_size
+        )
+        target_kv = (
+            full_tokens + page_size
+        ) * self._full_per_token * self._full_layers_num + (
+            swa_tokens + page_size
+        ) * self._swa_per_token * self._swa_layers_num
+        target_metadata = (
+            self._compact_target_table_bytes
+            + (self._full_layers_num + self._swa_layers_num) * 48
+            + (full_tokens + page_size + 1) * 8
+            + ((full_tokens + swa_tokens) // page_size) * 8
+        )
+        return target_kv + target_metadata + self._compact_fixed_bytes
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._compact_layout is not None:
+            # Solve on actual pages, including separate draft storage and target
+            # request/mapping/free-page metadata. Other transient allocations keep
+            # the existing AITER reserve policy; legacy sizing is untouched.
+            low, high = (
+                0,
+                int(
+                    available_bytes
+                    // (self._full_per_token * self._full_layers_num * page_size)
+                )
+                + 1,
+            )
+            while low + 1 < high:
+                mid = (low + high) // 2
+                if (
+                    self._compact_allocation_bytes(mid * page_size, page_size)
+                    <= available_bytes
+                ):
+                    low = mid
+                else:
+                    high = mid
+            if low == 0:
+                raise ValueError("bounded DFlash cache leaves no memory for target KV")
+            logger.info(
+                "DFLASH compact KV budget: available=%d, accounted=%d, draft_fixed=%d",
+                available_bytes,
+                self._compact_allocation_bytes(low * page_size, page_size),
+                self._compact_fixed_bytes,
+            )
+            return self._solve_pool_sizes(low * page_size, page_size)
         max_total_num_tokens = int(available_bytes // self._cell_size)
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 

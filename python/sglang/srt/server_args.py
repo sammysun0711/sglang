@@ -617,6 +617,7 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_compact_cache: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -6162,6 +6163,13 @@ class ServerArgs:
             "local KV cache (paged backends may retain up to one extra page on the "
             "left for alignment). Default is full attention/context.",
             default=ServerArgs.speculative_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-compact-cache",
+            action="store_true",
+            help="Use bounded page-64 draft KV banks for MiMo DFLASH on gfx950. "
+            "Requires TP8, BF16 KV, AITER/FlyDSL, window 1024, radix cache disabled, "
+            "and --disable-custom-all-reduce.",
         )
         parser.add_argument(
             "--speculative-dflash-draft-window-size",

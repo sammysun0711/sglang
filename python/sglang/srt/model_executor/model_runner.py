@@ -464,6 +464,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.dflash_compact_layout = None
+        self.dflash_draft_cell_size_per_token = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker
@@ -546,6 +548,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
             )
+            if server_args.speculative_dflash_compact_cache:
+                from sglang.srt.speculative.dflash_compact_config import (
+                    resolve_compact_dflash_layout,
+                )
+
+                if not torch.version.hip or not torch.cuda.get_device_properties(
+                    self.gpu_id
+                ).gcnArchName.startswith("gfx950"):
+                    raise ValueError("compact MiMo DFlash requires ROCm gfx950")
+                self.dflash_compact_layout, self.dflash_draft_cell_size_per_token = (
+                    resolve_compact_dflash_layout(
+                        server_args,
+                        self.model_config,
+                        draft_model_config,
+                        decode_preallocated=envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get(),
+                    )
+                )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:

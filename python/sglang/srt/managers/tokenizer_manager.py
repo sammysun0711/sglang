@@ -1109,6 +1109,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        if (
+            self.server_args.speculative_dflash_compact_cache
+            and sampling_params.top_k > 1
+        ):
+            raise ValueError(
+                "Compact DFlash currently requires greedy sampling (temperature=0 or top_k=1)."
+            )
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

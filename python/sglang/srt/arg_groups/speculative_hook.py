@@ -127,6 +127,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
+    if getattr(server_args, "speculative_dflash_compact_cache", False):
+        from sglang.srt.speculative.dflash_compact_config import (
+            validate_compact_dflash_args,
+        )
+
+        validate_compact_dflash_args(server_args)
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:

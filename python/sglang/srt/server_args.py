@@ -6169,7 +6169,7 @@ class ServerArgs:
             action="store_true",
             help="Use bounded page-64 draft KV banks for MiMo DFLASH on gfx950. "
             "Requires TP8, BF16 KV, AITER/FlyDSL, window 1024, radix cache disabled, "
-            "and --disable-custom-all-reduce.",
+            "and --disable-custom-all-reduce. Uses torch BF16 draft QKV projection.",
         )
         parser.add_argument(
             "--speculative-dflash-draft-window-size",

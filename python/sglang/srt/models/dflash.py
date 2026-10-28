@@ -29,6 +29,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -114,6 +115,17 @@ class DFlashAttention(nn.Module):
             bias=attention_bias,
             prefix="qkv_proj",
         )
+        # The gfx950 tuned M8/N2304/K6144 BF16 QKV kernels use BF16 atomic
+        # split-K and are not repeatable. Compact-cache qualification uses a
+        # single BF16 projection so identical KV/input produces identical draft
+        # proposals. Keep the legacy default-off dispatch unchanged.
+        self._compact_qkv_projection = (
+            get_global_server_args().speculative_dflash_compact_cache
+        )
+        if self._compact_qkv_projection:
+            eligible, reason = can_dflash_slice_qkv_weight(self.qkv_proj)
+            if not eligible:
+                raise ValueError(f"compact DFlash requires unquantized QKV: {reason}")
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
@@ -201,7 +213,10 @@ class DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if getattr(self, "_compact_qkv_projection", False):
+            qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         else:

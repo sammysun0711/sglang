@@ -311,6 +311,7 @@ class CompactDFlashCache:
             "banks_per_owner": 2,
             "draft_tokens": self.layout.physical_tokens,
             "request_table_shape": list(self.table.shape),
+            "qkv_projection": "torch_bf16_linear",
             "communication": "rccl",
             "kv_bytes": sum(
                 t.numel() * t.element_size()

@@ -388,6 +388,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 memory_pool_config.full_max_total_num_tokens,
                 memory_pool_config.swa_max_total_num_tokens,
             )
+            logger.info(
+                "DFLASH compact QKV projection: torch BF16 linear; communication: RCCL"
+            )
             return
 
         # Without draft windowing, the draft worker aliases the target

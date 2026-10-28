@@ -106,6 +106,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    num_retractions: int = 0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -700,6 +701,11 @@ async def async_request_sglang_generate(
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
+                    # Metadata remains present when final speculative tail
+                    # tokens have no visible text. It is the token-count source.
+                    if "meta_info" in data:
+                        output_len = data["meta_info"]["completion_tokens"]
+                        output.num_retractions = data["meta_info"].get("num_retractions", 0)
                     output.output_len = output_len
                 else:
                     output.error = (
@@ -1701,6 +1707,7 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "num_retractions": [output.num_retractions for output in outputs],
     }
 
     # Append results to a JSONL file

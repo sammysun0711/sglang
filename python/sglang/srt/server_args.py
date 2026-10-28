@@ -3180,8 +3180,15 @@ class ServerArgs:
 
         # AMD platforms backends
         if self.attention_backend == "aiter":
+            self.requested_mem_fraction_static = self.mem_fraction_static
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+            if self.speculative_dflash_compact_cache:
+                logger.info(
+                    "DFLASH memory fraction: requested=%s, effective=%s",
+                    self.requested_mem_fraction_static,
+                    self.mem_fraction_static,
+                )
 
         # Other platforms backends
         if (

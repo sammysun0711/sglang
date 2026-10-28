@@ -922,6 +922,33 @@ class Scheduler(
         avail_mem = get_available_gpu_memory(
             self.device, self.ps.gpu_id, empty_cache=False
         )
+        if self.server_args.speculative_dflash_compact_cache:
+            compact = self.draft_worker.compact_physical_cache
+            runner = self.tp_worker.model_runner
+            self.dflash_compact_startup_info = {
+                **compact.describe(),
+                "requested_memory_fraction": self.server_args.requested_mem_fraction_static,
+                "effective_memory_fraction": self.server_args.mem_fraction_static,
+                "target_full_tokens": runner.memory_pool_config.full_max_total_num_tokens,
+                "target_swa_tokens": runner.memory_pool_config.swa_max_total_num_tokens,
+                "derived_draft_target_ratio": compact.layout.physical_tokens
+                / self.max_total_num_tokens,
+                "graph_shapes": self.server_args.cuda_graph_config.to_dict(),
+                "minimum_free_vram_bytes": int(
+                    get_available_gpu_memory(
+                        self.device,
+                        self.ps.gpu_id,
+                        empty_cache=False,
+                        distributed=True,
+                        cpu_group=self.world_group.cpu_group,
+                    )
+                    * (1 << 30)
+                ),
+                "memory_ledger": runner.dflash_compact_memory_ledger,
+            }
+            logger.info(
+                "DFLASH compact startup ledger: %s", self.dflash_compact_startup_info
+            )
         if self.ps.tp_rank == 0:
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
@@ -3649,6 +3676,13 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        compact_cache = (
+            getattr(self.draft_worker, "compact_physical_cache", None)
+            if self.draft_worker is not None
+            else None
+        )
+        if compact_cache is not None:
+            ret["dflash_compact_cache"] = self.dflash_compact_startup_info
 
         if (
             not self.spec_algorithm.is_none()

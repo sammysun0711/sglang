@@ -1118,6 +1118,21 @@ class ModelRunnerKVCacheMixin:
             config.max_total_num_tokens
         )
         config.mem_fraction_static = self.server_args.mem_fraction_static
+        if config.dflash_compact_layout is not None:
+            self.dflash_compact_memory_ledger = {
+                "reference": "target_post_weight_load_snapshot",
+                "pre_weight_load_free_bytes": int(pre_model_load_memory * (1 << 30)),
+                "post_target_weight_load_free_bytes": int(
+                    self.post_model_load_memory * (1 << 30)
+                ),
+                "available_static_bytes": available_bytes,
+                "target_accounted_bytes": config.dflash_compact_target_accounted_bytes,
+                "draft_fixed_bytes": config.dflash_compact_fixed_bytes,
+                "unallocated_static_bytes": available_bytes
+                - config.dflash_compact_target_accounted_bytes
+                - config.dflash_compact_fixed_bytes,
+                "reserve_policy": "draft_weights_and_transient_workspaces_in_existing_aiter_slack",
+            }
         return config
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):

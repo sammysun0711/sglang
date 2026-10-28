@@ -8,6 +8,23 @@ from sglang.srt.speculative.dflash_compact_layout import (
 )
 
 
+def compact_dflash_transfer_pool(args, draft_pool):
+    """Prevent shared target transfer indices from reaching fixed draft banks.
+
+    Fake decode has no draft payload: admission initializes its visible zero
+    suffix locally. Real transfer needs a distinct draft protocol and remains
+    rejected even if a caller bypasses startup capability checks.
+    """
+    if not getattr(args, "speculative_dflash_compact_cache", False):
+        return draft_pool
+    if (
+        args.disaggregation_mode != "decode"
+        or args.disaggregation_transfer_backend != "fake"
+    ):
+        raise ValueError("compact DFlash does not support real draft KV transfer")
+    return None
+
+
 def validate_compact_dflash_args(args):
     if not args.speculative_dflash_compact_cache:
         return
@@ -55,8 +72,11 @@ def validate_compact_dflash_args(args):
         if getattr(args, key, False):
             errors.append(f"{key} is not supported")
     disaggregation_mode = getattr(args, "disaggregation_mode", "null")
-    if disaggregation_mode not in (None, "null"):
-        errors.append("compact DFlash disaggregation is not enabled")
+    if disaggregation_mode not in (None, "null") and not (
+        disaggregation_mode == "decode"
+        and getattr(args, "disaggregation_transfer_backend", None) == "fake"
+    ):
+        errors.append("compact DFlash only supports fake decode disaggregation")
     if os.environ.get("SGLANG_AITER_KV_CACHE_LAYOUT", "") != "vectorized_5d":
         errors.append("SGLANG_AITER_KV_CACHE_LAYOUT must be vectorized_5d")
     if os.environ.get("SGLANG_AITER_DFLASH_SWA_IMPL", "") != "flydsl":

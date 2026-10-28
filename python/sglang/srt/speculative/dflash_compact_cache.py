@@ -293,6 +293,35 @@ class CompactDFlashCache:
         for req in reqs:
             self._events[req.req_pool_idx] = event
 
+    def initialize_fake_prefix(self, reqs, prefix_lens):
+        """Initialize synthetic history without ever using target physical IDs.
+
+        Fake transfer carries no KV payload. Give each admitted owner a zero
+        visible suffix at its absolute sequence position, including on reuse.
+        This must be invoked by fake-decode admission before the first forward.
+        It is deliberately separate from real prefill and cannot restore real
+        request history.
+        """
+        owners, _ = self._owners(reqs, allow_new=True)
+        prefixes = prefix_lens.to(device=self.device, dtype=torch.int64)
+        if prefixes.shape != owners.shape:
+            raise ValueError("fake draft prefix lengths must match request owners")
+        torch._assert_async((prefixes >= 0).all(), "negative fake draft prefix length")
+        starts = self._start(prefixes)
+        lengths = prefixes - starts
+        banks = self.banks[owners]
+        bases = self._base(owners, banks)
+        self._copy(bases, bases, lengths, zero=True)
+        _write_request_table[(len(reqs),)](
+            self.table,
+            owners,
+            bases,
+            WIDTH=self.layout.bank_rows,
+            BLOCK=triton.next_power_of_2(self.layout.bank_rows),
+        )
+        self.starts[owners] = starts
+        self.finish(reqs, owners, prefixes)
+
     def clear(self):
         stream = torch.cuda.current_stream(self.device)
         for event in {e for e in self._events if e is not None}:

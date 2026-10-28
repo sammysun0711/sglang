@@ -250,6 +250,55 @@ def test_chunked_prefill_reuse_and_flush(cache):
         cache.prepare_decode([replacement], torch.tensor([67], device="cuda"))
 
 
+@pytest.mark.parametrize("residue", range(64))
+def test_fake_zero_suffix_preallocated_owners_and_reuse(cache, residue):
+    owners = [1, 18, 19, 36, 37, 54]
+    reqs = [Request(owner) for owner in owners]
+    prefixes = (
+        torch.tensor([0, 63, 1024, 65536, 262144, 1048512], device="cuda") + residue
+    )
+    # Dirty every owner bank, including speculative/rejected rows left by a
+    # previous lifetime. Fake admission must explicitly initialize its suffix.
+    for buffer in cache.pool.k_buffer + cache.pool.v_buffer:
+        buffer.fill_(0.734375)
+    for wave in range(4):
+        reqs = [Request(owner) for owner in owners]
+        cache.initialize_fake_prefix(reqs, prefixes)
+        actual_owners, lengths, locs = cache.prepare_decode(reqs, prefixes)
+        assert actual_owners.tolist() == owners
+        for layer in range(5):
+            visible = torch.cat(
+                [
+                    cache.table[owner, : int(length)]
+                    for owner, length in zip(owners, lengths)
+                ]
+            ).long()
+            k, v = launch_gather_shuffle_5d_to_linear(
+                cache.pool.k_buffer[layer], cache.pool.v_buffer[layer], visible
+            )
+            assert torch.all(k == 0) and torch.all(v == 0)
+            assert torch.all(locs >= 0) and torch.all(
+                locs < cache.layout.physical_tokens
+            )
+            # Simulate valid commits to dirty the next lifetime's history.
+            cache.pool.set_kv_buffer(
+                SimpleNamespace(layer_id=layer),
+                locs.reshape(-1),
+                torch.ones(
+                    len(owners) * 8, 1, 128, device="cuda", dtype=torch.bfloat16
+                ),
+                torch.ones(
+                    len(owners) * 8, 1, 128, device="cuda", dtype=torch.bfloat16
+                ),
+            )
+        cache.finish(reqs, actual_owners, prefixes + 8)
+    # Row zero and an unrelated owner never become another owner's cache.
+    guards = torch.tensor([0, cache.layout.bank_base(2, 0)], device="cuda")
+    for kbuf, vbuf in zip(cache.pool.k_buffer, cache.pool.v_buffer):
+        k, v = launch_gather_shuffle_5d_to_linear(kbuf, vbuf, guards)
+        assert torch.all(k == 0.734375) and torch.all(v == 0.734375)
+
+
 @pytest.fixture(scope="module")
 def checkpoint_materializer(cache):
     """Real TP-rank-0 projection weights, K norm and MiMo partial RoPE."""

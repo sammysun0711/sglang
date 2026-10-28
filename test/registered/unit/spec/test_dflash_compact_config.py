@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 from sglang.srt.speculative.dflash_compact_config import (
     _validate_compact_target_profile,
+    compact_dflash_transfer_pool,
     validate_compact_dflash_args,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,6 +45,28 @@ def test_supported_scope_and_off_switch():
     validate_compact_dflash_args(
         SimpleNamespace(speculative_dflash_compact_cache=False)
     )
+
+
+def test_fake_transfer_omits_compact_draft_buffers_and_legacy_retains_them():
+    pool = object()
+    args = valid_args()
+    args.disaggregation_mode = "decode"
+    args.disaggregation_transfer_backend = "fake"
+    validate_compact_dflash_args(args)
+    assert compact_dflash_transfer_pool(args, pool) is None
+    args.speculative_dflash_compact_cache = False
+    assert compact_dflash_transfer_pool(args, pool) is pool
+
+
+@pytest.mark.parametrize(
+    "mode,backend", [("decode", "mooncake"), ("decode", "nixl"), ("prefill", "fake")]
+)
+def test_real_transfer_cannot_expose_compact_draft_buffers(mode, backend):
+    args = valid_args()
+    args.disaggregation_mode = mode
+    args.disaggregation_transfer_backend = backend
+    with pytest.raises(ValueError, match="does not support real"):
+        compact_dflash_transfer_pool(args, object())
 
 
 @pytest.mark.parametrize(

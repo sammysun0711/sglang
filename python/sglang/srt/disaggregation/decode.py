@@ -382,6 +382,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
+        from sglang.srt.speculative.dflash_compact_config import (
+            compact_dflash_transfer_pool,
+        )
+
+        draft_transfer_pool = compact_dflash_transfer_pool(
+            self.scheduler.server_args,
+            self.draft_token_to_kv_pool,
+        )
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -408,11 +416,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
-        if self.draft_token_to_kv_pool is not None:
+        if draft_transfer_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_transfer_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
@@ -430,7 +438,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
+            draft_transfer_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
@@ -1931,6 +1939,12 @@ class SchedulerDisaggregationDecodeMixin:
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
+
+        compact_cache = getattr(self.draft_worker, "compact_physical_cache", None)
+        if compact_cache is not None:
+            if self.server_args.disaggregation_transfer_backend != "fake":
+                raise RuntimeError("compact draft admission requires fake transfer")
+            compact_cache.initialize_fake_prefix(new_batch.reqs, new_batch.seq_lens)
 
         return new_batch
 

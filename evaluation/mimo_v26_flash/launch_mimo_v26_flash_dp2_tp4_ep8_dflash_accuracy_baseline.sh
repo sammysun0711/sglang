@@ -112,9 +112,9 @@ if [[ -n "${SERVER_RANDOM_SEED}" ]] && ! [[ "${SERVER_RANDOM_SEED}" =~ ^(0|[1-9]
   exit 2
 fi
 
-# MORI quantizes dispatch input. FP8 QKV all-gather is a deferred migration.
+# MORI quantizes dispatch input. QKV fused quant also enables packed FP8 AG.
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
-export SGLANG_MIMO_FUSED_RMS_QKV_QUANT=0
+export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-1}"
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=0
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0

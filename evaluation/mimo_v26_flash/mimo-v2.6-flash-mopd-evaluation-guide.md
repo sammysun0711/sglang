@@ -130,6 +130,11 @@ PERFORMANCE_MODE=1 \
 
 `PERFORMANCE_MODE=1` enables fake expert routing. The server uses ordinary
 serving, and the client requests one output token to measure prefill performance.
+
+`SGLANG_MIMO_FUSED_RMS_QKV_QUANT=1` is the default: fused QKV RMSNorm/FP8
+quantization packs activations and FP32 scales into one attention-TP all-gather.
+Set it to `0` for the BF16 all-gather baseline. This requires the matching AITER
+fused-quant wrapper with caller-owned output buffers.
 In another terminal, run the full `mimo_v26_flash` preset:
 
 ```bash

@@ -162,11 +162,22 @@ fi
 mkdir -p "${LOG_DIR}" "$(dirname -- "${SERVER_LOG_PATH}")"
 
 seed_args=()
+compact_cache_args=()
+if [[ "${SPECULATIVE_DFLASH_COMPACT_CACHE:-0}" == "1" ]]; then
+  compact_cache_args+=(--speculative-dflash-compact-cache)
+fi
+precision_args=()
+if [[ "${ENABLE_FP32_LM_HEAD:-0}" == "1" ]]; then
+  precision_args+=(--enable-fp32-lm-head)
+fi
 if [[ -n "${SERVER_RANDOM_SEED}" ]]; then
   seed_args+=(--random-seed "${SERVER_RANDOM_SEED}")
 fi
 
 cuda_graph_args=(--cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}")
+if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+  cuda_graph_args=(--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled --disable-cuda-graph)
+fi
 if [[ -n "${CUDA_GRAPH_BS_DECODE}" ]]; then
   read -r -a cuda_graph_bs <<<"${CUDA_GRAPH_BS_DECODE}"
   cuda_graph_args+=(--cuda-graph-bs-decode "${cuda_graph_bs[@]}")
@@ -224,6 +235,7 @@ python3 -u -m sglang.launch_server \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
+  "${precision_args[@]}" \
   --reasoning-parser "${REASONING_PARSER}" \
   --tool-call-parser mimo \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
@@ -246,6 +258,7 @@ python3 -u -m sglang.launch_server \
   --speculative-draft-kv-cache-dtype "${SPECULATIVE_DRAFT_KV_CACHE_DTYPE}" \
   --speculative-draft-window-size "${SPECULATIVE_DRAFT_WINDOW_SIZE}" \
   --speculative-num-draft-tokens "${SPECULATIVE_NUM_DRAFT_TOKENS}" \
+  "${compact_cache_args[@]}" \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \
   "${custom_all_reduce_args[@]}" \

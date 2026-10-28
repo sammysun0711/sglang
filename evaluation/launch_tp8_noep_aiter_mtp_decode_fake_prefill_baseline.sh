@@ -40,6 +40,9 @@ export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-204}"
+export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
+export HOST="${HOST:-0.0.0.0}"
+export PORT="${PORT:-30001}"
 export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
 export DECODE_LOG_INTERVAL="${DECODE_LOG_INTERVAL:-1}"
 # Optional reproducibility control; unset preserves SGLang's seed selection.
@@ -68,6 +71,8 @@ export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-1.0}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
+export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"
+export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-bf16}"
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT="${SGLANG_MIMO_FUSED_RMS_MOE_QUANT:-1}"
@@ -95,7 +100,18 @@ echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
 mkdir -p ${LOG_DIR}
 
 cuda_graph_args=(--cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}")
+if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+  cuda_graph_args=(--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled --disable-cuda-graph)
+fi
 seed_args=()
+capacity_args=()
+if [[ -n "${MAX_TOTAL_TOKENS:-}" ]]; then
+  capacity_args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
+fi
+precision_args=()
+if [[ "${ENABLE_FP32_LM_HEAD:-0}" == "1" ]]; then
+  precision_args+=(--enable-fp32-lm-head)
+fi
 if [[ -n "${SERVER_RANDOM_SEED}" ]]; then
   seed_args+=(--random-seed "${SERVER_RANDOM_SEED}")
 fi
@@ -129,15 +145,17 @@ echo "Radix cache: ${radix_cache_status}"
 echo "HIP non-greedy EAGLE verifier: ${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY}"
 
 python3 -u -m sglang.launch_server \
-  --model-path /models/MiMo-V2.5-Pro/ \
+  --model-path "${MODEL}" \
   --tp-size 8 \
   --tokenizer-worker-num "${TOKENIZER_WORKER_NUM}" \
   "${seed_args[@]}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
+  "${capacity_args[@]}" \
   --decode-log-interval "${DECODE_LOG_INTERVAL}" \
-  --host 0.0.0.0 \
-  --port 30001 \
+  --host "${HOST}" \
+  --port "${PORT}" \
   --trust-remote-code \
+  "${precision_args[@]}" \
   --reasoning-parser "${REASONING_PARSER}" \
   --tool-call-parser mimo \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
@@ -148,6 +166,8 @@ python3 -u -m sglang.launch_server \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend fake \
   --attention-backend aiter \
+  --moe-runner-backend "${MOE_RUNNER_BACKEND}" \
+  --aiter-mxfp4-stage2-output-dtype "${AITER_MXFP4_STAGE2_OUTPUT_DTYPE}" \
   "${kv_cache_args[@]}" \
   --page-size 64 \
   --speculative-algorithm EAGLE \

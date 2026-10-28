@@ -147,11 +147,27 @@ export LOG_FILE="${LOG_FILE:-server_tp8_aiter_dflash_accuracy.log}"
 mkdir -p "${LOG_DIR}"
 
 seed_args=()
+precision_args=()
+if [[ "${ENABLE_FP32_LM_HEAD:-0}" == "1" ]]; then
+  precision_args+=(--enable-fp32-lm-head)
+fi
+token_capacity_args=()
+if [[ -n "${MAX_TOTAL_TOKENS:-}" ]]; then
+  token_capacity_args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
+fi
+compact_cache_args=()
+if [[ "${SPECULATIVE_DFLASH_COMPACT_CACHE:-0}" == "1" ]]; then
+  compact_cache_args+=(--speculative-dflash-compact-cache)
+fi
 if [[ -n "${SERVER_RANDOM_SEED}" ]]; then
   seed_args+=(--random-seed "${SERVER_RANDOM_SEED}")
 fi
 
 cuda_graph_args=(--cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}")
+if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+  # Per-phase backend selectors take precedence over the legacy global flag.
+  cuda_graph_args=(--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled --disable-cuda-graph)
+fi
 if [[ -n "${CUDA_GRAPH_BS_DECODE}" ]]; then
   read -r -a cuda_graph_bs <<<"${CUDA_GRAPH_BS_DECODE}"
   cuda_graph_args+=(--cuda-graph-bs-decode "${cuda_graph_bs[@]}")
@@ -202,9 +218,11 @@ python3 -u -m sglang.launch_server \
   --tokenizer-worker-num "${TOKENIZER_WORKER_NUM}" \
   "${seed_args[@]}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
+  "${token_capacity_args[@]}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
+  "${precision_args[@]}" \
   --reasoning-parser "${REASONING_PARSER}" \
   --tool-call-parser mimo \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
@@ -220,6 +238,7 @@ python3 -u -m sglang.launch_server \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
   --page-size "${PAGE_SIZE}" \
   --speculative-algorithm DFLASH \
+  "${compact_cache_args[@]}" \
   --speculative-draft-model-path "${SPECULATIVE_DRAFT_MODEL}" \
   --speculative-draft-attention-backend "${SPECULATIVE_DRAFT_ATTENTION_BACKEND}" \
   --speculative-draft-kv-cache-dtype "${SPECULATIVE_DRAFT_KV_CACHE_DTYPE}" \

@@ -6,9 +6,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.test.ci.ci_register import register_amd_ci
-
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not torch.version.hip,
     reason="MiMo stable-router weight fusion is enabled on ROCm",

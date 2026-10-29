@@ -30,6 +30,11 @@ CASES = [
     (128, (257,), (513,), 2, True, "bf16"),
     (64, (1, 32, 129), (1, 70, 257), 2, True, "bf16"),
     (64, (32683,), (65451,), 1, True, "bf16"),
+    # The penultimate Q tile can also reach the partial KV page.
+    (64, (257,), (519,), 1, True, "bf16"),
+    # Mix fast and masked tiles across batch items and local KV heads.
+    (64, (256, 257), (512, 519), 2, True, "bf16"),
+    (64, (256, 257), (512, 519), 2, True, "fp8"),
     (32, (1,), (1,), 1, True, "fp8"),
     (64, (32,), (70,), 1, True, "fp8"),
     (128, (65,), (141,), 2, True, "fp8"),

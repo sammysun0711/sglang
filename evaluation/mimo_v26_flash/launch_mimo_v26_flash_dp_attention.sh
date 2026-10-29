@@ -7,7 +7,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD/}"
-export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT:-/root/workspace/aiter}${PYTHONPATH:+:${PYTHONPATH}}"
+export AITER_ROOT="${AITER_ROOT:-${SGLANG_ROOT}/../aiter}"
+export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 export SGLANG_MXFP4_TO_FP8_128BLOCK=1
 export SGLANG_INT4_WEIGHT=0

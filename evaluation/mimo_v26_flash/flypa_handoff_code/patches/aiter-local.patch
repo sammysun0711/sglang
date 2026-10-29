@@ -1,0 +1,192 @@
+diff --git a/csrc/include/custom_all_reduce.cuh b/csrc/include/custom_all_reduce.cuh
+index b10fd0f417e76c836934acc3b0b3e4dcd9c1b8e0..a2eeaefa623af6f366e858655963ab280c57f0cb 100644
+--- a/csrc/include/custom_all_reduce.cuh
++++ b/csrc/include/custom_all_reduce.cuh
+@@ -3582,6 +3582,9 @@ constexpr int    kLL128LineElems = 16;
+ constexpr int    kLL128DataElems = 15;
+ constexpr int    kLL128FlagElem  = 15;
+ constexpr int    kLL128Lanes     = 16;
++// Per-rank slot stride in uint32 words, sized for kLL128PocCapBytes so that
++// consecutive calls of different sizes never overlap a peer's unread slots.
++constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
+ 
+ struct LLLine128
+ {
+@@ -3779,7 +3782,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
+ 
+   __shared__ uint32_t s_flag;
+   const uint32_t flag = ll128EpochBegin(graph_safe_flag, blockIdx.x, s_flag);
+-  int bank_offset = (flag & 1u) * ngpus * (total_group * 128 * 2 / 4);
++  int bank_offset = (flag & 1u) * ngpus * kLL128SlotStride;
+ 
+   for (int idx = g_index; idx < total_group; idx += stride)
+   {
+@@ -3791,7 +3794,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
+       int peer = (self_rank + i) % ngpus;
+       uint32_t* scratch_dst = reinterpret_cast<uint32_t*>(peer_scratch[peer])
+                               + bank_offset
+-                              + self_rank * (total_group * 128 * 2 / 4)
++                              + self_rank * kLL128SlotStride
+                               + idx * 8 * 2 * 4 + lane_id * 4;
+       ll128_store_b128<T>(inp_reg[0], scratch_dst);
+       ll128_store_b128<T>(inp_reg[1], scratch_dst + 8 * 4);
+@@ -3815,7 +3818,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
+ #pragma unroll
+     for (int i = 1; i < ngpus; ++i)
+     {
+-      scratch_base[i - 1] = self_scratch + ((self_rank + i) % ngpus) * (total_group * 128 * 2 / 4) + idx * 8 * 2 * 4;
++      scratch_base[i - 1] = self_scratch + ((self_rank + i) % ngpus) * kLL128SlotStride + idx * 8 * 2 * 4;
+       scratch_flag_addr[0][i - 1] = scratch_base[i - 1] + 7 * 4;
+       scratch_flag_addr[1][i - 1] = scratch_flag_addr[0][i - 1] + 8 * 4;
+     }
+@@ -4402,8 +4405,8 @@ class CustomAllreduce
+     }
+ 
+     // LL128 unroll2 1-shot all-reduce. 2-byte dtype only (fp16 / bf16). The
+-    // kernel sizes its scratch from the message internally (per total_group);
+-    // the cap bounds it to the LL128 sub-region of the reused tmp buffer.
++    // scratch uses a fixed per-rank stride sized for kLL128PocCapBytes, so it
++    // spans 2 * ngpus * kLL128SlotStride words of the reused tmp buffer.
+     template <typename T>
+     void allreduce_ll128_unroll2(hipStream_t stream, const T* input, T* output,
+                                  int numel, int threads_per_block = 512)
+@@ -4497,7 +4500,7 @@ class CustomAllreduce
+     // scratch reuses the meta buffer's post-Signal region (see
+     // allreduce_ll_poc / allreduce_ll128_unroll2), which assumes the tmp region
+     // (2 * max_size) comfortably exceeds the fast-path scratch (worst case
+-    // ~18 MiB at tp2); true for the default max_size (1 GiB).
++    // ~38 MiB at tp4); true for the default max_size (1 GiB).
+     //
+     // `size` here is still the element count (numel); it is divided down to
+     // 16-byte packs only after this block. Thresholds were measured on bf16, so
+diff --git a/op_tests/multigpu_tests/test_allreduce_ll128_mixed_sizes.py b/op_tests/multigpu_tests/test_allreduce_ll128_mixed_sizes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..390f7c80f2b1933b540bcb64194c823ad7fd7b83
+--- /dev/null
++++ b/op_tests/multigpu_tests/test_allreduce_ll128_mixed_sizes.py
+@@ -0,0 +1,125 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
++
++"""PR #6446 regression helpers, extracted from pinned head 32f4908ba263f87c3427cad68525681aa5b7aee3."""
++import argparse
++import ctypes
++import logging
++import mmap
++import os
++import threading
++import time
++import torch
++import torch.distributed as dist
++from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
++logger=logging.getLogger("aiter")
++# Back-to-back LL128 messages of different sizes per TP size (see the LL / LL128
++# dispatch in custom_all_reduce.cuh). Three calls per round alternate the bank
++# each size lands in, which the overlap needs. TP8 has no LL128 range.
++_LL128_MIXED_SIZES = {
++    2: [16 * 7168, 16 * 7168, 8 * 7168],
++    4: [4 * 8192, 4 * 8192, 28800],
++}
++
++
++def _start_queue_evictions(stop):
++    """Repeatedly evict this process's GPU queues so its kernels pause mid-flight.
++
++    Toggling the protection of registered host memory makes KFD preempt every
++    queue of the process, which lets the peers run ahead as on a busy host.
++    """
++    libc = ctypes.CDLL(None, use_errno=True)
++    hip = ctypes.CDLL("libamdhip64.so")
++    buf = mmap.mmap(-1, 256 << 20)
++    buf.write(b"\1" * len(buf))
++    view = ctypes.c_char.from_buffer(buf)
++    nbytes = ctypes.c_size_t(len(buf))
++    assert hip.hipHostRegister(ctypes.c_void_p(ctypes.addressof(view)), nbytes, 0) == 0
++
++    def evict():
++        # Referencing view keeps the mapping alive for the thread's lifetime.
++        addr = ctypes.c_void_p(ctypes.addressof(view))
++        while not stop.is_set():
++            assert libc.mprotect(addr, ctypes.c_size_t(2 << 20), 1) == 0
++            assert libc.mprotect(addr, ctypes.c_size_t(2 << 20), 3) == 0
++            time.sleep(0.002)
++
++    threading.Thread(target=evict, daemon=True).start()
++
++
++def _allreduce_ll128_mixed_size_regression(
++    rank, tp_size, sizes, iterations, distributed_init_method, stop
++):
++    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
++
++    torch.cuda.set_device(rank)
++    device = torch.device(f"cuda:{rank}")
++    dist.init_process_group(
++        "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
++    )
++    ca_comm = CustomAllreduce(dist.group.WORLD, device)
++    assert not ca_comm.disabled, "The LL128 regression requires custom allreduce"
++    generator = torch.Generator().manual_seed(2026)
++    inputs, refs = [], []
++    for n in sizes:
++        x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
++        inputs.append(x[rank].to(device, torch.bfloat16))
++        refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
++    # Opt-in: how the evictions behave depends on the host's KFD driver.
++    evict = os.environ.get("AITER_TEST_LL128_EVICT") == "1"
++    # Rank 1 reads the peer slots that a faster rank's next call overlaps.
++    if evict and rank == 1:
++        _start_queue_evictions(stop)
++    dist.barrier()
++    done = torch.cuda.Event()
++    for iteration in range(iterations):
++        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in inputs]
++        if iteration % 100 != 99:
++            continue
++        done.record()
++        deadline, evicting = time.time() + 30, evict and not stop.is_set()
++        while not done.query():
++            if time.time() > deadline:
++                if not evicting:
++                    logger.error(f"{rank=} LL128 hang before {iteration=} {sizes=}")
++                    os._exit(1)
++                logger.warning(f"{rank=} stalled before {iteration=}; stop evicting")
++                stop.set()
++                deadline, evicting = time.time() + 60, False
++            time.sleep(0.001)
++        for out, ref in zip(outs, refs):
++            torch.testing.assert_close(out, ref, rtol=0, atol=0)
++    stop.set()
++    torch.cuda.synchronize()
++    dist.barrier()
++    ca_comm.close()
++    dist.destroy_process_group()
++
++
++def test_allreduce_ll128_mixed_size_regression(tp_size, iterations=1000):
++    # A rank that finished one call used to overwrite a slower peer's unread
++    # LL128 slots when the next call had a different size, hanging both ranks.
++    sizes = _LL128_MIXED_SIZES.get(tp_size)
++    if sizes is None:
++        return
++    torch.multiprocessing.spawn(
++        _allreduce_ll128_mixed_size_regression,
++        args=(
++            tp_size,
++            sizes,
++            iterations,
++            get_distributed_init_method(get_ip(), get_open_port()),
++            torch.multiprocessing.get_context("spawn").Event(),
++        ),
++        nprocs=tp_size,
++        join=True,
++    )
++
++
++if __name__ == "__main__":
++    p=argparse.ArgumentParser()
++    p.add_argument("--tp-size",type=int,choices=(2,4),required=True)
++    p.add_argument("--iterations",type=int,default=1000)
++    a=p.parse_args()
++    test_allreduce_ll128_mixed_size_regression(a.tp_size,a.iterations)
++    print(f"PASS: TP{a.tp_size}, {a.iterations} mixed-size rounds, evictions={os.getenv('AITER_TEST_LL128_EVICT', '0')}",flush=True)

@@ -1675,7 +1675,10 @@ class Scheduler(
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
             ps=self.ps,
+            # Profiling coordinates tensor work across all MoE TP ranks. The
+            # request/vision group is only attention-TP sized under DP attention.
             dp_tp_cpu_group=self.dp_tp_cpu_group,
+            tensor_cpu_group=self.tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
 

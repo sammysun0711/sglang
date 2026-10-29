@@ -1,0 +1,30 @@
+{
+  "source_worktree": "/root/workspace/rocm7.2.4/sglang-mimo-ck-prefill",
+  "sglang_head": "a15045ff186a5bbd39661a15b05cae676ea9dda9",
+  "aiter_head": "2b81433bbff27020ce98271b992a1aab93a5f3db",
+  "files": {
+    "kernels/flydsl_pa.py": {
+      "source": "/root/workspace/rocm7.2.4/sglang-mimo-ck-prefill/python/sglang/srt/layers/attention/flydsl_pa.py",
+      "source_sha256": "bb23bc254ee369c1ea18abfde0bc256875d99c389286a4f7371b4047b2adc666",
+      "bundled_sha256": "bb23bc254ee369c1ea18abfde0bc256875d99c389286a4f7371b4047b2adc666",
+      "method": "Verbatim copy"
+    },
+    "kernels/flydsl_helpers.py": {
+      "source": "/root/workspace/rocm7.2.4/sglang-mimo-ck-prefill/python/sglang/srt/layers/attention/flydsl_helpers.py",
+      "source_sha256": "927afc99d8071733b56b203945c270d7b82cef957cf06d96b724f1fac83d5143",
+      "bundled_sha256": "927afc99d8071733b56b203945c270d7b82cef957cf06d96b724f1fac83d5143",
+      "method": "Verbatim copy"
+    },
+    "kernels/gather.py": {
+      "source": "/root/workspace/rocm7.2.4/sglang-mimo-ck-prefill/python/sglang/srt/layers/attention/utils.py",
+      "source_sha256": "dde8c9c5261a1f78add6420f8389140577bac1974c4016d30c3dc571f0093750",
+      "bundled_sha256": "11aa37fcc11ac4e1877a32ef0bd59f1d4c55fd1f0729cf063a036f9959b7331b",
+      "method": "The two functions and decorators copied verbatim; function ASTs identical; only standalone imports added"
+    }
+  },
+  "notes": [
+    "No model weights, SGLang server or distributed initialization is needed.",
+    "FlyPA/helper files are copied unchanged from the qualified worktree; main-checkout FlyPA has different tuning support.",
+    "AITER is an external dependency; no AITER source or binary is copied into this bundle."
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "records": [
+    {
+      "input_tokens": 8192,
+      "requests": 1024,
+      "concurrency": 32,
+      "output_tokens_per_request": 1,
+      "h200_input_tps": 100267.83,
+      "control": {
+        "input_tps": 68792.76272170653,
+        "median_ttft_ms": 3782.0674129761755
+      },
+      "ck_linear": {
+        "input_tps": 69116.60782931511,
+        "median_ttft_ms": 3733.134608482942
+      },
+      "speedup": 1.0047075461835813,
+      "h200_ratio": 0.689319872877623,
+      "meets_h200": false
+    },
+    {
+      "input_tokens": 65536,
+      "requests": 256,
+      "concurrency": 32,
+      "output_tokens_per_request": 1,
+      "h200_input_tps": 81868.01,
+      "control": {
+        "input_tps": 53564.918331884706,
+        "median_ttft_ms": 39979.799151973566
+      },
+      "ck_linear": {
+        "input_tps": 60633.288891456206,
+        "median_ttft_ms": 34358.4778434888
+      },
+      "speedup": 1.1319589533540655,
+      "h200_ratio": 0.7406224835739407,
+      "meets_h200": false
+    }
+  ],
+  "pending": [],
+  "candidate_dispatch_ranks": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "accuracy_gate": {
+    "started_at": "2026-10-28T22:15:43.043667+00:00",
+    "finished_at": "2026-10-28T22:16:52.920944+00:00",
+    "result_scope": "full",
+    "evaluation_exit_code": 0,
+    "gsm8k": {
+      "accuracy": 0.9742228961334344,
+      "accuracy_percent": 97.42228961334344,
+      "correct": 1285,
+      "total": 1319,
+      "api_errors": 0,
+      "min_accuracy": 0.97,
+      "threshold_passed": true,
+      "report": "/root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/rocm7.2.4-decode-analysis/mi325x_h200_optimization_20261028/serving_prefill_ck_ab/ck_linear/gsm8k/evalscope/reports/MiMo-V2.6-Flash-MOPD/gsm8k.json"
+    },
+    "acceptance": {
+      "passed": true,
+      "min_accept_length": 4.0,
+      "mean_worker_accept_length": 5.567963776615585,
+      "min_worker_accept_length": 5.542845114623598,
+      "max_worker_accept_length": 5.5930824386075715,
+      "workers": [
+        {
+          "response_index": 0,
+          "accept_length": 5.5930824386075715,
+          "passed": true
+        },
+        {
+          "response_index": 1,
+          "accept_length": 5.542845114623598,
+          "passed": true
+        }
+      ],
+      "gate": "Every reported worker mean must meet MIN_ACCEPT_LENGTH",
+      "aggregation": "Arithmetic mean of per-worker avg_spec_accept_length values, not an exact global weighted mean",
+      "source": "Upstream SGLang /server_info internal_states[].avg_spec_accept_length (bonus-inclusive)",
+      "scope": "After successful pre-run flush; requires real acceptance, no concurrent inference, and no statistics resets during evaluation"
+    },
+    "checks": {
+      "evalscope_exit": true,
+      "acceptance": true,
+      "gsm8k_complete": true,
+      "gsm8k_accuracy": true
+    },
+    "errors": [],
+    "passed": true
+  },
+  "checks": {
+    "source_hashes_match": true,
+    "candidate_dispatch_on_all_ranks": true,
+    "all_points_complete": true,
+    "full_accuracy_passed": true
+  },
+  "qualified_for_measured_points": true,
+  "scope": "One unprofiled A/B per point, exact input IDs,32 warmups; requires repeats and broader target-matrix coverage before general promotion."
+}

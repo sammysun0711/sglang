@@ -163,6 +163,10 @@ def PagedAttention(
     is_causal,
     quant_query_mode="per-token",
     key_layout="vectorized",
+    cooperative_v=False,
+    manual_schedule=None,
+    cta_multiplier=1,
+    workgroup_waves=8,
 ):
     """
     cu_seqlens_q: [batch_size + 1] cu_seqlens_q[i] ~ cu_seqlens_q[i+1] is the range of query tokens in batch i
@@ -176,11 +180,17 @@ def PagedAttention(
 
     任务复杂，从极简pipeline开始构建，保证框架正确之后再开始性能调优迭代
     """
-    BM, BN = 256, 32
-    num_threads = 512
+    if manual_schedule is None:
+        manual_schedule = bool(int(os.environ.get("SGLANG_FLYPA_MIMO_BF16_MANUAL_SCHEDULE", "1")))
+    assert workgroup_waves in (4, 8)
+    BM, BN = 32 * workgroup_waves, 32
+    num_threads = 64 * workgroup_waves
     num_waves = num_threads // 64
     assert page_size in [32, 64, 128]
     assert key_layout in ("vectorized", "linear")
+    assert cta_multiplier in (1, 2, 4)
+    if cooperative_v:
+        assert key_layout == "vectorized" and head_dim_v == 128
     if key_layout == "linear":
         assert page_size == 32
         assert head_dim_qk == head_dim_v == 128
@@ -207,11 +217,11 @@ def PagedAttention(
         tid = fx.thread_idx.x
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
-        wave_m = wave_id // 4
+        wave_m = wave_id // (num_waves // 2)
 
         flyobj = fxh.FlyObjCache()
-        tmma1 = flyobj.create_thr_mma(k_tile.dtype, (1, 8, 1), 32)
-        tmma2 = flyobj.create_thr_mma(v_tile.dtype, (1, 8, 1), 32)
+        tmma1 = flyobj.create_thr_mma(k_tile.dtype, (1, num_waves, 1), 32)
+        tmma2 = flyobj.create_thr_mma(v_tile.dtype, (1, num_waves, 1), 32)
 
         """
         [TRICKY]:
@@ -254,6 +264,8 @@ def PagedAttention(
         num_bits_fragK = (fx.size(fragK.shape).get_static_leaf_int * fragK.dtype.width)
         num_bits_fragV = (fx.size(fragV.shape).get_static_leaf_int * fragV.dtype.width)
         num_vm_cnt_load_v = (num_bits_fragV)//128
+        if fx.const_expr(cooperative_v):
+            num_vm_cnt_load_v = 0
 
         fakeCt = fx.make_rmem_tensor(fx.make_layout((BN, BM), (BM, 1)), fx.Float32)
         fragS = tmma1.make_fragment_C(fakeCt)
@@ -278,12 +290,26 @@ def PagedAttention(
         @fx.union
         class SharedStorage:
             k_lds: fx.Array[k_tile.dtype, 2 * BN * head_dim_qk, 16]
-            o_lds: fx.Array[o_tile.dtype, (BM//8) * head_dim_v, 16]
+            o_lds: fx.Array[o_tile.dtype, (BM//num_waves) * head_dim_v, 16]
 
         # mask,base,shift, swizzle always in unit of 128b,
         swz_base = ((128 // k_tile.dtype.width) - 1).bit_length()
         swz = fx.SwizzleType.get(3, swz_base, 3)
-        lds = fx.SharedAllocator().allocate(SharedStorage)
+        if fx.const_expr(cooperative_v):
+            @fx.struct
+            class StorageWithV:
+                ko: SharedStorage
+                v_lds: fx.Array[v_tile.dtype, 2 * BN * head_dim_v, 16]
+
+            storage = fx.SharedAllocator().allocate(StorageWithV)
+            lds = storage.ko
+            layout_v_lds = fx.make_composed_layout(
+                fx.static(swz),
+                fx.make_ordered_layout((head_dim_v, BN, 2), (1, 0, 2)),
+            )
+            lds_v = storage.v_lds.peek().view(layout_v_lds)
+        else:
+            lds = fx.SharedAllocator().allocate(SharedStorage)
         layout_k_lds = fx.make_composed_layout(
             fx.static(swz),
             fx.make_ordered_layout((BN, head_dim_qk, 2), (1, 0, 2)),
@@ -300,9 +326,11 @@ def PagedAttention(
         # assert 0, f"{k_tile}"
         num_copy_threads = BN * head_dim_qk * k_tile.dtype.width // copy_atom_bits
         assert BN * head_dim_qk * k_tile.dtype.width % copy_atom_bits == 0
-        if fx.const_expr(k_tile.dtype == fx.BFloat16 and head_dim_qk == 192):
-            # Fit 768 b128 atoms into 384 threads; each thread copies two atoms.
-            num_copy_threads //= 2
+        # Keep the copy layout a compile-time value. D192 uses 384 active
+        # threads at eight waves and 192 at four waves.
+        for _copy_factor in fx.range_constexpr(4):
+            if fx.const_expr(num_copy_threads > num_threads):
+                num_copy_threads //= 2
         assert num_copy_threads <= num_threads
 
         # [TRICKY]
@@ -339,6 +367,25 @@ def PagedAttention(
             fx.make_fragment_like(glk_srck[None, None, None, 0, 0]),
         ]
 
+        if fx.const_expr(cooperative_v):
+            v_tile_u32 = recast_tensor(v_tile, fx.Uint32)
+            lds_v_u32 = recast_tensor(lds_v, fx.Uint32)
+            glv_thrcopy, glv_load_atom = flyobj.get_tiled_copy_coalesced_mn(
+                v_tile_u32[None, None, 0, 0],
+                copy_atom_bits=128,
+                num_threads=num_threads,
+            )
+            glv_src = glv_thrcopy.partition_S(v_tile_u32)
+            glv_dst = glv_thrcopy.partition_D(lds_v_u32)
+            glv_store_atom = flyobj.get_universal_copy_atom(fx.Uint32, 128)
+            prefetch_fragv_list = [
+                fx.make_fragment_like(glv_src[None, None, None, 0, 0]),
+                fx.make_fragment_like(glv_src[None, None, None, 0, 0]),
+            ]
+            num_vm_cnt_prefetch_v = (
+                fx.size(prefetch_fragv_list[0].shape).get_static_leaf_int * 32
+            ) // 128
+
         def global_load_k(block_n, page_id, bn_id, frag_id):
             if fx.const_expr(is_valid_block_n(block_n)):
                 if fx.const_expr(key_layout == "linear"):
@@ -354,6 +401,13 @@ def PagedAttention(
                 else:
                     if tid < num_copy_threads:
                         fx.copy(glk_load_atom, source, prefetch_fragk_list[frag_id])
+                if fx.const_expr(cooperative_v):
+                    fx.copy(
+                        glv_load_atom,
+                        glv_src[None, None, None, page_id, bn_id],
+                        prefetch_fragv_list[frag_id],
+                    )
+                    return num_vm_cnt_load_k + num_vm_cnt_prefetch_v
                 return num_vm_cnt_load_k
             else:
                 return 0
@@ -365,12 +419,23 @@ def PagedAttention(
                 else:
                     if tid < num_copy_threads:
                         fx.copy(glk_store_atom, prefetch_fragk_list[frag_id], glk_dstk[None, None, None, lds_buff_id & 1])
+                if fx.const_expr(cooperative_v):
+                    fx.copy(
+                        glv_store_atom,
+                        prefetch_fragv_list[frag_id],
+                        glv_dst[None, None, None, lds_buff_id & 1],
+                    )
     
         fragO.fill(0.0)
 
         v_copy_atom = flyobj.get_universal_copy_atom(v_tile.dtype, 128)
         v_tcopy = flyobj.get_tiled_mma_copy(v_copy_atom, tmma2, "A")
         v_thrcopy = v_tcopy.get_slice(tid)
+        if fx.const_expr(cooperative_v):
+            # Define cached SSA views outside the hot/tail loops so they
+            # dominate every use, including one-page inputs.
+            v_lds_src = flyobj.get_partition_S(v_tcopy, lds_v)
+            v_lds_dst = flyobj.get_retile(v_tcopy, fragV)
 
         def kv_step(page_n, lds_buff_id, cur_max, l_in,
                     kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3,
@@ -399,25 +464,33 @@ def PagedAttention(
                     fragS.fill(0.0)
                     #s_waitcnt(lgkmcnt=0)
                     fx.gemm(tmma1, fragS, fragK, fragQ, fragS)
-                    fx.copy(
-                        v_copy_atom,
-                        v_thrcopy.partition_S(v_tile[None, None, bn0_page, bn0_part]),
-                        v_thrcopy.retile(fragV),
-                    )
+                    if fx.const_expr(cooperative_v):
+                        fx.copy(
+                            v_copy_atom,
+                            v_lds_src[None, None, None, lds_buff_id],
+                            v_lds_dst,
+                        )
+                    else:
+                        fx.copy(
+                            v_copy_atom,
+                            v_thrcopy.partition_S(v_tile[None, None, bn0_page, bn0_part]),
+                            v_thrcopy.retile(fragV),
+                        )
 
                     vm_cnt += num_vm_cnt_load_v
                     #assert 0, f"{vm_cnt} {num_vm_cnt_load_v}"
 
                     # Issue all eight V loads across the first eight QK MFMAs. The
                     # final eight MFMAs hide the latency of the last V load.
-                    fx.rocdl.sched_group_barrier(0x200, 1, 0)
-                    fx.rocdl.sched_mfma(2)
-                    fx.rocdl.sched_vmem(1)
-                    for _ in fx.range_constexpr(num_vm_cnt_load_v//2):
-                        fx.rocdl.sched_mfma(3)
-                        fx.rocdl.sched_vmem(2)
-                    fx.rocdl.sched_vmem(100)
-                    fx.rocdl.sched_mfma(100)
+                    if fx.const_expr(manual_schedule or k_tile.dtype != fx.BFloat16):
+                        fx.rocdl.sched_group_barrier(0x200, 1, 0)
+                        fx.rocdl.sched_mfma(2)
+                        fx.rocdl.sched_vmem(1)
+                        for _ in fx.range_constexpr(num_vm_cnt_load_v//2):
+                            fx.rocdl.sched_mfma(3)
+                            fx.rocdl.sched_vmem(2)
+                        fx.rocdl.sched_vmem(100)
+                        fx.rocdl.sched_mfma(100)
 
                 rocdl.sched_barrier(0)
                 fxh.s_waitcnt(vmcnt=vm_cnt, lgkmcnt=0)
@@ -472,10 +545,11 @@ def PagedAttention(
 
                 # leave some LDS bandwidth in head of MFMA-stage
                 # because head of online-softmax-stage needs LDS
-                for _ in fx.range_constexpr(num_bits_fragK//128//2):
-                    fx.rocdl.sched_group_barrier(0x100, 2, 0)
-                    fx.rocdl.sched_mfma(3)
-                fx.rocdl.sched_mfma(100)
+                if fx.const_expr(manual_schedule or k_tile.dtype != fx.BFloat16):
+                    for _ in fx.range_constexpr(num_bits_fragK//128//2):
+                        fx.rocdl.sched_group_barrier(0x100, 2, 0)
+                        fx.rocdl.sched_mfma(3)
+                    fx.rocdl.sched_mfma(100)
                 #fx.rocdl.sched_group_barrier(0x200, 1, 0)
                 fx.rocdl.sched_barrier(0)
                 lds_buff_id = lds_buff_id^1
@@ -930,6 +1004,8 @@ def PagedAttention(
         stream = torch.cuda.current_stream() if stream is None else stream
 
         assert causal == is_causal
+        if cooperative_v and (K.dtype != torch.bfloat16 or V.dtype != torch.bfloat16):
+            raise ValueError("cooperative V staging currently requires BF16 KV")
         assert not causal or max_seqlen_k >= max_seqlen_q, (
             "bottom-right causal attention requires max_seqlen_k >= max_seqlen_q"
         )
@@ -975,13 +1051,15 @@ def PagedAttention(
         # some internal logic use i32 address
         # assert K.numel()*K.element_size() <= 2**31 - 1, f"KV cache size ={K.numel()*K.element_size()} > 2**31 - 1"
 
-        multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
+        multi_processor_count = torch.cuda.get_device_properties().multi_processor_count * cta_multiplier
         with torch.cuda.stream(stream):
             # slot 0: global ticket counter; slots 1..N: per-workgroup mailbox
             work_counter = torch.zeros(
                 multi_processor_count + 1, device="cuda", dtype=torch.int32
             )
-            work_counter[0] = multi_processor_count
+            # Initialize on the device: scalar assignment stages an unpinned
+            # CPU tensor and is rejected inside a CUDA/HIP graph capture.
+            work_counter[:1].fill_(multi_processor_count)
 
             if out is None:
                 out = torch.empty(

@@ -1,0 +1,156 @@
+{
+  "status": "complete",
+  "source_hashes_verified": true,
+  "prefill_64k_c32": {
+    "pairs": [
+      {
+        "run": "serving_prefill_ck_ab",
+        "order": [
+          "control",
+          "ck_linear"
+        ],
+        "control": {
+          "completed": 256,
+          "input_throughput": 53564.918331884706,
+          "median_ttft_ms": 39979.799151973566,
+          "median_e2e_latency_ms": 39979.8217714706,
+          "median_tpot_ms": 0.0
+        },
+        "ck_linear": {
+          "completed": 256,
+          "input_throughput": 60633.288891456206,
+          "median_ttft_ms": 34358.4778434888,
+          "median_e2e_latency_ms": 34358.498930494534,
+          "median_tpot_ms": 0.0
+        },
+        "candidate_over_control": 1.1319589533540655
+      },
+      {
+        "run": "serving_prefill_ck_repeat",
+        "order": [
+          "ck_linear",
+          "control"
+        ],
+        "control": {
+          "completed": 256,
+          "input_throughput": 53107.10043375424,
+          "median_ttft_ms": 40361.81669399957,
+          "median_e2e_latency_ms": 40361.83933299617,
+          "median_tpot_ms": 0.0
+        },
+        "ck_linear": {
+          "completed": 256,
+          "input_throughput": 56790.861651714455,
+          "median_ttft_ms": 37445.09702650248,
+          "median_e2e_latency_ms": 37445.120415999554,
+          "median_tpot_ms": 0.0
+        },
+        "candidate_over_control": 1.0693647589093165
+      }
+    ],
+    "control_median_input_tps": 53336.00938281947,
+    "candidate_median_input_tps": 58712.07527158533,
+    "candidate_over_control": 1.1007961778726099,
+    "h200_reference_input_tps": 81868.01,
+    "candidate_over_h200": 0.7171552755659425
+  },
+  "c2_latency": [
+    {
+      "input_tokens": 8192,
+      "output_tokens": 20,
+      "concurrency": 2,
+      "prompts": 8,
+      "control": {
+        "completed": 8,
+        "input_throughput": 42174.315280182964,
+        "median_ttft_ms": 258.5218864842318,
+        "median_e2e_latency_ms": 379.7621054982301,
+        "median_tpot_ms": 6.243013920826151
+      },
+      "ck_linear": {
+        "completed": 8,
+        "input_throughput": 51294.14451168448,
+        "median_ttft_ms": 258.1448499986436,
+        "median_e2e_latency_ms": 299.4188710290473,
+        "median_tpot_ms": 1.7682432632060034
+      },
+      "ttft_reduction_fraction": 0.001458431588581055,
+      "e2e_reduction_fraction": 0.21156201028477084
+    },
+    {
+      "input_tokens": 65536,
+      "output_tokens": 20,
+      "concurrency": 2,
+      "prompts": 8,
+      "control": {
+        "completed": 8,
+        "input_throughput": 44698.49770355889,
+        "median_ttft_ms": 2470.3375505050644,
+        "median_e2e_latency_ms": 2890.9292294993065,
+        "median_tpot_ms": 25.05045897315109
+      },
+      "ck_linear": {
+        "completed": 8,
+        "input_throughput": 48865.72650593414,
+        "median_ttft_ms": 2255.451422999613,
+        "median_e2e_latency_ms": 2639.987780508818,
+        "median_tpot_ms": 22.914162605670032
+      },
+      "ttft_reduction_fraction": 0.08698654459651378,
+      "e2e_reduction_fraction": 0.0868030411916898
+    }
+  ],
+  "reused_full_accuracy": {
+    "started_at": "2026-10-28T22:15:43.043667+00:00",
+    "finished_at": "2026-10-28T22:16:52.920944+00:00",
+    "result_scope": "full",
+    "evaluation_exit_code": 0,
+    "gsm8k": {
+      "accuracy": 0.9742228961334344,
+      "accuracy_percent": 97.42228961334344,
+      "correct": 1285,
+      "total": 1319,
+      "api_errors": 0,
+      "min_accuracy": 0.97,
+      "threshold_passed": true,
+      "report": "/root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/rocm7.2.4-decode-analysis/mi325x_h200_optimization_20261028/serving_prefill_ck_ab/ck_linear/gsm8k/evalscope/reports/MiMo-V2.6-Flash-MOPD/gsm8k.json"
+    },
+    "acceptance": {
+      "passed": true,
+      "min_accept_length": 4.0,
+      "mean_worker_accept_length": 5.567963776615585,
+      "min_worker_accept_length": 5.542845114623598,
+      "max_worker_accept_length": 5.5930824386075715,
+      "workers": [
+        {
+          "response_index": 0,
+          "accept_length": 5.5930824386075715,
+          "passed": true
+        },
+        {
+          "response_index": 1,
+          "accept_length": 5.542845114623598,
+          "passed": true
+        }
+      ],
+      "gate": "Every reported worker mean must meet MIN_ACCEPT_LENGTH",
+      "aggregation": "Arithmetic mean of per-worker avg_spec_accept_length values, not an exact global weighted mean",
+      "source": "Upstream SGLang /server_info internal_states[].avg_spec_accept_length (bonus-inclusive)",
+      "scope": "After successful pre-run flush; requires real acceptance, no concurrent inference, and no statistics resets during evaluation"
+    },
+    "checks": {
+      "evalscope_exit": true,
+      "acceptance": true,
+      "gsm8k_complete": true,
+      "gsm8k_accuracy": true
+    },
+    "errors": [],
+    "passed": true
+  },
+  "limitations": [
+    "Two serving samples per arm; no confidence interval or full target-matrix qualification.",
+    "C2 latency has one eight-request run per arm and real DFlash acceptance.",
+    "8K TTFT is unchanged; its E2E difference is not attributed to the prefill kernel.",
+    "The reverse pair reuses unchanged-source full GSM8K; it is not a new accuracy run."
+  ]
+}

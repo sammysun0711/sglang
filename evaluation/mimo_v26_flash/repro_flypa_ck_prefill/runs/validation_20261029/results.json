@@ -1,0 +1,294 @@
+{
+  "status": "complete",
+  "gpu": "AMD Instinct MI325X",
+  "arch": "gfx942:sramecc+:xnack-",
+  "device": 0,
+  "versions": {
+    "torch": "2.11.0+rocm7.2",
+    "triton": "3.7.0+amd.rocm7.2.0.git89002410",
+    "flydsl": "0.3.2"
+  },
+  "torch_hip_build": "7.2.26015",
+  "query_heads": 16,
+  "kv_heads": 1,
+  "qk_dim": 192,
+  "v_dim": 128,
+  "page_size": 64,
+  "dtype": "bfloat16",
+  "flypa": {
+    "manual_schedule": false,
+    "workgroup_waves": 8,
+    "cooperative_v": false,
+    "cta_multiplier": 1
+  },
+  "timing": "Alternating warmed HIP graph replays; CUDA events; CK includes full KV gather on each replay",
+  "source_manifest_sha256": "e31a7341bf73b53fa48c132ac1066b1ec63055fc8c1268c1e860eec0deceb46d",
+  "records": [
+    {
+      "query_tokens": 32768,
+      "kv_tokens": 32768,
+      "q_stride": [
+        3392,
+        192,
+        1
+      ],
+      "flypa_ms": 13.18675708770752,
+      "ck_with_gather_ms": 9.01416015625,
+      "speedup": 1.4628935873259845,
+      "samples_ms": {
+        "flypa": [
+          13.157632827758789,
+          13.18675708770752,
+          13.365785598754883,
+          13.102230072021484,
+          13.485967636108398
+        ],
+        "ck_with_gather": [
+          9.01416015625,
+          8.868902206420898,
+          9.143714904785156,
+          8.878636360168457,
+          9.026498794555664
+        ]
+      },
+      "initial_errors": {
+        "flypa": {
+          "max_abs_error": 0.010431289672851562,
+          "relative_rms": 0.0011598613345995545
+        },
+        "ck_with_gather": {
+          "max_abs_error": 0.022225379943847656,
+          "relative_rms": 0.002993919886648655
+        }
+      },
+      "changed_query_replay_errors": {
+        "flypa": {
+          "max_abs_error": 0.008025169372558594,
+          "relative_rms": 0.0011471075704321265
+        },
+        "ck_with_gather": {
+          "max_abs_error": 0.019005537033081055,
+          "relative_rms": 0.0029879421927034855
+        }
+      },
+      "initial_output_sha256": {
+        "flypa": "24e5691ac05bfdbdcd8698ef474de752babde8c3c29049d76b0e78d45e5ab708",
+        "ck_with_gather": "06375c1704fe4065dd560f8b479a859f6c0028041ab97990ea72ea7ff07af689"
+      },
+      "checked_query_rows": [
+        0,
+        1,
+        31,
+        8192,
+        16384,
+        32735,
+        32766,
+        32767
+      ],
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02,
+      "gather_bit_exact": true
+    },
+    {
+      "query_tokens": 32768,
+      "kv_tokens": 65536,
+      "q_stride": [
+        3392,
+        192,
+        1
+      ],
+      "flypa_ms": 36.574859619140625,
+      "ck_with_gather_ms": 27.125486373901367,
+      "speedup": 1.34835774426264,
+      "samples_ms": {
+        "flypa": [
+          36.48067855834961,
+          36.574859619140625,
+          36.798561096191406,
+          36.402801513671875,
+          36.88196563720703
+        ],
+        "ck_with_gather": [
+          27.134740829467773,
+          26.884201049804688,
+          27.125486373901367,
+          26.816499710083008,
+          27.354347229003906
+        ]
+      },
+      "initial_errors": {
+        "flypa": {
+          "max_abs_error": 0.0001300126314163208,
+          "relative_rms": 0.002371346578001976
+        },
+        "ck_with_gather": {
+          "max_abs_error": 0.00026192888617515564,
+          "relative_rms": 0.006117773242294788
+        }
+      },
+      "changed_query_replay_errors": {
+        "flypa": {
+          "max_abs_error": 9.648129343986511e-05,
+          "relative_rms": 0.002411251189187169
+        },
+        "ck_with_gather": {
+          "max_abs_error": 0.0003308802843093872,
+          "relative_rms": 0.006146047729998827
+        }
+      },
+      "initial_output_sha256": {
+        "flypa": "18d6103e046a55daa8b8fdbd254cf10b1dd13e3111bcebb00ad88c2753bd343b",
+        "ck_with_gather": "41a42c6cfc421ca215e572081bf8eb775d01e9687c3b689d11d65038e4de5b61"
+      },
+      "checked_query_rows": [
+        0,
+        1,
+        31,
+        8192,
+        16384,
+        32735,
+        32766,
+        32767
+      ],
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02,
+      "gather_bit_exact": true
+    },
+    {
+      "query_tokens": 32768,
+      "kv_tokens": 262144,
+      "q_stride": [
+        3392,
+        192,
+        1
+      ],
+      "flypa_ms": 170.2650909423828,
+      "ck_with_gather_ms": 132.40438842773438,
+      "speedup": 1.2859474898395276,
+      "samples_ms": {
+        "flypa": [
+          170.2650909423828,
+          170.67538452148438,
+          169.87808227539062,
+          170.2033233642578,
+          170.28372192382812
+        ],
+        "ck_with_gather": [
+          132.19918823242188,
+          132.86138916015625,
+          143.80972290039062,
+          132.2491455078125,
+          132.40438842773438
+        ]
+      },
+      "initial_errors": {
+        "flypa": {
+          "max_abs_error": 4.408322274684906e-05,
+          "relative_rms": 0.0023900920059531927
+        },
+        "ck_with_gather": {
+          "max_abs_error": 9.850040078163147e-05,
+          "relative_rms": 0.006170523818582296
+        }
+      },
+      "changed_query_replay_errors": {
+        "flypa": {
+          "max_abs_error": 4.393048584461212e-05,
+          "relative_rms": 0.002349178772419691
+        },
+        "ck_with_gather": {
+          "max_abs_error": 9.907130151987076e-05,
+          "relative_rms": 0.006088133901357651
+        }
+      },
+      "initial_output_sha256": {
+        "flypa": "62fe12e227224274903d176c1828d400e1c6ed50104962fc8fe80ac498b9ffcc",
+        "ck_with_gather": "9e3fa6ed30b81bd34a194fce6650176f181b943fe923fd483d746b27d69d2387"
+      },
+      "checked_query_rows": [
+        0,
+        1,
+        31,
+        8192,
+        16384,
+        32735,
+        32766,
+        32767
+      ],
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02,
+      "gather_bit_exact": true
+    },
+    {
+      "query_tokens": 18432,
+      "kv_tokens": 378880,
+      "q_stride": [
+        3392,
+        192,
+        1
+      ],
+      "flypa_ms": 146.34576416015625,
+      "ck_with_gather_ms": 114.26717376708984,
+      "speedup": 1.2807332091581438,
+      "samples_ms": {
+        "flypa": [
+          155.93215942382812,
+          146.191650390625,
+          145.81973266601562,
+          146.34576416015625,
+          146.3623046875
+        ],
+        "ck_with_gather": [
+          114.31949615478516,
+          113.84466552734375,
+          114.26717376708984,
+          114.03459167480469,
+          114.51956176757812
+        ]
+      },
+      "initial_errors": {
+        "flypa": {
+          "max_abs_error": 3.7136487662792206e-05,
+          "relative_rms": 0.0023404275998473167
+        },
+        "ck_with_gather": {
+          "max_abs_error": 9.24849882721901e-05,
+          "relative_rms": 0.006146377418190241
+        }
+      },
+      "changed_query_replay_errors": {
+        "flypa": {
+          "max_abs_error": 3.094226121902466e-05,
+          "relative_rms": 0.0023627339396625757
+        },
+        "ck_with_gather": {
+          "max_abs_error": 9.015761315822601e-05,
+          "relative_rms": 0.006122269667685032
+        }
+      },
+      "initial_output_sha256": {
+        "flypa": "c3be4e1513c36d6c7c9a6082bcda8bb08d27042e8f214f1c71baa55695bea895",
+        "ck_with_gather": "164f7a4f2961809d44269b53d81e5bc7a948471f6f273d4050d0f32a8494735e"
+      },
+      "checked_query_rows": [
+        0,
+        1,
+        31,
+        4608,
+        9216,
+        18399,
+        18430,
+        18431
+      ],
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02,
+      "gather_bit_exact": true
+    }
+  ],
+  "loaded_rocm_libraries": {
+    "/root/workspace/rocm7.2.4/runtime724/python/torch/lib/libhsa-runtime64.so": "b8cdfe93d343649a35c1daf73a0a3a6840f09379ebeee9be65670461ffea43f4",
+    "/opt/rocm-7.2.4/lib/libhsa-runtime64.so.1.18.70204": "b8cdfe93d343649a35c1daf73a0a3a6840f09379ebeee9be65670461ffea43f4",
+    "/root/workspace/rocm7.2.4/runtime724/python/torch/lib/libroctracer64.so": "c7c71117051dd8874e326dc4c2bdeb2a06eacfdf37f10d046beb95ff30cdae11",
+    "/root/workspace/rocm7.2.4/runtime724/python/torch/lib/libamdhip64.so": "f1043337461c8e54ee135e95fa979a7d0e4344676ad5b0554652f844f8f098ac"
+  }
+}

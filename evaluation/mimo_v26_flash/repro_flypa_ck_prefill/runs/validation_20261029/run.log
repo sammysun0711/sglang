@@ -1,0 +1,11 @@
+bash: /opt/venv/lib/python3.12/site-packages/torch/lib/libtinfo.so.6: no version information available (required by bash)
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /root/workspace/rocm7.2.4/aiter/aiter/jit/module_aiter_core.so
+AMD Instinct MI325X, gfx942:sramecc+:xnack-; {'torch': '2.11.0+rocm7.2', 'triton': '3.7.0+amd.rocm7.2.0.git89002410', 'flydsl': '0.3.2'}
+Query tokens | KV tokens | FlyPA ms | CK incl. gather ms | Speedup
+[aiter] import [mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale] under /root/workspace/rocm7.2.4/aiter/aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale.so
+       32768 |     32768 |   13.187 |              9.014 | 1.463x
+       32768 |     65536 |   36.575 |             27.125 | 1.348x
+       32768 |    262144 |  170.265 |            132.404 | 1.286x
+       18432 |    378880 |  146.346 |            114.267 | 1.281x
+Results: sglang/evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/results.json

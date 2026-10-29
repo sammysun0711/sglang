@@ -1,0 +1,14 @@
+{
+  "ck_integration_passed": 5,
+  "ck_skipped": 0,
+  "flypa_cases_passed": 11,
+  "markdown_bash_syntax_pass": true,
+  "links_pass": true,
+  "server_dry_runs": [
+    "flypa",
+    "ck"
+  ],
+  "client_dry_run_pass": true,
+  "e2e_restarted": false,
+  "accuracy_dry_run_pass": true
+}

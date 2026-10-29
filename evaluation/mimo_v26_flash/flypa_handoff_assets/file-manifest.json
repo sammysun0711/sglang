@@ -1,0 +1,580 @@
+{
+  "created_utc": "2026-10-29T05:42:49.495844+00:00",
+  "sglang_base": "a15045ff186a5bbd39661a15b05cae676ea9dda9",
+  "sglang_remote": "https://github.com/sammysun0711/sglang",
+  "sglang_remote_ref": "refs/heads/feat/mimo-flash-dp-attention",
+  "original_status_files": [
+    "evaluation/mimo_v26_flash/launch_mimo_v26_flash_dp_attention.sh",
+    "python/sglang/srt/layers/attention/aiter_backend.py",
+    "python/sglang/srt/layers/attention/aiter_utils.py",
+    "python/sglang/srt/layers/attention/flydsl_pa.py",
+    "python/sglang/srt/layers/communicator.py",
+    "python/sglang/srt/layers/dp_attention.py",
+    "python/sglang/srt/managers/scheduler.py",
+    "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
+    "python/sglang/srt/batch_overlap/dp_collectives.py",
+    "test/manual/test_mimo_ck_linear_prefill.py"
+  ],
+  "added_handoff_files": [
+    "evaluation/mimo_v26_flash/check_flypa_handoff_files.py",
+    "evaluation/mimo_v26_flash/configs/moe_novs_gfx942_rocm724.csv",
+    "evaluation/mimo_v26_flash/flypa-optimization-handoff.md",
+    "evaluation/mimo_v26_flash/flypa_handoff_assets/ck-gsm8k-gate.json",
+    "evaluation/mimo_v26_flash/flypa_handoff_assets/ck-serving-comparison.json",
+    "evaluation/mimo_v26_flash/flypa_handoff_assets/ck-serving-repeat.json",
+    "evaluation/mimo_v26_flash/flypa_handoff_assets/runtime724-manifest.json",
+    "evaluation/mimo_v26_flash/flypa_handoff_code/README.md",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/LICENSE.sglang",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/README.md",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/SHA256SUMS",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/benchmark.py",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/__init__.py",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/flydsl_helpers.py",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/flydsl_pa.py",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/gather.py",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/reference-results/prefill-ck-varlen.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/reference-results/prefill-shape-matrix-manual0.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/run.sh",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/accuracy-dry-run.log",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck-linear.xml",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck-server-dry-run.log",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck_linear-exit.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck_linear.log",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/client-dry-run.log",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/commands.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/final-idle.txt",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa-exit.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa-server-dry-run.log",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa.log",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/handoff-verification.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/idle-after.txt",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/idle-before.txt",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/idle-after.txt",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/idle-before.txt",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/results.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/run.log",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/verification.json",
+    "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/source-manifest.json",
+    "evaluation/mimo_v26_flash/rocm7.2.4-decode-analysis/mi325x_h200_optimization_20261028/test_prefill_candidate.py",
+    "evaluation/mimo_v26_flash/flypa_handoff_code/patches/aiter-local.patch",
+    "evaluation/mimo_v26_flash/flypa_handoff_code/patches/composable-kernel-local.patch"
+  ],
+  "already_in_base": [
+    "python/sglang/srt/layers/attention/utils.py",
+    "python/sglang/srt/layers/attention/flydsl_helpers.py",
+    "test/registered/attention/test_mimo_flypa_nan_tail.py",
+    "test/registered/attention/test_mimo_flydsl_full_decode.py",
+    "test/registered/attention/test_aiter_mimo_vectorized_5d.py",
+    "python/sglang/srt/batch_overlap/two_batch_overlap.py",
+    "evaluation/run_benchmark_mimo_pro_prefill.sh",
+    "evaluation/run_evalscope_gsm8k_accuracy.py"
+  ],
+  "files": [
+    {
+      "path": "evaluation/mimo_v26_flash/launch_mimo_v26_flash_dp_attention.sh",
+      "role": "original_worktree_change",
+      "sha256": "7ff1de7b69e97b7dea2d4040f7c1ef73793c152429e8201e0898cbe98621da1d",
+      "bytes": 5137,
+      "git_mode": "100755"
+    },
+    {
+      "path": "python/sglang/srt/layers/attention/aiter_backend.py",
+      "role": "original_worktree_change",
+      "sha256": "9a772584c2874982bc41d8972a958fd5d5f0c5b4b16c8acfbee11192afb286fc",
+      "bytes": 143544,
+      "git_mode": "100755"
+    },
+    {
+      "path": "python/sglang/srt/layers/attention/aiter_utils.py",
+      "role": "original_worktree_change",
+      "sha256": "0afac0cc12c3a28a6ea815c9eb62098fdd3dfdc9abfe54144426cc2c0f31d1a4",
+      "bytes": 129299,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/layers/attention/flydsl_pa.py",
+      "role": "original_worktree_change",
+      "sha256": "bb23bc254ee369c1ea18abfde0bc256875d99c389286a4f7371b4047b2adc666",
+      "bytes": 54359,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/layers/communicator.py",
+      "role": "original_worktree_change",
+      "sha256": "7d6d76eacd95c5e94c916afa85cdcde1986e88698611afcadbfd0413cb4a96d2",
+      "bytes": 59340,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/layers/dp_attention.py",
+      "role": "original_worktree_change",
+      "sha256": "f9b7effcfec7def82eb78892398342858c1b48c691446801a33f50dbac07cdf6",
+      "bytes": 32177,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/managers/scheduler.py",
+      "role": "original_worktree_change",
+      "sha256": "d4ac51c4af67c70afd4be48d008887c8d518e54ceaa41423c62fa24a47ddccb6",
+      "bytes": 180234,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
+      "role": "original_worktree_change",
+      "sha256": "3ead9fc8ffa52bc69e710d68a7f6fb77f5dbcc8410263b08c6e186d0cd1f95fe",
+      "bytes": 19434,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/batch_overlap/dp_collectives.py",
+      "role": "original_worktree_change",
+      "sha256": "01b6051b48f1681a3233a13dab864abe8424bf3a09e803536061b96805e2c830",
+      "bytes": 5133,
+      "git_mode": "100644"
+    },
+    {
+      "path": "test/manual/test_mimo_ck_linear_prefill.py",
+      "role": "original_worktree_change",
+      "sha256": "4ea7fa5efd6587b0fea7a06037ebe28261df27eb0a265b49870f6371782958f3",
+      "bytes": 4984,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/check_flypa_handoff_files.py",
+      "role": "handoff_support",
+      "sha256": "f29e30339aa6d3353b8909d84795d46aac5003c933f59103551c616693168fba",
+      "bytes": 4896,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/configs/moe_novs_gfx942_rocm724.csv",
+      "role": "handoff_support",
+      "sha256": "c9e9848fd84d728047733a8a4edfe85b8ef1a4cd44fa463b1a449079339c0abf",
+      "bytes": 5151,
+      "git_mode": "100755"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa-optimization-handoff.md",
+      "role": "handoff_support",
+      "sha256": "2aecb54bcaa309920c5cc54e9887dfbae4023f900487ccfb78aca88159cee284",
+      "bytes": 6526,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa_handoff_assets/ck-gsm8k-gate.json",
+      "role": "handoff_support",
+      "sha256": "319556f7af5abec300282d65c5527b232acb3c5e849f5d7912a9111f0cd043ff",
+      "bytes": 1671,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa_handoff_assets/ck-serving-comparison.json",
+      "role": "handoff_support",
+      "sha256": "6b2959b9229bf88171f9997a3ae09ea5b4ee149f7c1f36ffe738dd94329109e1",
+      "bytes": 3253,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa_handoff_assets/ck-serving-repeat.json",
+      "role": "handoff_support",
+      "sha256": "ac2a7e168b3a8d5477656556597433c65cdde500ce8ccab522c803c669d61ddd",
+      "bytes": 5294,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa_handoff_assets/runtime724-manifest.json",
+      "role": "handoff_support",
+      "sha256": "214d0a3be426b0562613cdc9309d8f125c143c6a105619ccb464bc4faa3b8f2a",
+      "bytes": 1084,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa_handoff_code/README.md",
+      "role": "handoff_support",
+      "sha256": "b46249728091446924fe5013dc63b50405eb3b929e03226d6e2495add1f5fa31",
+      "bytes": 5904,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/LICENSE.sglang",
+      "role": "handoff_support",
+      "sha256": "1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747",
+      "bytes": 11346,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/README.md",
+      "role": "handoff_support",
+      "sha256": "99d7b1933eed5d432c34144d776cfdaad0a490861670d3a51a297c818b39b902",
+      "bytes": 3339,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/SHA256SUMS",
+      "role": "handoff_support",
+      "sha256": "89c7a3aae6acd04e754860eb0cebd07ad42eb309eee801a263d2a8749aa93518",
+      "bytes": 3028,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/benchmark.py",
+      "role": "handoff_support",
+      "sha256": "b85449ad06a93ba32e7815b7df7d21d4beeedbc5a38303fdce0110c5e8a97efd",
+      "bytes": 9451,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/__init__.py",
+      "role": "handoff_support",
+      "sha256": "0aaf585d0517757c136c02141fc29424305b2e4b3eef3d840f13ed6715db870e",
+      "bytes": 73,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/flydsl_helpers.py",
+      "role": "handoff_support",
+      "sha256": "927afc99d8071733b56b203945c270d7b82cef957cf06d96b724f1fac83d5143",
+      "bytes": 26510,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/flydsl_pa.py",
+      "role": "handoff_support",
+      "sha256": "bb23bc254ee369c1ea18abfde0bc256875d99c389286a4f7371b4047b2adc666",
+      "bytes": 54359,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/kernels/gather.py",
+      "role": "handoff_support",
+      "sha256": "11aa37fcc11ac4e1877a32ef0bd59f1d4c55fd1f0729cf063a036f9959b7331b",
+      "bytes": 6472,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/reference-results/prefill-ck-varlen.json",
+      "role": "handoff_support",
+      "sha256": "28536f310756b6cb2bb2660e02cd1d86e8d70b94827ff00a4cfec513da9efa75",
+      "bytes": 3250,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/reference-results/prefill-shape-matrix-manual0.json",
+      "role": "handoff_support",
+      "sha256": "3d7d376c31e402dc1a731d1dab3b24bb07e1f32dfe82b6fcd8b100d119d1b82b",
+      "bytes": 3219,
+      "git_mode": "100755"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/run.sh",
+      "role": "handoff_support",
+      "sha256": "eccfd81fe2e51b4ce8f1723ebe92ee69a63148d55c628915c1730b4079ffd2b7",
+      "bytes": 512,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/accuracy-dry-run.log",
+      "role": "handoff_support",
+      "sha256": "369a4186a6ab4b6cffa07f6fdf099031a2b26c11249953e0b8fd1a66a351388e",
+      "bytes": 827,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck-linear.xml",
+      "role": "handoff_support",
+      "sha256": "53f30dff9e050e6bd500553a8a17c260f38cd40f7e1a8779584be2de18792f52",
+      "bytes": 889,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck-server-dry-run.log",
+      "role": "handoff_support",
+      "sha256": "002848d63b04b108960f9ad27c5215affe4f444faf6076e79bf5187b8c45db50",
+      "bytes": 1344,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck_linear-exit.json",
+      "role": "handoff_support",
+      "sha256": "df4d721d233a2334088d2d2e0110346ae9e509ff46bf0b379fbcfa85c715af4d",
+      "bytes": 18,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck_linear.log",
+      "role": "handoff_support",
+      "sha256": "1516cd3dfd9874b116bfa9a5dddbe914da03bfe4bed459eb33b7ecdecca1dc26",
+      "bytes": 1205,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/client-dry-run.log",
+      "role": "handoff_support",
+      "sha256": "219a07a68c5cf5972da8f7e9016c7021cd7569447c2ec278ece97957ebe4bbfb",
+      "bytes": 2208,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/commands.json",
+      "role": "handoff_support",
+      "sha256": "120920255506b61a8cfc4156b18a623647fd59f67d38d9ab04e1cc48ac4ecffc",
+      "bytes": 1326,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/final-idle.txt",
+      "role": "handoff_support",
+      "sha256": "9faf6068b07a41852d64a0026a129770cab52e4d1de992cd9e5ebe24cbe069a0",
+      "bytes": 396,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa-exit.json",
+      "role": "handoff_support",
+      "sha256": "df4d721d233a2334088d2d2e0110346ae9e509ff46bf0b379fbcfa85c715af4d",
+      "bytes": 18,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa-server-dry-run.log",
+      "role": "handoff_support",
+      "sha256": "002848d63b04b108960f9ad27c5215affe4f444faf6076e79bf5187b8c45db50",
+      "bytes": 1344,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa.json",
+      "role": "handoff_support",
+      "sha256": "e0ce44ec19db65a005d8fdc6e014ff7eb903f91bd96817f3c0516bd4ce4d604c",
+      "bytes": 653,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa.log",
+      "role": "handoff_support",
+      "sha256": "3611e28643b2a3939125ff73007da708874497703c4bd1c2ceecaf3a76c4af24",
+      "bytes": 503,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/handoff-verification.json",
+      "role": "handoff_support",
+      "sha256": "c2840a216e342c05e2d2d646b7e92a5e0242ff8f73872d2b853fc0e9d9a3fd3a",
+      "bytes": 279,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/idle-after.txt",
+      "role": "handoff_support",
+      "sha256": "9faf6068b07a41852d64a0026a129770cab52e4d1de992cd9e5ebe24cbe069a0",
+      "bytes": 396,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/idle-before.txt",
+      "role": "handoff_support",
+      "sha256": "9faf6068b07a41852d64a0026a129770cab52e4d1de992cd9e5ebe24cbe069a0",
+      "bytes": 396,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/idle-after.txt",
+      "role": "handoff_support",
+      "sha256": "9faf6068b07a41852d64a0026a129770cab52e4d1de992cd9e5ebe24cbe069a0",
+      "bytes": 396,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/idle-before.txt",
+      "role": "handoff_support",
+      "sha256": "9faf6068b07a41852d64a0026a129770cab52e4d1de992cd9e5ebe24cbe069a0",
+      "bytes": 396,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/results.json",
+      "role": "handoff_support",
+      "sha256": "33896d2a048123a00c40cf2f936f4ab23b2645963c71ee2fea329030ee63145a",
+      "bytes": 8170,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/run.log",
+      "role": "handoff_support",
+      "sha256": "cff1610841ad193e2d37b459fa9c40afe6ccf10fc81b3b1d6285cff3920161c4",
+      "bytes": 1299,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/validation_20261029/verification.json",
+      "role": "handoff_support",
+      "sha256": "cf18f1a3167b5ef0450c3d08c161e10d9c24eb055fb2309e5561008dd3e61b07",
+      "bytes": 1061,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/repro_flypa_ck_prefill/source-manifest.json",
+      "role": "handoff_support",
+      "sha256": "e31a7341bf73b53fa48c132ac1066b1ec63055fc8c1268c1e860eec0deceb46d",
+      "bytes": 1729,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/rocm7.2.4-decode-analysis/mi325x_h200_optimization_20261028/test_prefill_candidate.py",
+      "role": "handoff_support",
+      "sha256": "07b0394b97d11890d8c991a9dd5084c3f3ec8a8ce617b2a5e0075c5edf3f683f",
+      "bytes": 1997,
+      "git_mode": "100755"
+    },
+    {
+      "path": "python/sglang/srt/layers/attention/utils.py",
+      "role": "already_in_base",
+      "sha256": "dde8c9c5261a1f78add6420f8389140577bac1974c4016d30c3dc571f0093750",
+      "bytes": 54574,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/layers/attention/flydsl_helpers.py",
+      "role": "already_in_base",
+      "sha256": "927afc99d8071733b56b203945c270d7b82cef957cf06d96b724f1fac83d5143",
+      "bytes": 26510,
+      "git_mode": "100644"
+    },
+    {
+      "path": "test/registered/attention/test_mimo_flypa_nan_tail.py",
+      "role": "already_in_base",
+      "sha256": "a20102e161f49605124b51d2474b95ea94026caccf6f9ac737fdd294eafc3d32",
+      "bytes": 7075,
+      "git_mode": "100644"
+    },
+    {
+      "path": "test/registered/attention/test_mimo_flydsl_full_decode.py",
+      "role": "already_in_base",
+      "sha256": "a7f2494656c764676cfbca5f5ad6078e09b32fe2a517910589964c9bb1604156",
+      "bytes": 6065,
+      "git_mode": "100644"
+    },
+    {
+      "path": "test/registered/attention/test_aiter_mimo_vectorized_5d.py",
+      "role": "already_in_base",
+      "sha256": "27ff1325609ed86d4140e42e1cc9713fcde3b22928b0ee24e18af3a8d2f43670",
+      "bytes": 134280,
+      "git_mode": "100644"
+    },
+    {
+      "path": "python/sglang/srt/batch_overlap/two_batch_overlap.py",
+      "role": "already_in_base",
+      "sha256": "4548db9502a6aa2ea10d7b2d4c98a095feaf9a96ddd02553e2042305def5750e",
+      "bytes": 48668,
+      "git_mode": "100644"
+    },
+    {
+      "path": "evaluation/run_benchmark_mimo_pro_prefill.sh",
+      "role": "already_in_base",
+      "sha256": "9162cbafaf0081a1e5f768bf24bf64c924b4ef12d3cf0b7cc4416e4301fb4c0e",
+      "bytes": 10892,
+      "git_mode": "100755"
+    },
+    {
+      "path": "evaluation/run_evalscope_gsm8k_accuracy.py",
+      "role": "already_in_base",
+      "sha256": "a370151b9ad827b5d5c7c376e230c11b1837a1c14fcb81f5174a79591a7ee219",
+      "bytes": 23333,
+      "git_mode": "100755"
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa_handoff_code/patches/aiter-local.patch",
+      "role": "handoff_support",
+      "git_mode": "100644",
+      "sha256": "5833350244a4d21139332ac257dcf3383be64c950bc742fb3be68148d6785588",
+      "bytes": 8841
+    },
+    {
+      "path": "evaluation/mimo_v26_flash/flypa_handoff_code/patches/composable-kernel-local.patch",
+      "role": "handoff_support",
+      "git_mode": "100644",
+      "sha256": "c1ae601ad6547b32ef3c030faea40f1ec9f4d536118556d72f8883bf0fff797b",
+      "bytes": 20369
+    }
+  ],
+  "dependencies": {
+    "aiter_head": "2b81433bbff27020ce98271b992a1aab93a5f3db",
+    "aiter_remote": "https://github.com/sammysun0711/aiter",
+    "ck_head": "af9e1d1f1ae347c22feeb08fd2d42645075e0c5d",
+    "aiter_files": [
+      {
+        "path": "aiter/ops/mha.py",
+        "role": "tracked_dependency",
+        "sha256": "441f18fa726f24d418808fcd37d066a97d0350c7d4d2065aa323908997569474",
+        "bytes": 147727,
+        "git_mode": "100644"
+      },
+      {
+        "path": "csrc/include/custom_all_reduce.cuh",
+        "role": "local_environment_snapshot",
+        "sha256": "d5aeaab9fd856d3038adc8df04208401602d07748d2c218ff0bb3c996eedbc7d",
+        "bytes": 235241,
+        "git_mode": "100644"
+      }
+    ],
+    "ck_files": [
+      {
+        "path": "example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py",
+        "role": "local_ck_patch",
+        "sha256": "7c215feea0dcccbcc05b138d6169bf0cb14ee3ec724427d50314665d7b4ef03c",
+        "bytes": 50732,
+        "git_mode": "100644"
+      },
+      {
+        "path": "include/ck_tile/core/tensor/tile_scatter_gather.hpp",
+        "role": "local_ck_patch",
+        "sha256": "fc121aba4d84453a3f0b6512978bd1e588f9ab5a04823badfec51b694e705723",
+        "bytes": 74910,
+        "git_mode": "100644"
+      },
+      {
+        "path": "include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp",
+        "role": "local_ck_patch",
+        "sha256": "808c463835e222c664486335e29c72e7bd37e46162bffe596eb522e2eb42dfee",
+        "bytes": 60677,
+        "git_mode": "100644"
+      }
+    ],
+    "runtime_files": [
+      {
+        "path": "python/torch/lib/libamdhip64.so",
+        "sha256": "f1043337461c8e54ee135e95fa979a7d0e4344676ad5b0554652f844f8f098ac",
+        "bytes": 27193296
+      },
+      {
+        "path": "python/torch/lib/libhsa-runtime64.so",
+        "sha256": "b8cdfe93d343649a35c1daf73a0a3a6840f09379ebeee9be65670461ffea43f4",
+        "bytes": 4248144
+      },
+      {
+        "path": "python/torch/lib/libroctracer64.so",
+        "sha256": "c7c71117051dd8874e326dc4c2bdeb2a06eacfdf37f10d046beb95ff30cdae11",
+        "bytes": 347896
+      },
+      {
+        "path": "python/torch/lib/librocprofiler-register.so",
+        "sha256": "1a23a2b5a62dc7feee9259b9a307bca94caef7cfbaebc7b1b20a0289ed7e69f0",
+        "bytes": 590232
+      }
+    ],
+    "dataset": {
+      "source_path": "/root/workspace/rocm7.2.4/sglang/evaluation/data/ShareGPT_V3_unfiltered_cleaned_split.json",
+      "bytes": 672837942,
+      "sha256": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
+      "included": false
+    },
+    "model_root": "/models/MiMo-V2.6-Flash-MOPD",
+    "model_included": false,
+    "runtime_overlay_included": false
+  },
+  "validation_scope": "CPU-only source/file/patch checks. No GPU calls, imports or new performance validation.",
+  "restore_stages_ignored_support_files": true,
+  "commit_scope": "The10 original worktree changes, handoff assets, and AITER/CK dependency patches. GPU validation remains historical."
+}

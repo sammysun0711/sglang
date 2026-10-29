@@ -4,6 +4,7 @@ from __future__ import annotations
 end to end attention solution with aiter kernels
 """
 
+import inspect
 import logging
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -75,6 +76,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_target_verify_flydsl_5d,
     forward_target_verify_vectorized_5d,
     get_flydsl_mimo_num_partitions,
+    get_flydsl_mimo_decode_variants,
     load_flydsl_pa_decode_kernels,
     prepare_flydsl_dflash_swa,
     prepare_flydsl_swa_forward_metadata,
@@ -323,6 +325,8 @@ class AiterAttnBackend(AttentionBackend):
         self._flydsl_pa_decode_context_lengths = None
         self._flydsl_pa_decode_workspace_max_bs = 0
         self._flydsl_pa_decode_num_partitions = FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS
+        self._flydsl_pa_decode_max_num_partitions = FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS
+        self._flydsl_pa_decode_tuned = False
         self._flydsl_pa_decode_query_length = int(self.num_draft_tokens or 4)
         self._flydsl_pa_decode_compiled = False
         self._configure_flydsl_pa_decode(max_bs)
@@ -447,8 +451,19 @@ class AiterAttnBackend(AttentionBackend):
             return
 
         self._flydsl_pa_decode_num_partitions = get_flydsl_mimo_num_partitions()
+        self._flydsl_pa_decode_tuned = get_bool_env_var(
+            "SGLANG_FLYDSL_PA_TUNED_DECODE", "false"
+        )
+        self._flydsl_pa_decode_max_num_partitions = max(
+            self._flydsl_pa_decode_num_partitions,
+            64 if self._flydsl_pa_decode_tuned else 0,
+        )
 
         incompatibilities = []
+        if self._flydsl_pa_decode_tuned and (
+            not is_gfx942_supported() or self.kv_cache_dtype != torch.bfloat16
+        ):
+            incompatibilities.append("tuned decode currently requires gfx942 and BF16 KV")
         if self.use_mla:
             incompatibilities.append("MLA is unsupported")
         if self.topk != 1:
@@ -495,6 +510,10 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         kernels = load_flydsl_pa_decode_kernels()
+        if self._flydsl_pa_decode_tuned and "query_splits" not in inspect.signature(
+            kernels.pa_decode_tile
+        ).parameters:
+            raise RuntimeError("Tuned FlyDSL PA requires query_splits support in AITER")
         self._flydsl_pa_decode_tile = kernels.pa_decode_tile
         self._flydsl_compile_pa_decode_tile = kernels.compile_pa_decode_tile
         self._flydsl_compile_pa_decode_reduce = kernels.compile_pa_decode_reduce
@@ -507,13 +526,14 @@ class AiterAttnBackend(AttentionBackend):
             "Enabled MiMo FlyDSL PA decode on target worker: full "
             "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=%s, "
             "ordinary full decode=FlyDSL; runtime=%s (%s), kernel=%s, "
-            "partitions=%d, workspace_max_bs=%d",
+            "partitions=%d, workspace_max_bs=%d, tuned_decode=%s",
             "FlyDSL" if flydsl_target_verify_swa_enabled() else "AITER",
             kernels.version,
             kernels.runtime_path,
             kernels.kernel_path,
             self._flydsl_pa_decode_num_partitions,
             self._flydsl_pa_decode_workspace_max_bs,
+            self._flydsl_pa_decode_tuned,
         )
 
     def _ensure_flydsl_pa_decode_workspace(self, max_bs: int) -> None:
@@ -529,7 +549,7 @@ class AiterAttnBackend(AttentionBackend):
         scalar_numel = (
             max_bs
             * FLYDSL_MIMO_KV_HEADS
-            * self._flydsl_pa_decode_num_partitions
+            * self._flydsl_pa_decode_max_num_partitions
             * self._flydsl_pa_decode_query_length
             * (self.num_head // self.num_kv_head)
         )
@@ -597,8 +617,16 @@ class AiterAttnBackend(AttentionBackend):
             compile_kwargs["query_length"] = query_length
             if not self._flydsl_pa_decode_reduce_uses_runtime_query_length:
                 reduce_kwargs["query_seq_len"] = query_length
-            self._flydsl_compile_pa_decode_tile(**compile_kwargs)
-            self._flydsl_compile_pa_decode_reduce(**reduce_kwargs)
+            for partitions, query_splits in get_flydsl_mimo_decode_variants(
+                self, query_length
+            ):
+                compile_kwargs["num_partitions"] = partitions
+                reduce_kwargs["max_context_partition_num"] = partitions
+                self._flydsl_compile_pa_decode_tile(
+                    **compile_kwargs,
+                    **({"query_splits": query_splits} if query_splits is not None else {}),
+                )
+                self._flydsl_compile_pa_decode_reduce(**reduce_kwargs)
         warmup_flydsl_full_decode(self)
         self._flydsl_pa_decode_compiled = True
 

@@ -1,0 +1,22 @@
+{
+  "libamdhip64.so": {
+    "source": "/opt/rocm-7.2.4/lib/libamdhip64.so.7.2.70204",
+    "previous_sha256": "13da62fef5f7279a8d045b12e5e91d5c98d01cf6785db557c3a3b0d3255f929c",
+    "sha256": "f1043337461c8e54ee135e95fa979a7d0e4344676ad5b0554652f844f8f098ac"
+  },
+  "libhsa-runtime64.so": {
+    "source": "/opt/rocm-7.2.4/lib/libhsa-runtime64.so.1.18.70204",
+    "previous_sha256": "793a87df844171f7247faffb957347b55779cf68875e4d8624c7d6d32ed191a9",
+    "sha256": "b8cdfe93d343649a35c1daf73a0a3a6840f09379ebeee9be65670461ffea43f4"
+  },
+  "libroctracer64.so": {
+    "source": "/opt/rocm-7.2.4/lib/libroctracer64.so.4.1.70204",
+    "previous_sha256": "b4ccab93373c3dc339da0d7739c4e937b9f6f38dd069315b7c8ae319ffeeba82",
+    "sha256": "c7c71117051dd8874e326dc4c2bdeb2a06eacfdf37f10d046beb95ff30cdae11"
+  },
+  "librocprofiler-register.so": {
+    "source": "/opt/rocm-7.2.4/lib/librocprofiler-register.so.0.6.0",
+    "previous_sha256": "8dcc9575cd14dbbcc9e7788abf88ae4723def34ba70f3130a6dac3ea6cb41645",
+    "sha256": "1a23a2b5a62dc7feee9259b9a307bca94caef7cfbaebc7b1b20a0289ed7e69f0"
+  }
+}

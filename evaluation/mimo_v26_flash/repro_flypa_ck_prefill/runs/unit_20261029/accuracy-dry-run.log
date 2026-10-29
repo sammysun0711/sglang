@@ -1,0 +1,4 @@
+evalscope eval --model /models/MiMo-V2.6-Flash-MOPD/ --model-id MiMo-V2.6-Flash-MOPD --eval-type openai_api --api-url http://127.0.0.1:30001/v1 --api-key '<redacted>' --datasets gsm8k --dataset-dir /root/workspace/rocm7.2.4/sglang/evaluation/evalscope_cache --dataset-hub huggingface --dataset-args '{"gsm8k": {"dataset_id": "openai/gsm8k", "subset_list": ["main"], "few_shot_num": 4}}' --eval-batch-size 32 --seed 12345 --generation-config temperature=0.0,top_p=1.0,max_tokens=8192,seed=12345,stream=False,timeout=1800,retries=1 --work-dir /root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/dry_accuracy/evalscope --no-timestamp
+Acceptance gate: 4.0; accuracy threshold: 0.97
+Required EvalScope: 1.11.0; auto-install: True
+Dry run: no server requests or output files created.

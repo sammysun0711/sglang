@@ -1,0 +1,23 @@
+Benchmark preset: mimo_v26_flash; dry run: 1
+Client matrix: MiMo-v2.6-Flash-H200-prefill-data.csv; input K=1024 tokens.
+Record actual server topology, effective chunk size, TBO, quantization, and backends with results.
+
+============================================================
+Testing: Input Token = 8192, Output Token = 1, Concurrency = 32 | Run 1
+Measured prompts = 1024, warmups = 32
+Log file: benchmark_8192_con32.log
+============================================================
+Command: python3 -m sglang.bench_serving --backend sglang --model /models/MiMo-V2.6-Flash-MOPD/ --host 127.0.0.1 --port 30001 --dataset-name random --random-input-len 8192 --random-output-len 1 --random-range-ratio 1.0 --flush-cache --seed 12345 --num-prompts 1024 --warmup-requests 32 --max-concurrency 32 --tokenize-prompt --dataset-path /root/workspace/rocm7.2.4/sglang/evaluation/data/ShareGPT_V3_unfiltered_cleaned_split.json --output-details --output-file /root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/dry_client.jsonl
+============================================================
+
+
+============================================================
+Testing: Input Token = 65536, Output Token = 1, Concurrency = 32 | Run 1
+Measured prompts = 256, warmups = 32
+Log file: benchmark_65536_con32.log
+============================================================
+Command: python3 -m sglang.bench_serving --backend sglang --model /models/MiMo-V2.6-Flash-MOPD/ --host 127.0.0.1 --port 30001 --dataset-name random --random-input-len 65536 --random-output-len 1 --random-range-ratio 1.0 --flush-cache --seed 12345 --num-prompts 256 --warmup-requests 32 --max-concurrency 32 --tokenize-prompt --dataset-path /root/workspace/rocm7.2.4/sglang/evaluation/data/ShareGPT_V3_unfiltered_cleaned_split.json --output-details --output-file /root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/dry_client.jsonl
+============================================================
+
+Dry run complete; no benchmark requests sent.
+bash: /opt/venv/lib/python3.12/site-packages/torch/lib/libtinfo.so.6: no version information available (required by bash)

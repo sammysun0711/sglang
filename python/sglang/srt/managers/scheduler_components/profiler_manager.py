@@ -48,6 +48,7 @@ class SchedulerProfilerManager:
     ps: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
+    tensor_cpu_group: Any = None
 
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
@@ -158,12 +159,33 @@ class SchedulerProfilerManager:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _profile_cpu_group(self, stage: Optional[ForwardMode]):
+        # Stage requests can be attention-group local. Manual requests cover
+        # all tensor work, including MoE ranks in the other attention groups.
+        if stage is None and self.tensor_cpu_group is not None:
+            return self.tensor_cpu_group
+        return self.dp_tp_cpu_group
+
+    def _synchronize_profile_boundary(self, stage: Optional[ForwardMode]) -> None:
+        # Manual control requests reach every TP rank between scheduler steps.
+        # Finish queued HIP graphs/collectives before enabling or draining the
+        # tracer. Stage-based profiling can involve only a subset of ranks, so
+        # it must not acquire an additional full-TP barrier here.
+        if (
+            stage is None
+            and torch.version.hip is not None
+            and "GPU" in (self.profiler_activities or [])
+        ):
+            torch.cuda.synchronize()
+            torch.distributed.barrier(self._profile_cpu_group(stage))
+
     def _start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.manual_start()
 
+        self._synchronize_profile_boundary(stage)
         stage_str = f" for {stage.name}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
@@ -205,7 +227,7 @@ class SchedulerProfilerManager:
                 schema.writeSchema(connection)
                 connection.commit()
                 del connection
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.distributed.barrier(self._profile_cpu_group(stage))
 
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
@@ -307,6 +329,7 @@ class SchedulerProfilerManager:
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
+        self._synchronize_profile_boundary(stage)
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
             if not _is_npu:
@@ -331,14 +354,14 @@ class SchedulerProfilerManager:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.distributed.barrier(self._profile_cpu_group(stage))
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
 
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.distributed.barrier(self._profile_cpu_group(stage))
             if self.ps.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 

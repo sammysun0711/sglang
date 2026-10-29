@@ -1,0 +1,42 @@
+{
+  "environment": {
+    "PYTHONPATH": "/root/workspace/rocm7.2.4/runtime724/python:/root/workspace/rocm7.2.4/sglang-mimo-ck-prefill/python:/root/workspace/rocm7.2.4/aiter",
+    "SPT_NOENV": "1",
+    "SGLANG_USE_AITER": "1",
+    "AITER_USE_SYSTEM_TRITON": "1",
+    "SGLANG_DISABLE_CUDNN_CHECK": "1"
+  },
+  "cwd": "/root/workspace/rocm7.2.4/sglang-mimo-ck-prefill",
+  "commands": [
+    [
+      "ck_linear",
+      [
+        "/opt/venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "test/manual/test_mimo_ck_linear_prefill.py",
+        "--junitxml=/root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/ck-linear.xml"
+      ]
+    ],
+    [
+      "flypa",
+      [
+        "/opt/venv/bin/python",
+        "/root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/rocm7.2.4-decode-analysis/mi325x_h200_optimization_20261028/test_prefill_candidate.py",
+        "--source-root",
+        "/root/workspace/rocm7.2.4/sglang-mimo-ck-prefill",
+        "--cooperative-v",
+        "0",
+        "--manual-schedule",
+        "0",
+        "--cta-multiplier",
+        "1",
+        "--workgroup-waves",
+        "8",
+        "--output",
+        "/root/workspace/rocm7.2.4/sglang/evaluation/mimo_v26_flash/repro_flypa_ck_prefill/runs/unit_20261029/flypa.json"
+      ]
+    ]
+  ]
+}

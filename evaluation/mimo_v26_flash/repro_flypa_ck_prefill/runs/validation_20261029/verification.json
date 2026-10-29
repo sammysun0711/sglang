@@ -1,0 +1,34 @@
+{
+  "passed": true,
+  "source_hashes_match": true,
+  "loaded_overlay_hashes_match": true,
+  "historical_output_hash_checks": [
+    {
+      "query_tokens": 32768,
+      "kv_tokens": 32768,
+      "flypa_historical_output_hash_match": true,
+      "ck_with_gather_historical_output_hash_match": true
+    },
+    {
+      "query_tokens": 32768,
+      "kv_tokens": 65536,
+      "flypa_historical_output_hash_match": true,
+      "ck_with_gather_historical_output_hash_match": true
+    },
+    {
+      "query_tokens": 32768,
+      "kv_tokens": 262144,
+      "flypa_historical_output_hash_match": true,
+      "ck_with_gather_historical_output_hash_match": true
+    },
+    {
+      "query_tokens": 18432,
+      "kv_tokens": 378880,
+      "flypa_historical_output_hash_match": true,
+      "ck_with_gather_historical_output_hash_match": true
+    }
+  ],
+  "sglang_import_blocked_probe_passed": true,
+  "benchmark_sha256": "b85449ad06a93ba32e7815b7df7d21d4beeedbc5a38303fdce0110c5e8a97efd",
+  "run_sh_sha256": "eccfd81fe2e51b4ce8f1723ebe92ee69a63148d55c628915c1730b4079ffd2b7"
+}

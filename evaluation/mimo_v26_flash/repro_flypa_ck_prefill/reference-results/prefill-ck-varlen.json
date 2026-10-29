@@ -1,0 +1,105 @@
+{
+  "backend": "ck_varlen",
+  "cooperative_v": 0,
+  "manual_schedule": 0,
+  "cta_multiplier": 1,
+  "workgroup_waves": 8,
+  "records": [
+    {
+      "query_length": 32768,
+      "kv_length": 32768,
+      "median_ms": 8.722235679626465,
+      "samples_ms": [
+        9.198431015014648,
+        8.848825454711914,
+        8.722235679626465,
+        8.658059120178223,
+        8.61535358428955
+      ],
+      "errors": {
+        "max_abs_error": 0.022225379943847656,
+        "relative_rms": 0.002993919886648655
+      },
+      "replay_errors": {
+        "max_abs_error": 0.019005537033081055,
+        "relative_rms": 0.0029879421927034855
+      },
+      "output_sha256": "06375c1704fe4065dd560f8b479a859f6c0028041ab97990ea72ea7ff07af689",
+      "changed_query_output_sha256": "3fffb5d1f37413916ce174887c26e300d608ade16fcd6d80c953cc34043424bf",
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02
+    },
+    {
+      "query_length": 32768,
+      "kv_length": 65536,
+      "median_ms": 26.903173446655273,
+      "samples_ms": [
+        26.913707733154297,
+        26.893280029296875,
+        26.903173446655273,
+        26.94655990600586,
+        26.902009963989258
+      ],
+      "errors": {
+        "max_abs_error": 0.00026192888617515564,
+        "relative_rms": 0.006117773242294788
+      },
+      "replay_errors": {
+        "max_abs_error": 0.0003308802843093872,
+        "relative_rms": 0.006146047729998827
+      },
+      "output_sha256": "41a42c6cfc421ca215e572081bf8eb775d01e9687c3b689d11d65038e4de5b61",
+      "changed_query_output_sha256": "4c25eba0cc4d096500316d5fe4ffcf88d919c57456317c643217277f864b8450",
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02
+    },
+    {
+      "query_length": 32768,
+      "kv_length": 262144,
+      "median_ms": 132.80397033691406,
+      "samples_ms": [
+        132.80397033691406,
+        140.94798278808594,
+        132.43853759765625,
+        132.79776000976562,
+        132.81378173828125
+      ],
+      "errors": {
+        "max_abs_error": 9.850040078163147e-05,
+        "relative_rms": 0.006170523818582296
+      },
+      "replay_errors": {
+        "max_abs_error": 9.907130151987076e-05,
+        "relative_rms": 0.006088133901357651
+      },
+      "output_sha256": "9e3fa6ed30b81bd34a194fce6650176f181b943fe923fd483d746b27d69d2387",
+      "changed_query_output_sha256": "0569f4eb19bf3c557207e2da13c6ae714dc0e0f60c12209e99c3de23fbf9fa71",
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02
+    },
+    {
+      "query_length": 18432,
+      "kv_length": 378880,
+      "median_ms": 114.13249969482422,
+      "samples_ms": [
+        113.64976501464844,
+        114.13249969482422,
+        114.15664672851562,
+        114.19426727294922,
+        114.12725067138672
+      ],
+      "errors": {
+        "max_abs_error": 9.24849882721901e-05,
+        "relative_rms": 0.006146377418190241
+      },
+      "replay_errors": {
+        "max_abs_error": 9.015761315822601e-05,
+        "relative_rms": 0.006122269667685032
+      },
+      "output_sha256": "164f7a4f2961809d44269b53d81e5bc7a948471f6f273d4050d0f32a8494735e",
+      "changed_query_output_sha256": "bc0d63757ead1f86b162479649fb3861767796f890e2ae17d63a52802d7dad54",
+      "reference_atol": 0.02,
+      "reference_rtol": 0.02
+    }
+  ]
+}

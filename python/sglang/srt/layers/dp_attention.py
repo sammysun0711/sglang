@@ -23,6 +23,8 @@ from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_moe_data_parallel_world_size,
+    get_moe_expert_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -49,6 +51,10 @@ _DP_MAX_LEN_WITH_IDLE = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_USE_FUSED_DP_BUFFER_COPY = _is_hip and get_bool_env_var("SGLANG_DP_FUSED_BUFFER_COPY")
+_USE_HIERARCHICAL_DP_COMM = _is_hip and get_bool_env_var(
+    "SGLANG_DP_HIERARCHICAL_COMM"
+)
 
 
 class DpPaddingMode(IntEnum):
@@ -469,6 +475,60 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+@triton.jit
+def _copy_and_zero_dp_buffer_kernel(
+    dst_ptr,
+    src_ptr,
+    offset_ptr,
+    sz_ptr,
+    dst_numel,
+    src_numel,
+    chunk_size: tl.constexpr,
+    offset_src: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Traverse the destination so every element is written exactly once.
+    # Offset and length remain device inputs for graph replay with padding.
+    index = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
+    size = tl.load(sz_ptr).to(tl.int64) * chunk_size
+    if offset_src:
+        source_index = index + offset
+        copy = index < size
+    else:
+        source_index = index - offset
+        copy = (source_index >= 0) & (source_index < size)
+    value = tl.load(
+        src_ptr + source_index,
+        mask=(
+            copy
+            & (index < dst_numel)
+            & (source_index >= 0)
+            & (source_index < src_numel)
+        ),
+        other=0,
+    )
+    tl.store(dst_ptr + index, value, mask=index < dst_numel)
+
+
+def _copy_and_zero_dp_buffer(dst, src, offset, size, *, offset_src):
+    assert dst.shape[1:] == src.shape[1:]
+    if dst.numel() == 0:
+        return
+    block = 8192
+    _copy_and_zero_dp_buffer_kernel[(triton.cdiv(dst.numel(), block),)](
+        dst,
+        src,
+        offset,
+        size,
+        dst.numel(),
+        src.numel(),
+        prod(src.shape[1:]),
+        offset_src,
+        block,
+    )
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -477,18 +537,32 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
+    copy_local = local_tokens.shape[0] > 0 and (
+        is_partial or get_attention_tp_rank() == 0
+    )
+    if not (_USE_FUSED_DP_BUFFER_COPY and copy_local):
+        global_tokens.fill_(0)
+
+    if copy_local:
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-        )
+        if _USE_FUSED_DP_BUFFER_COPY:
+            _copy_and_zero_dp_buffer(
+                global_tokens,
+                local_tokens,
+                local_start_pos,
+                local_num_tokens,
+                offset_src=False,
+            )
+        else:
+            memcpy_triton(
+                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -522,6 +596,109 @@ def _dp_gather_via_all_gather(
     ]
     get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+
+
+def should_use_dp_hierarchical_communication(
+    forward_batch: Optional[ForwardBatch] = None,
+) -> bool:
+    """Select a bulk SUM_LEN transport using only globally agreed CPU metadata.
+
+    Attention and MoE retain their original token counts. Small, idle, or
+    strongly uneven batches use the existing path. All ranks must make the
+    same gather/combine decision.
+    """
+    if not _USE_HIERARCHICAL_DP_COMM:
+        return False
+    if forward_batch is not None:
+        mode = forward_batch.dp_padding_mode
+        if mode is None or not mode.is_sum_len():
+            return False
+    elif is_dp_max_padding():
+        return False
+    if (
+        not get_is_extend_in_batch()
+        or get_attention_cp_size() != 1
+        or get_attention_dp_size() <= 1
+        or get_attention_tp_size() <= 1
+        or get_local_attention_dp_size() != get_attention_dp_size()
+        or get_moe_data_parallel_world_size() != 1
+        or get_moe_expert_parallel_world_size() != 1
+        or get_tensor_model_parallel_world_size()
+        != get_attention_dp_size() * get_attention_tp_size()
+        or get_dp_dtype() not in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return False
+    sizes = get_dp_global_num_tokens()
+    if sizes is None or len(sizes) != get_attention_dp_size():
+        return False
+    tp_size = get_attention_tp_size()
+    if any(n <= 0 or n % tp_size for n in sizes):
+        return False
+    total_rows = sum(sizes)
+    max_rows = max(sizes) * len(sizes)
+    # Exact-size variable collectives lose to all-reduce at high imbalance.
+    # Retain the measured near-balanced range and avoid small inputs.
+    return (
+        total_rows * 9 >= max_rows * 8
+        and total_rows
+        * get_dp_hidden_size()
+        * (4 if get_dp_dtype() == torch.float32 else 2)
+        >= 64 * 1024 * 1024
+    )
+
+
+def _dp_gather_via_hierarchical_collectives(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    is_partial: bool,
+):
+    """Exact-size TP-local reduction followed by a global variable gather."""
+    assert local_tokens.is_contiguous() and global_tokens.is_contiguous()
+    sizes = get_dp_global_num_tokens()
+    local_rows = sizes[get_attention_dp_rank()]
+    tp_size = get_attention_tp_size()
+    contribute = is_partial or get_attention_tp_rank() == 0
+    if contribute and local_tokens.shape[0] >= local_rows:
+        local_input = local_tokens[:local_rows]
+    else:
+        local_input = local_tokens.new_zeros((local_rows, *local_tokens.shape[1:]))
+        if contribute:
+            local_input[: local_tokens.shape[0]].copy_(local_tokens)
+    shard = local_input.new_empty((local_rows // tp_size, *local_input.shape[1:]))
+    if local_rows:
+        get_attention_tp_group().reduce_scatter_tensor(shard, local_input)
+    shard_sizes = [n // tp_size for n in sizes for _ in range(tp_size)]
+    # Keep this bulk transport on RCCL. The global group's automatic gather can
+    # admit a 64 MiB shard to AITER's 1 GiB gather pool, independently of its
+    # 64 MiB all-reduce cutoff. That is a different path from the measured RCCL
+    # hierarchy and adds staging to the new 512 MiB gather.
+    comm = get_tp_group().pynccl_comm
+    with comm.change_state(enable=True):
+        comm.all_gather(
+            global_tokens,
+            shard,
+            sizes=None if all(n == sizes[0] for n in sizes) else shard_sizes,
+        )
+
+
+def dp_hierarchical_reduce_scatter(output: torch.Tensor, input: torch.Tensor):
+    """Replace the global MoE all-reduce, then replicate the reduced local rows.
+
+    The residual already belongs to attention TP and must not be reduced again.
+    """
+    sizes = get_dp_global_num_tokens()
+    tp_size = get_attention_tp_size()
+    local_rows = sizes[get_attention_dp_rank()]
+    shard_sizes = [n // tp_size for n in sizes for _ in range(tp_size)]
+    shard = input.new_empty((local_rows // tp_size, *input.shape[1:]))
+    assert input.shape[0] == sum(sizes)
+    assert output.shape[0] == local_rows
+    if all(n == sizes[0] for n in sizes):
+        get_tp_group().reduce_scatter_tensor(shard, input)
+    else:
+        get_tp_group().reduce_scatterv(input, output=shard, sizes=shard_sizes)
+    if local_rows:
+        get_attention_tp_group().all_gather_into_tensor(output, shard)
 
 
 # Variable-length DP-MoE gather (reference https://github.com/ROCm/ATOM/pull/930): instead of padding every
@@ -596,6 +773,13 @@ def _dp_gather(
     is_partial: bool,
 ):
     if (
+        should_use_dp_hierarchical_communication(forward_batch)
+        and global_tokens.shape == (sum(get_dp_global_num_tokens()), get_dp_hidden_size())
+        and local_tokens.dtype == get_dp_dtype()
+    ):
+        _dp_gather_via_hierarchical_collectives(global_tokens, local_tokens, is_partial)
+        return
+    if (
         is_dp_gatherv_active()
         and forward_batch.dp_padding_mode is not None
         and not forward_batch.dp_padding_mode.is_max_len()
@@ -653,7 +837,8 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    local_tokens.fill_(0)
+    if not _USE_FUSED_DP_BUFFER_COPY:
+        local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
@@ -661,9 +846,18 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
+        if _USE_FUSED_DP_BUFFER_COPY:
+            _copy_and_zero_dp_buffer(
+                local_tokens,
+                global_tokens,
+                local_start_pos,
+                local_num_tokens,
+                offset_src=True,
+            )
+        else:
+            memcpy_triton(
+                local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            )
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

@@ -1,0 +1,19 @@
+Running (32, (1,), (1,), 1, False, 'bf16')
+Passed
+Running (32, (65,), (141,), 1, True, 'bf16')
+Passed
+Running (64, (32,), (70,), 1, False, 'bf16')
+Passed
+Running (64, (64,), (64,), 1, True, 'bf16')
+Passed
+Running (64, (129,), (257,), 2, True, 'bf16')
+Passed
+Running (128, (65,), (141,), 1, True, 'bf16')
+Passed
+Running (128, (257,), (513,), 2, True, 'bf16')
+Passed
+Running (64, (1, 32, 129), (1, 70, 257), 2, True, 'bf16')
+Passed
+Running (64, (32683,), (65451,), 1, True, 'bf16')
+Passed
+11 cases passed

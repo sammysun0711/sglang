@@ -1293,6 +1293,38 @@ def get_flydsl_mimo_num_partitions() -> int:
     return num_partitions
 
 
+def get_flydsl_mimo_decode_config(backend, batch_size: int, query_length: int):
+    """Experimental gfx942 BF16 policy; selection is fixed for each graph batch.
+
+    Do not use device lengths to select a kernel: they change on replay. The
+    existing partition setting remains the fallback for unmeasured shapes.
+    """
+    base = backend._flydsl_pa_decode_num_partitions
+    if not getattr(backend, "_flydsl_pa_decode_tuned", False):
+        return base, None
+    if query_length not in (1, 8):
+        return base, None
+    if batch_size == 1:
+        return 64, 1 if query_length == 1 else 4
+    if query_length == 8:
+        if batch_size >= 128:
+            return 8, 2
+        if batch_size >= 64:
+            return 16, 2
+        if batch_size >= 16:
+            return 32, 2
+    return base, None
+
+
+def get_flydsl_mimo_decode_variants(backend, query_length: int):
+    """All launch configurations that startup must prepare for this phase."""
+    variants = {
+        get_flydsl_mimo_decode_config(backend, bs, query_length)
+        for bs in (1, 2, 16, 64, 128)
+    }
+    return sorted(variants, key=lambda item: (item[0], item[1] or 0))
+
+
 @dataclass(frozen=True)
 class FlyDSLPADecodeKernels:
     pa_decode_tile: Callable
@@ -1983,6 +2015,74 @@ def _mimo_gfx942_paged_swa_prefill(
     )
 
 
+def run_mimo_ck_linear_prefill(
+    backend, q, layer, forward_batch, k_cache, v_cache, metadata
+) -> torch.Tensor:
+    """BF16 full prefill with CK varlen, gathering the existing paged KV slots.
+
+    The public varlen wrapper may choose an ASM backend; call CK explicitly.
+    Keep one gather workspace per stream so overlapping child forwards cannot
+    overwrite each other's K/V. The gather helper gives graph captures their
+    own allocations.
+    """
+    from aiter.ops.mha import mha_varlen_fwd
+
+    batch_size = int(forward_batch.batch_size)
+    lengths = forward_batch.extend_seq_lens_cpu
+    logical_q = sum(int(length) for length in lengths)
+    total_kv = int(forward_batch.seq_lens_sum)
+    if len(lengths) != batch_size or not 0 <= logical_q <= q.shape[0]:
+        raise ValueError("MiMo CK linear prefill has inconsistent query lengths")
+    if logical_q == 0:
+        return q.new_zeros((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+    if (
+        metadata.kv_indices is None
+        or metadata.kv_indices.ndim != 1
+        or metadata.kv_indices.numel() < total_kv
+        or metadata.kv_indptr is None
+        or metadata.kv_indptr.numel() < batch_size + 1
+    ):
+        raise ValueError("MiMo CK linear prefill requires complete request-major KV slots")
+    if not hasattr(backend, "_mimo_ck_linear_workspaces"):
+        backend._mimo_ck_linear_workspaces = {}
+    stream_id = torch.cuda.current_stream(q.device).cuda_stream
+    workspace = backend._mimo_ck_linear_workspaces.setdefault(stream_id, {})
+    k_linear, v_linear = launch_gather_shuffle_5d_to_linear(
+        k_cache, v_cache, metadata.kv_indices[:total_kv], workspace=workspace
+    )
+    output_storage, output_live = _allocate_mimo_asm_output(
+        q, logical_q, q.shape[0], layer.tp_q_head_num, layer.v_head_dim
+    )
+    result = mha_varlen_fwd(
+        q[:logical_q].view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        k_linear,
+        v_linear,
+        backend.qo_indptr[:batch_size + 1],
+        metadata.kv_indptr[:batch_size + 1],
+        int(metadata.max_q_len),
+        int(metadata.max_kv_len),
+        # This is a skip threshold. Zero processes every non-empty request.
+        0,
+        0.0,
+        float(layer.scaling),
+        0.0,
+        False,
+        True,
+        -1,
+        -1,
+        0,
+        False,
+        False,
+        out=output_live,
+    )
+    if result[0].data_ptr() != output_live.data_ptr():
+        raise RuntimeError("MiMo CK linear prefill did not use its output buffer")
+    if not getattr(backend, "_logged_mimo_ck_linear_prefill", False):
+        logger.info("Using experimental CK linear-KV BF16 full prefill on gfx942")
+        backend._logged_mimo_ck_linear_prefill = True
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
 def forward_extend_vectorized_5d(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -2328,6 +2428,13 @@ def forward_extend_vectorized_5d(
         v_buf,
         metadata,
     ):
+        if (
+            get_bool_env_var("SGLANG_MIMO_CK_LINEAR_PREFILL", "false")
+            and backend.kv_cache_dtype == torch.bfloat16
+        ):
+            return run_mimo_ck_linear_prefill(
+                backend, q, layer, forward_batch, k_buf, v_buf, metadata
+            )
         return run_mimo_flypa_prefill(
             backend,
             q,
@@ -2655,8 +2762,10 @@ def _get_flydsl_workspace_views(
     backend: AiterAttnBackend,
     batch_size: int,
     query_length: int,
+    num_partitions: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_partitions = backend._flydsl_pa_decode_num_partitions
+    if num_partitions is None:
+        num_partitions = backend._flydsl_pa_decode_num_partitions
     configured_query_length = int(backend._flydsl_pa_decode_query_length)
     if query_length not in (1, configured_query_length):
         raise RuntimeError(
@@ -2918,8 +3027,11 @@ def _forward_full_flydsl_5d(
                 f"FlyDSL MiMo {name} must be on {device}; got {tensor.device}"
             )
 
-    pmax, psum, pout, context_lengths = _get_flydsl_workspace_views(
+    num_partitions, query_splits = get_flydsl_mimo_decode_config(
         backend, batch_size, query_length
+    )
+    pmax, psum, pout, context_lengths = _get_flydsl_workspace_views(
+        backend, batch_size, query_length, num_partitions
     )
     for name, workspace, dtype in (
         ("pmax", pmax, torch.float32),
@@ -2950,28 +3062,33 @@ def _forward_full_flydsl_5d(
         key_scale=key_scale,
         value_scale=value_scale,
         softmax_scale=layer.scaling,
-        num_partitions=backend._flydsl_pa_decode_num_partitions,
+        num_partitions=num_partitions,
         pmax=pmax,
         psum=psum,
         pout=pout,
+        **({"query_splits": query_splits} if query_splits is not None else {}),
     )
 
 
 def warmup_flydsl_full_decode(backend: AiterAttnBackend) -> None:
-    """Materialize the qlen=1 executable on owned scratch before graph capture.
+    """Materialize selected executables on owned scratch before graph capture.
 
     AITER's compile_pa_decode_tile returns a JIT launcher; the first call with
     tensor arguments compiles its executable. Preparing only that factory
     leaves ordinary decode cold when startup captures TARGET_VERIFY instead.
     """
     vector = 8 if backend.kv_cache_dtype == torch.bfloat16 else 16
+    query_lengths = {1}
+    if getattr(backend, "_flydsl_pa_decode_tuned", False):
+        query_lengths.add(backend._flydsl_pa_decode_query_length)
+    max_query_length = max(query_lengths)
     q = torch.zeros(
-        (1, FLYDSL_MIMO_QUERY_HEADS, FLYDSL_MIMO_HEAD_DIM),
+        (max_query_length, FLYDSL_MIMO_QUERY_HEADS, FLYDSL_MIMO_HEAD_DIM),
         dtype=torch.bfloat16,
         device=backend.device,
     )
     output = torch.empty(
-        (1, FLYDSL_MIMO_QUERY_HEADS, FLYDSL_MIMO_VALUE_HEAD_DIM),
+        (max_query_length, FLYDSL_MIMO_QUERY_HEADS, FLYDSL_MIMO_VALUE_HEAD_DIM),
         dtype=torch.bfloat16,
         device=backend.device,
     )
@@ -2986,28 +3103,35 @@ def warmup_flydsl_full_decode(backend: AiterAttnBackend) -> None:
         device=backend.device,
     )
     table = torch.zeros((1, 1), dtype=torch.int32, device=backend.device)
-    pmax, psum, pout, lengths = _get_flydsl_workspace_views(backend, 1, 1)
-    lengths.fill_(1)
     scale = (
         torch.ones(1, dtype=torch.float32, device=backend.device)
         if backend.kv_cache_dtype == fp8_dtype
         else None
     )
-    backend._flydsl_pa_decode_tile(
-        output=output,
-        query=q,
-        key_cache=k_cache,
-        value_cache=v_cache,
-        block_tables=table,
-        context_lengths=lengths,
-        key_scale=scale,
-        value_scale=scale,
-        softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
-        num_partitions=backend._flydsl_pa_decode_num_partitions,
-        pmax=pmax,
-        psum=psum,
-        pout=pout,
-    )
+    for query_length in sorted(query_lengths):
+        for partitions, query_splits in get_flydsl_mimo_decode_variants(
+            backend, query_length
+        ):
+            pmax, psum, pout, lengths = _get_flydsl_workspace_views(
+                backend, 1, query_length, partitions
+            )
+            lengths.fill_(query_length)
+            backend._flydsl_pa_decode_tile(
+                output=output[:query_length],
+                query=q[:query_length],
+                key_cache=k_cache,
+                value_cache=v_cache,
+                block_tables=table,
+                context_lengths=lengths,
+                key_scale=scale,
+                value_scale=scale,
+                softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
+                num_partitions=partitions,
+                pmax=pmax,
+                psum=psum,
+                pout=pout,
+                **({"query_splits": query_splits} if query_splits is not None else {}),
+            )
     torch.cuda.current_stream(backend.device).synchronize()
 
 

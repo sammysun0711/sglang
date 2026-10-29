@@ -1,0 +1,21 @@
+{
+  "passed": [
+    "(32, (1,), (1,), 1, False, 'bf16')",
+    "(32, (65,), (141,), 1, True, 'bf16')",
+    "(64, (32,), (70,), 1, False, 'bf16')",
+    "(64, (64,), (64,), 1, True, 'bf16')",
+    "(64, (129,), (257,), 2, True, 'bf16')",
+    "(128, (65,), (141,), 1, True, 'bf16')",
+    "(128, (257,), (513,), 2, True, 'bf16')",
+    "(64, (1, 32, 129), (1, 70, 257), 2, True, 'bf16')",
+    "(64, (32683,), (65451,), 1, True, 'bf16')",
+    "noncausal_nan_tail",
+    "valid_nan_values_are_not_sanitized"
+  ],
+  "count": 11,
+  "elapsed_seconds": 22.600340934004635,
+  "cooperative_v": 0,
+  "manual_schedule": 0,
+  "cta_multiplier": 1,
+  "workgroup_waves": 8
+}

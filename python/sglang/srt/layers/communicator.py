@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
     dp_gather_replicate,
+    dp_hierarchical_reduce_scatter,
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_cp_rank,
@@ -59,6 +60,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
+    should_use_dp_hierarchical_communication,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
@@ -856,6 +858,8 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
+            if should_use_dp_hierarchical_communication(forward_batch):
+                return True
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
@@ -1425,6 +1429,10 @@ class CommunicateSummableTensorPairFn:
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
+        elif allow_reduce_scatter and should_use_dp_hierarchical_communication(
+            forward_batch
+        ):
+            dp_hierarchical_reduce_scatter(hidden_states, global_hidden_states)
         elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:

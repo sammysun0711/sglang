@@ -3606,6 +3606,7 @@ def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
     kernels = SimpleNamespace(
         pa_decode=lambda **kwargs: None,
         plan_pa_decode=lambda *args, **kwargs: None,
+        supports_query_splits=True,
         version="test",
         runtime_path="test-runtime",
         kernel_path="test-kernel",
@@ -3653,6 +3654,9 @@ def test_flydsl_bf16_decode_configuration_accepts_supported_arches(
 
     assert backend._use_flydsl_pa_decode
     assert backend._flydsl_pa_decode_num_partitions == 8
+    assert backend._flydsl_pa_decode_query_splits == (
+        1 if gfx942 and query_length == 4 else None
+    )
     assert backend._flydsl_pa_decode is captured["kernels"].pa_decode
     assert backend._flydsl_plan_pa_decode is captured["kernels"].plan_pa_decode
     # The prepared flag prevents duplicate work on subsequent graph setup calls.
@@ -3670,6 +3674,7 @@ def test_flydsl_fp8_decode_uses_public_api(monkeypatch):
     backend._compile_flydsl_pa_decode()
     assert backend._flydsl_pa_decode is captured["kernels"].pa_decode
     assert captured["warmups"] == [backend]
+    assert backend._flydsl_pa_decode_query_splits is None
 
 
 def test_flydsl_pa_decode_loader_rejects_legacy_compile_api(monkeypatch):
@@ -3722,6 +3727,7 @@ def test_flydsl_pa_decode_loader_accepts_public_plan_api(monkeypatch):
         kernels = aiter_utils.load_flydsl_pa_decode_kernels()
         assert kernels.pa_decode is pa_decode
         assert kernels.plan_pa_decode is plan_pa_decode
+        assert not kernels.supports_query_splits
     finally:
         aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
 
@@ -3911,3 +3917,21 @@ def test_mimo_multimodal_aux_capture_embeds_placeholders_first(monkeypatch, capt
         torch.testing.assert_close(auxiliary[0], embedded + 2)
     else:
         assert auxiliary is None
+
+
+@pytest.mark.parametrize("query_length", [1, 4, 8])
+@pytest.mark.parametrize("splits", [None, 1])
+def test_full_pa_query_split_kwargs_are_scoped(query_length, splits):
+    backend = SimpleNamespace(_flydsl_pa_decode_query_splits=splits)
+    expected = {"query_splits": 1} if query_length == 4 and splits == 1 else {}
+    assert aiter_utils._full_pa_query_split_kwargs(backend, query_length) == expected
+
+
+def test_full_pa_keeps_automatic_policy_without_override_api(monkeypatch):
+    captured = _patch_flydsl_backend_dependencies(
+        monkeypatch, gfx942=True, gfx950=False
+    )
+    captured["kernels"].supports_query_splits = False
+    backend = _make_flydsl_bf16_backend(4)
+    backend._configure_flydsl_pa_decode(max_bs=1)
+    assert backend._flydsl_pa_decode_query_splits is None

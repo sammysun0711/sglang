@@ -1,6 +1,8 @@
 """SGLang transport tests against AITER's public plan-based PA API."""
 
+import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -22,16 +24,21 @@ def _backend(query_length, partitions=8, dtype=torch.bfloat16):
     backend.page_size = 64
     backend.num_head, backend.num_kv_head = 16, 1
     backend.kv_cache_dtype = dtype
-    backend._use_flydsl_pa_decode = True
-    kernels = aiter_utils.load_flydsl_pa_decode_kernels()
-    backend._flydsl_pa_decode = kernels.pa_decode
-    backend._flydsl_plan_pa_decode = kernels.plan_pa_decode
+    backend.kv_cache_is_vectorized_5d = True
+    backend.use_mla = False
+    backend.topk = 1
+    backend.max_context_len = 1_048_576
+    backend.head_dim, backend.v_head_dim = 192, 128
+    backend.input_dtype = torch.bfloat16
     backend._flydsl_pa_work_plans = {}
-    backend._flydsl_pa_decode_num_partitions = partitions
     backend._flydsl_pa_decode_query_length = query_length
     backend._flydsl_pa_decode_workspace_max_bs = 0
     backend._flydsl_pa_decode_compiled = False
-    backend._ensure_flydsl_pa_decode_workspace(4)
+    with (
+        aiter_backend.envs.SGLANG_AITER_PA_DECODE_IMPL.override("flydsl"),
+        patch.dict(os.environ, {"SGLANG_FLYDSL_PA_NUM_PARTITIONS": str(partitions)}),
+    ):
+        backend._configure_flydsl_pa_decode(4)
     return backend
 
 
@@ -332,3 +339,65 @@ def test_sglang_graph_backend_alternates_batch_shapes_with_shared_scratch():
     finally:
         torch.cuda.synchronize()
         graphs.cleanup()
+
+
+def test_block4_full_pa_high_cache_addresses_and_nan_tail():
+    # K extends beyond 4 GiB, as in the serving KV pool. Only two high pages
+    # are live, so the Torch reference stays small and checks the real offsets.
+    if torch.cuda.mem_get_info()[0] < 8 * 2**30:
+        pytest.skip("requires 8 GiB free for the model-size KV address test")
+    backend = _backend(4, 16)
+    blocks = 2**32 // (192 * 64 * 2) + 2
+    k_cache = torch.empty((blocks, 1, 24, 64, 8), dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.empty((blocks, 1, 8, 128, 8), dtype=torch.bfloat16, device="cuda")
+    assert k_cache.nbytes > 2**32
+    table = torch.tensor([[blocks - 2, blocks - 1]], dtype=torch.int32, device="cuda")
+    ref_table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    torch.manual_seed(5887)
+    k = torch.randn((2, 64, 1, 192), dtype=torch.bfloat16, device="cuda") * 0.2
+    v = torch.randn((2, 64, 1, 128), dtype=torch.bfloat16, device="cuda") * 0.2
+    q = torch.randn((4, 16 * 192), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((4, 16 * 128), dtype=torch.bfloat16, device="cuda")
+    lengths = torch.empty(1, dtype=torch.int64, device="cuda")
+    batch = SimpleNamespace(batch_size=1, seq_lens=lengths)
+    layer = SimpleNamespace(
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        sliding_window_size=-1,
+        logit_cap=0.0,
+        scaling=192**-0.5,
+    )
+    backend.forward_metadata = SimpleNamespace(max_q_len=4, kv_indices=table)
+
+    def set_context(length):
+        keys, values = k.clone(), v.clone()
+        keys[1, length - 64 :] = float("nan")
+        values[1, length - 64 :] = float("nan")
+        k_cache[-2:].copy_(keys.view(2, 64, 1, 24, 8).permute(0, 2, 3, 1, 4))
+        v_cache[-2:].copy_(values.view(2, 8, 8, 1, 128).permute(0, 3, 1, 4, 2))
+        lengths.fill_(length - 4)
+
+    def run():
+        aiter_utils.forward_target_verify_flydsl_5d(
+            backend, q, layer, batch, k_cache, v_cache, output, None
+        )
+
+    set_context(65)
+    run()
+    expected = _reference(q, k, v, ref_table, [65], 4, 192)
+    torch.testing.assert_close(output, expected, atol=0.006, rtol=0.04)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    for length in (124, 65):
+        set_context(length)
+        graph.replay()
+        expected = _reference(q, k, v, ref_table, [length], 4, 192)
+        torch.testing.assert_close(output, expected, atol=0.006, rtol=0.04)

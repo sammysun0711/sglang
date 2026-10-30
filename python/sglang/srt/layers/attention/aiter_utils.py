@@ -1327,6 +1327,7 @@ def get_flydsl_mimo_num_partitions() -> int:
 class FlyDSLPADecodeKernels:
     pa_decode: Callable
     plan_pa_decode: Callable
+    supports_query_splits: bool
     version: str
     runtime_path: str
     kernel_path: str
@@ -1358,6 +1359,7 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
     return FlyDSLPADecodeKernels(
         pa_decode=decode,
         plan_pa_decode=plan,
+        supports_query_splits="query_splits" in decode_params,
         version=str(getattr(flydsl, "__version__", "unknown")),
         runtime_path=str(getattr(flydsl, "__file__", "unknown")),
         kernel_path=str(getattr(module, "__file__", "unknown")),
@@ -2632,6 +2634,11 @@ def forward_decode_vectorized_5d(
     )
 
 
+def _full_pa_query_split_kwargs(backend: AiterAttnBackend, query_length: int) -> dict:
+    splits = getattr(backend, "_flydsl_pa_decode_query_splits", None)
+    return {"query_splits": splits} if query_length == 4 and splits is not None else {}
+
+
 def _get_flydsl_work_plan(
     backend: AiterAttnBackend,
     context_lengths: torch.Tensor,
@@ -2991,6 +2998,7 @@ def _forward_full_flydsl_5d(
         max_logits=pmax,
         exp_sums=psum,
         temporary_output=pout,
+        **_full_pa_query_split_kwargs(backend, query_length),
     )
 
 
@@ -3055,6 +3063,7 @@ def warmup_flydsl_full_decode(backend: AiterAttnBackend) -> None:
             max_logits=pmax,
             exp_sums=psum,
             temporary_output=pout,
+            **_full_pa_query_split_kwargs(backend, query_length),
         )
     torch.cuda.current_stream(backend.device).synchronize()
 

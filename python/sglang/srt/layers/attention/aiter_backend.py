@@ -314,6 +314,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         self._flydsl_pa_decode = None
+        self._flydsl_pa_decode_query_splits = None
         self._flydsl_plan_pa_decode = None
         self._flydsl_pa_work_plans = {}
         self._flydsl_pa_decode_pmax = None
@@ -515,18 +516,30 @@ class AiterAttnBackend(AttentionBackend):
         kernels = load_flydsl_pa_decode_kernels()
         self._flydsl_pa_decode = kernels.pa_decode
         self._flydsl_plan_pa_decode = kernels.plan_pa_decode
+        # Keep MiMo block4 queries together on gfx942: split-query CTAs reread
+        # the same long KV cache. This BF16 D192/V128 geometry fits 64 KiB LDS.
+        # Older plan APIs retain their automatic policy when no override exists.
+        self._flydsl_pa_decode_query_splits = (
+            1
+            if is_gfx942_supported()
+            and self.kv_cache_dtype == torch.bfloat16
+            and self._flydsl_pa_decode_query_length == 4
+            and getattr(kernels, "supports_query_splits", False)
+            else None
+        )
         self._ensure_flydsl_pa_decode_workspace(max_bs)
         logger.info(
             "Enabled MiMo FlyDSL PA decode on target worker: full "
             "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=%s, "
             "ordinary full decode=FlyDSL; runtime=%s (%s), kernel=%s, "
-            "partitions=%d, workspace_max_bs=%d",
+            "partitions=%d, workspace_max_bs=%d, block4_query_splits=%s",
             "FlyDSL" if flydsl_target_verify_swa_enabled() else "AITER",
             kernels.version,
             kernels.runtime_path,
             kernels.kernel_path,
             self._flydsl_pa_decode_num_partitions,
             self._flydsl_pa_decode_workspace_max_bs,
+            self._flydsl_pa_decode_query_splits or "auto",
         )
 
     def _ensure_flydsl_pa_decode_workspace(self, max_bs: int) -> None:

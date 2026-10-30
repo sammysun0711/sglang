@@ -172,6 +172,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.input_dtype = model_runner.model_config.dtype
         self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
+        self._configure_grouped_pa_swa(model_runner)
 
         self.page_size = model_runner.server_args.page_size
 
@@ -423,6 +424,25 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+    def _configure_grouped_pa_swa(self, model_runner: ModelRunner) -> None:
+        self._grouped_pa_swa_first_layer = None
+        if not envs.SGLANG_MIMO_GROUPED_PA_SWA.get() or self.is_draft_worker:
+            return
+        pattern = getattr(
+            model_runner.model_config.hf_config, "hybrid_layer_pattern", None
+        )
+        args = model_runner.server_args
+        if (
+            args.pp_size != 1
+            or not pattern
+            or 1 not in pattern
+            or args.speculative_algorithm != "DFLASH"
+        ):
+            raise ValueError(
+                "Grouped MiMo PA SWA requires single-stage DFlash hybrid attention"
+            )
+        self._grouped_pa_swa_first_layer = pattern.index(1)
 
     def _configure_flydsl_pa_decode(self, max_bs: int) -> None:
         requested_impl = envs.SGLANG_AITER_PA_DECODE_IMPL.get().strip().lower()

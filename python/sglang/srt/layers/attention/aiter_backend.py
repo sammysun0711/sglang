@@ -312,11 +312,9 @@ class AiterAttnBackend(AttentionBackend):
             self.device
         )
 
-        self._flydsl_pa_decode_tile = None
-        self._flydsl_compile_pa_decode_tile = None
-        self._flydsl_compile_pa_decode_reduce = None
-        self._flydsl_pa_decode_kv_dtype_parameter = None
-        self._flydsl_pa_decode_reduce_uses_runtime_query_length = False
+        self._flydsl_pa_decode = None
+        self._flydsl_plan_pa_decode = None
+        self._flydsl_pa_work_plans = {}
         self._flydsl_pa_decode_pmax = None
         self._flydsl_pa_decode_psum = None
         self._flydsl_pa_decode_pout = None
@@ -495,13 +493,8 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         kernels = load_flydsl_pa_decode_kernels()
-        self._flydsl_pa_decode_tile = kernels.pa_decode_tile
-        self._flydsl_compile_pa_decode_tile = kernels.compile_pa_decode_tile
-        self._flydsl_compile_pa_decode_reduce = kernels.compile_pa_decode_reduce
-        self._flydsl_pa_decode_kv_dtype_parameter = kernels.kv_dtype_parameter
-        self._flydsl_pa_decode_reduce_uses_runtime_query_length = (
-            kernels.reduce_uses_runtime_query_length
-        )
+        self._flydsl_pa_decode = kernels.pa_decode
+        self._flydsl_plan_pa_decode = kernels.plan_pa_decode
         self._ensure_flydsl_pa_decode_workspace(max_bs)
         logger.info(
             "Enabled MiMo FlyDSL PA decode on target worker: full "
@@ -542,63 +535,23 @@ class AiterAttnBackend(AttentionBackend):
             dtype=torch.bfloat16,
             device=self.device,
         )
-        self._flydsl_pa_decode_context_lengths = torch.empty(
+        self._flydsl_pa_decode_context_lengths = torch.zeros(
             max_bs, dtype=torch.int32, device=self.device
         )
         self._flydsl_pa_decode_workspace_max_bs = max_bs
 
     def _compile_flydsl_pa_decode(self) -> None:
+        """Warm the public plan-based API before graph capture.
+
+        Real graph batches also run their normal eager warmups. The native
+        wrapper owns kernel/reducer compilation for each scheduling shape.
+        """
         if not self._use_flydsl_pa_decode or self._flydsl_pa_decode_compiled:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "FlyDSL PA decode must be compiled before CUDA graph capture"
+                "FlyDSL PA decode must be warmed before CUDA graph capture"
             )
-
-        compile_kwargs = dict(
-            head_dim=FLYDSL_MIMO_HEAD_DIM,
-            v_head_dim=FLYDSL_MIMO_VALUE_HEAD_DIM,
-            query_group_size=16,
-            block_size=64,
-            num_partitions=self._flydsl_pa_decode_num_partitions,
-            softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
-            query_dtype="bf16",
-            per_token_kv=False,
-            query_length=self._flydsl_pa_decode_query_length,
-            trans_v=True,
-        )
-        if self._flydsl_pa_decode_kv_dtype_parameter == "kv_dtype":
-            compile_kwargs["kv_dtype"] = (
-                "bf16" if self.kv_cache_dtype == torch.bfloat16 else "fp8"
-            )
-        elif self._flydsl_pa_decode_kv_dtype_parameter == "bf16_kv":
-            compile_kwargs["bf16_kv"] = self.kv_cache_dtype == torch.bfloat16
-        else:
-            raise RuntimeError("FlyDSL PA decode KV dtype API is not initialized")
-        reduce_kwargs = dict(
-            max_context_partition_num=self._flydsl_pa_decode_num_partitions,
-            query_group_size=16,
-            head_size=FLYDSL_MIMO_VALUE_HEAD_DIM,
-            output_dtype_str="bf16",
-            logits_dtype_str="bf16",
-        )
-        if self._flydsl_pa_decode_reduce_uses_runtime_query_length:
-            reduce_kwargs.update(
-                sink_dtype_str="f32",
-                use_sinks=False,
-                use_work_plan=False,
-            )
-        else:
-            reduce_kwargs["query_seq_len"] = self._flydsl_pa_decode_query_length
-        # Ordinary decode can run eagerly inside a mixed DP prefill forward,
-        # even when the target's captured phase is multi-token verification.
-        # Prepare qlen=1 as well, so that path does not introduce a cold kernel.
-        for query_length in sorted({1, self._flydsl_pa_decode_query_length}):
-            compile_kwargs["query_length"] = query_length
-            if not self._flydsl_pa_decode_reduce_uses_runtime_query_length:
-                reduce_kwargs["query_seq_len"] = query_length
-            self._flydsl_compile_pa_decode_tile(**compile_kwargs)
-            self._flydsl_compile_pa_decode_reduce(**reduce_kwargs)
         warmup_flydsl_full_decode(self)
         self._flydsl_pa_decode_compiled = True
 
@@ -1687,9 +1640,8 @@ class AiterAttnBackend(AttentionBackend):
     ):
         if self._use_flydsl_pa_decode:
             self._ensure_flydsl_pa_decode_workspace(max_bs)
-            # Compile both the tile and split reducer before capture. The
-            # Python wrapper's cache then makes every captured layer call a
-            # launch-only operation with caller-owned workspaces.
+            # Warm the public API before graph setup. Per-shape eager model
+            # warmups populate plans and kernel specializations before capture.
             self._compile_flydsl_pa_decode()
         if self._flydsl_dflash_swa_enabled:
             prepare_flydsl_dflash_swa(

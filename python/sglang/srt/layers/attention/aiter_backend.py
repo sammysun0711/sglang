@@ -1731,7 +1731,14 @@ class AiterAttnBackend(AttentionBackend):
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int32, device=self.device
         )
-        if kv_indices_buf is None:
+        # Unified decode/draft-extend and unified verification use page tables.
+        # Keep flat token indices only when at least one metadata path needs
+        # them; allocating max_bs * max_context_len otherwise wastes GiBs.
+        needs_legacy_kv_indices = self.use_mla or not (
+            self.use_triton_unified_attention and self._use_unified_verify
+        )
+        self.cuda_graph_kv_indices = kv_indices_buf
+        if kv_indices_buf is None and needs_legacy_kv_indices:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
@@ -1759,8 +1766,6 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-        else:
-            self.cuda_graph_kv_indices = kv_indices_buf
 
         if self._use_unified_verify:
             # Keep a distinct page-table buffer for unified attention.  Sharing
@@ -1775,7 +1780,9 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        if not self.skip_prefill:
+        # Only the legacy target-verify branch reads the custom mask.
+        self.cuda_graph_custom_mask = None
+        if not self.skip_prefill and not self._use_unified_verify:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
@@ -1816,8 +1823,10 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.cuda_graph_swa_kv_indices = torch.zeros_like(
-                self.cuda_graph_kv_indices
+            self.cuda_graph_swa_kv_indices = (
+                torch.zeros_like(self.cuda_graph_kv_indices)
+                if needs_legacy_kv_indices
+                else None
             )
             # SWA write-target buffer; refilled and bound onto forward_metadata
             # in init_forward_metadata_out_graph before each replay.
@@ -1826,6 +1835,22 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+
+        def allocated_bytes(name):
+            buffer = getattr(self, name, None)
+            return 0 if buffer is None else buffer.numel() * buffer.element_size()
+
+        logger.info(
+            "AITER graph allocation: legacy_workspace_bytes=%d, "
+            "legacy_kv_indices_bytes=%d, legacy_swa_kv_indices_bytes=%d, "
+            "legacy_custom_mask_bytes=%d, page_table_bytes=%d",
+            allocated_bytes("workspace_buffer"),
+            allocated_bytes("cuda_graph_kv_indices"),
+            allocated_bytes("cuda_graph_swa_kv_indices"),
+            allocated_bytes("cuda_graph_custom_mask"),
+            allocated_bytes("cuda_graph_page_table")
+            + allocated_bytes("cuda_graph_swa_page_table"),
+        )
 
     def _apply_cuda_graph_metadata(
         self,

@@ -8,6 +8,7 @@ set -euo pipefail
 # Defaults: global chunk 32768 and request limit 192, or 16384 / 96 per DP.
 # PERFORMANCE_MODE=1 uses fake routing for performance tests.
 # PERFORMANCE_MODE=0 selects real routing and ordinary serving for accuracy.
+# ENABLE_PREFILL_DELAYER=1 coordinates new prefill admission; set 0 for the prior baseline.
 # Additional server options may be passed as positional arguments.
 # DRY_RUN=1 prints the command
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -83,6 +84,9 @@ export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
 export KV_CACHE_DTYPE=bf16
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
 export PERFORMANCE_MODE="${PERFORMANCE_MODE:-1}"
+export ENABLE_PREFILL_DELAYER="${ENABLE_PREFILL_DELAYER:-1}"
+# This is a count of scheduler negotiations, not a delay in milliseconds.
+export PREFILL_DELAYER_MAX_DELAY_PASSES="${PREFILL_DELAYER_MAX_DELAY_PASSES:-100}"
 
 for name in MAX_RUNNING_REQUESTS CHUNKED_PREFILL_SIZE; do
   if ! [[ "${!name}" =~ ^[1-9][0-9]*$ ]]; then
@@ -96,6 +100,14 @@ if [[ "${PERFORMANCE_MODE}" != "0" && "${PERFORMANCE_MODE}" != "1" ]]; then
 fi
 if [[ "${ENABLE_DFLASH}" != "0" && "${ENABLE_DFLASH}" != "1" ]]; then
   echo "ENABLE_DFLASH must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "${ENABLE_PREFILL_DELAYER}" != "0" && "${ENABLE_PREFILL_DELAYER}" != "1" ]]; then
+  echo "ENABLE_PREFILL_DELAYER must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "${ENABLE_PREFILL_DELAYER}" == "1" ]] && ! [[ "${PREFILL_DELAYER_MAX_DELAY_PASSES}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PREFILL_DELAYER_MAX_DELAY_PASSES must be a positive integer" >&2
   exit 2
 fi
 
@@ -115,6 +127,8 @@ fi
 # MORI quantizes dispatch input. QKV fused quant also enables packed FP8 AG.
 export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
 export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-1}"
+# Fuse selected-expert sigmoid weights and stable normalization; set 0 to disable.
+export SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS="${SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS:-0}"
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=0
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
@@ -170,6 +184,14 @@ if [[ "${PERFORMANCE_MODE}" == "1" ]]; then
   performance_args+=(--ep-dispatch-algorithm fake)
 fi
 
+prefill_delayer_args=()
+if [[ "${ENABLE_PREFILL_DELAYER}" == "1" ]]; then
+  prefill_delayer_args=(
+    --enable-prefill-delayer
+    --prefill-delayer-max-delay-passes "${PREFILL_DELAYER_MAX_DELAY_PASSES}"
+  )
+fi
+
 dflash_args=()
 speculative_status=disabled
 if [[ "${ENABLE_DFLASH}" == "1" ]]; then
@@ -203,6 +225,7 @@ if [[ "${MORI_EP_LAUNCH_CONFIG_MODE}" == "AUTO" ]]; then
   echo "MORI tuning config: ${MORI_EP_TUNING_CONFIG}"
 fi
 echo "Performance mode: ${PERFORMANCE_MODE} (1=fake routing; 0=real routing; both use ordinary serving)"
+echo "Prefill delayer: enabled=${ENABLE_PREFILL_DELAYER}, max-delay-passes=${PREFILL_DELAYER_MAX_DELAY_PASSES} (when enabled)"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
 if [[ "${ENABLE_DFLASH}" == "1" ]]; then
@@ -261,6 +284,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   --moe-a2a-backend mori \
   --deepep-mode normal \
   "${performance_args[@]}" \
+  "${prefill_delayer_args[@]}" \
   --moe-dense-tp-size 1 \
   --enable-dp-lm-head \
   --moe-runner-backend aiter \

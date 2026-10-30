@@ -482,6 +482,11 @@ class Envs:
     # sink-free full-attention target verification; SWA/sink layers remain on
     # AITER Gluon.
     SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
+    # gfx942 BF16 MiMo full-attention prefill via PyHIP's FlyDSL kernel; needs
+    # SGLANG_FLYPA_MIMO_PREFILL=1 eligibility and takes precedence over CK linear.
+    SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
+    # PyHIP checkout whose src/pyhip extends the installed pyhip (AITER needs the installed one).
+    SGLANG_PYHIP_ROOT = EnvStr(None)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

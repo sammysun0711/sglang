@@ -57,6 +57,7 @@ except ImportError:  # Keep compatibility with AITER builds predating OPUS varle
     fmha_fwd_bf16_opus_fwd = None
     fmha_fwd_bf16_opus_varlen_fwd = None
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.utils import get_bool_env_var
@@ -2083,6 +2084,68 @@ def run_mimo_ck_linear_prefill(
     return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
+@lru_cache(maxsize=1)
+def load_pyhip_mimo_prefill_module():
+    import pyhip
+
+    root = envs.SGLANG_PYHIP_ROOT.get()
+    if root:
+        source = os.path.join(root, "src", "pyhip")
+        if source not in pyhip.__path__:
+            pyhip.__path__.insert(0, source)
+    return importlib.import_module("pyhip.ops.mha.flydsl.mha_pa_bf16_942")
+
+
+def run_mimo_pyhip_prefill(
+    backend, q, layer, forward_batch, k_cache, v_cache, metadata
+) -> torch.Tensor:
+    """BF16 full prefill with PyHIP's gfx942 FlyDSL kernel on the SHUFFLE-5D cache."""
+    batch_size = int(forward_batch.batch_size)
+    logical_q = sum(int(length) for length in forward_batch.extend_seq_lens_cpu)
+    output_storage, output_live = _allocate_mimo_asm_output(
+        q, logical_q, q.shape[0], layer.tp_q_head_num, layer.v_head_dim
+    )
+    if logical_q == 0:
+        return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+    module = load_pyhip_mimo_prefill_module()
+    attention = module.PagedAttention(
+        layer.tp_q_head_num,
+        layer.tp_k_head_num,
+        layer.qk_head_dim,
+        layer.v_head_dim,
+        backend.page_size,
+        True,
+        "per-tensor",
+    )
+    unit = getattr(backend, "_mimo_flypa_prefill_unit_scale", None)
+    if unit is None:
+        unit = torch.ones(1, dtype=torch.float32, device=q.device)
+        backend._mimo_flypa_prefill_unit_scale = unit
+    if not getattr(backend, "_logged_pyhip_mimo_prefill", False):
+        logger.info("Using PyHIP %s for gfx942 BF16 MiMo full prefill", module.__file__)
+        backend._logged_pyhip_mimo_prefill = True
+    # Batch and Q/KV bounds are kernel arguments: one kernel serves every batch.
+    attention(
+        q[:logical_q].view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        k_cache,
+        v_cache,
+        backend.qo_indptr[: batch_size + 1],
+        None,
+        metadata.paged_kv_indptr[: batch_size + 1],
+        metadata.paged_kv_indices,
+        int(metadata.max_q_len),
+        int(metadata.max_kv_len),
+        True,
+        unit,
+        unit,
+        unit,
+        metadata.paged_kv_last_page_len[:batch_size],
+        out=output_live,
+        softmax_scale=float(layer.scaling),
+    )
+    return output_storage.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
 def forward_extend_vectorized_5d(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -2428,13 +2491,15 @@ def forward_extend_vectorized_5d(
         v_buf,
         metadata,
     ):
-        if (
-            get_bool_env_var("SGLANG_MIMO_CK_LINEAR_PREFILL", "false")
-            and backend.kv_cache_dtype == torch.bfloat16
-        ):
-            return run_mimo_ck_linear_prefill(
-                backend, q, layer, forward_batch, k_buf, v_buf, metadata
-            )
+        if backend.kv_cache_dtype == torch.bfloat16:
+            if envs.SGLANG_USE_PYHIP_MIMO_PREFILL.get():
+                return run_mimo_pyhip_prefill(
+                    backend, q, layer, forward_batch, k_buf, v_buf, metadata
+                )
+            if get_bool_env_var("SGLANG_MIMO_CK_LINEAR_PREFILL", "false"):
+                return run_mimo_ck_linear_prefill(
+                    backend, q, layer, forward_batch, k_buf, v_buf, metadata
+                )
         return run_mimo_flypa_prefill(
             backend,
             q,

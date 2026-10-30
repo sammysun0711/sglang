@@ -19,6 +19,126 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
+from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm1 import a8w4_gemm1
+from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm2 import a8w4_gemm2
+from aiter.fused_moe import moe_sorting
+from aiter import ActivationType, QuantType, dtypes
+
+# block_m -> (gemm1 kwargs, gemm2 kwargs). Both stages share the sorting block_m.
+#  32: gemm1 pipelined (prefetch) + XCD swizzle; gemm2 skips all-padding sub-blocks.
+#  64: same block_m as the tuned CSV; gemm1 dyn_m (32/64 rows per block at runtime),
+#      gemm2 dyn_rows.
+A8W4_E2E_CFGS = {
+    32: (
+        dict(tile_n=128, b_cache_mod=1, xcd_swizzle=1),
+        dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0, dyn_rows=True),
+    ),
+    64: (
+        dict(tile_n=128, b_cache_mod=1, xcd_swizzle=1, dyn_m=True),
+        dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0, dyn_rows=True),
+    ),
+}
+
+def a8w4_fused_moe(
+    hidden_states, weights, topk_weights, topk_ids, *, block_m=32, fuse_quant=False
+):
+    """SiLU SEPARATED A8W4 MoE: sort -> fp8 row-quant(x) -> gemm1 (gate+up+SiLU,
+    bf16 by sorted row) -> fp8 row-quant(inter) -> gemm2 (down + weighted atomic
+    scatter into the zeroed moe_buf). Returns bf16 [tokens, model_dim].
+
+    ``fuse_quant``: gemm1 quantizes in its epilogue (``q8s``: fp8 by sorted row,
+    one f32 scale per (row, 128 cols)) and gemm2 takes the per-128-K-group A
+    scales; drops the second row-quant kernel and the bf16 round trip."""
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import quantize_rows
+
+    g1_cfg, g2_cfg = A8W4_E2E_CFGS[block_m]
+    E, model_dim, _ = weights["w2"].shape
+    inter_dim = weights["w1"].shape[1] // 2
+
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+        moe_sorting(topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_m)[:5]
+    )
+    x_fp8, x_scale = quantize_rows(hidden_states)
+    sorted_size = sorted_expert_ids.numel() * block_m
+    if fuse_quant:
+        assert g1_cfg["tile_n"] == 128, "q8s scale groups = gemm1 tile_n = 128"
+        groups = inter_dim // 128
+        buf = torch.empty(
+            sorted_size * (inter_dim + groups * 4),
+            dtype=torch.uint8,
+            device=hidden_states.device,
+        )
+        a8w4_gemm1(
+            x_fp8,
+            x_scale,
+            weights["w1"],
+            weights["w1_scale"],
+            weights["w1_exp"],
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            buf,
+            num_experts=E,
+            tile_m=block_m,
+            epilog="q8s",
+            inter_dim=inter_dim,
+            topk=topk_ids.shape[1],
+            **g1_cfg,
+        )
+        nd = sorted_size * inter_dim
+        a2_fp8 = buf[:nd].view(torch.float8_e4m3fnuz).view(sorted_size, inter_dim)
+        a2_scale = buf[nd:].view(torch.float32).view(sorted_size, groups)
+        a8w4_gemm2(
+            a2_fp8,
+            a2_scale,
+            weights["w2"],
+            weights["w2_scale"],
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts=E,
+            tile_m=block_m,
+            a_group=128,
+            **g2_cfg,
+        )
+        return moe_buf
+    inter = torch.empty(
+        (sorted_size, inter_dim),
+        dtype=dtypes.bf16,
+        device=hidden_states.device,
+    )
+    a8w4_gemm1(
+        x_fp8,
+        x_scale,
+        weights["w1"],
+        weights["w1_scale"],
+        weights["w1_exp"],
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        inter,
+        num_experts=E,
+        tile_m=block_m,
+        **g1_cfg,
+    )
+    a2_fp8, a2_scale = quantize_rows(inter, num_valid_ids)
+    a8w4_gemm2(
+        a2_fp8,
+        a2_scale,
+        weights["w2"],
+        weights["w2_scale"],
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts=E,
+        tile_m=block_m,
+        **g2_cfg,
+    )
+    return moe_buf
 
 class Mxfp4AiterA16W4MoEMethod:
     """MXFP4 (E8M0 scales) MoE via aiter fused_moe with bf16 activations."""
@@ -100,6 +220,19 @@ class Mxfp4AiterA16W4MoEMethod:
             weight.is_shuffled = True
             weight.gate_up_interleave = False
 
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import channel_exponents
+        w1_u8 = layer.w13_weight.data.view(torch.uint8)
+        w1_scale_u8 = layer.w13_weight_scale_inv.data.view(torch.uint8).contiguous().view(-1)
+        w2_scale_u8 = layer.w2_weight_scale_inv.data.view(torch.uint8).contiguous().view(-1)
+
+        layer.all_weights = dict(
+            w1=w1_u8,
+            w2=layer.w2_weight.data.view(torch.uint8),
+            w1_scale=w1_scale_u8,
+            w2_scale=w2_scale_u8,
+            w1_exp=channel_exponents(w1_u8, w1_scale_u8),
+        )
+
         layer.dispatcher.set_quant_config(
             {"weight_dtype": layer.w13_weight.dtype, "use_mxfp8": False}
         )
@@ -109,6 +242,15 @@ class Mxfp4AiterA16W4MoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        if 1:
+            from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+            from sglang.srt.layers.moe.topk import TopKOutputChecker            
+            topk_output = dispatch_output.topk_output
+            hidden_states = dispatch_output.hidden_states
+            output = a8w4_fused_moe(hidden_states, layer.all_weights,
+                                    topk_output.topk_weights, topk_output.topk_ids, block_m=64, fuse_quant=True)
+            return StandardCombineInput(hidden_states=output)
+
         from aiter.ops.flydsl.moe_common import GateMode
 
         from sglang.srt.layers.moe.moe_runner.aiter import (

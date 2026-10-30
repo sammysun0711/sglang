@@ -518,6 +518,19 @@ def forward_target_verify_flydsl_swa_5d(
             sinks=sinks,
         )
         return
+    if (
+        getattr(backend, "_grouped_pa_swa_first_layer", None) is not None
+        and not backend.is_draft_worker
+        and forward_batch.forward_mode.is_target_verify()
+    ):
+        from sglang.srt.layers.attention.grouped_pa_swa_eval import (
+            forward_grouped_pa_swa,
+        )
+
+        forward_grouped_pa_swa(
+            backend, q, layer, forward_batch, k_cache, v_cache, output, sinks
+        )
+        return
     context_lens = getattr(metadata, "flydsl_swa_context_lens", None)
     page_indptr = getattr(metadata, "flydsl_swa_kv_indptr", None)
     page_indices = getattr(metadata, "flydsl_swa_kv_indices", None)

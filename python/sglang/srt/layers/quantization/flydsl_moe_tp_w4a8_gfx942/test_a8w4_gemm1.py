@@ -149,6 +149,45 @@ def _fp4x8_to_fp8x8(raw, lut):
     return fx.Vector.from_elements([lo32, hi32], fx.Int32).bitcast(fx.Float8E4M3FNUZ)
 
 
+# ---- fast decode (``fast_dec``): W pre-transformed by ``prep_w1_fast_decode`` ----
+# Each dword holds (k_j, k_{j+4}) in byte j (low, high nibble) and no -0 nibble, so
+# even nibbles decode straight to K 0..3 and odd nibbles to K 4..7 (no interleave
+# v_perm), and the sign is bit 3 of the nibble moved to bit 7 (no sign-table
+# v_perm). flush_tiny only: then every non-zero magnitude maps to a non-zero byte
+# unless the whole group is flushed, where the sign mask is zeroed instead.
+
+
+def _fp8_lut_fast(group_code, max_code):
+    difference = max_code - group_code
+    delta = fx.min(difference, 11).to(fx.Uint32) * fx.Uint32(0x08080808)
+    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
+    hi = fx.Uint32(0x7C787470) - delta
+    flushed = difference > 11
+    lo = flushed.select(fx.Uint32(0), lo)
+    hi = flushed.select(fx.Uint32(0), hi)
+    smask = flushed.select(fx.Uint32(0), fx.Uint32(0x80808080))
+    return lo, hi, smask
+
+
+def _fp4x8_to_fp8x8_fast(raw, lut):
+    lo, hi, smask = lut
+    raw = fx.Uint32(raw)
+    even = ((raw << 4) & smask) | _perm_u32(hi, lo, raw & 0x07070707)
+    odd = (raw & smask) | _perm_u32(hi, lo, (raw >> 4) & 0x07070707)
+    return fx.Vector.from_elements(
+        [even.bitcast(fx.Int32), odd.bitcast(fx.Int32)], fx.Int32
+    ).bitcast(fx.Float8E4M3FNUZ)
+
+
+def _fp8_lut_predelta(delta):
+    """``fast_dec=2``: the scale byte already holds min(max-code, 11)*8 (flushed
+    groups are zeroed in W by ``prep_w1_predelta``), broadcast to all 4 bytes."""
+    delta = fx.Uint32(delta)
+    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
+    hi = fx.Uint32(0x7C787470) - delta
+    return lo, hi, fx.Uint32(0x80808080)
+
+
 def _channel_factor(exponent):
     """2**(exponent-127-5) as f32 (subnormal-safe)."""
     normal = ((exponent - 5).to(fx.Uint32) << 23).bitcast(fx.Float32)
@@ -192,6 +231,8 @@ def compile_a8w4_gemm1(
     AG_ROWS=None,
     NPES=1,
     MAX_TILES=None,
+    w_layout="std",
+    fast_dec=False,
 ):
     """Build the A8W4 stage1 launcher.
 
@@ -232,8 +273,15 @@ def compile_a8w4_gemm1(
         sorted_size): ``out`` = ``[sorted_size, inter]`` fp8 then
         ``[sorted_size, inter/TILE_N]`` f32, i.e. gemm2's A + per-128-K-group scale
         (``a8w4_gemm2(..., a_group=128)``); replaces the separate row-quant kernel.
+
+    ``w_layout``: ``"std"`` = standard preshuffle; ``"tile"`` = W / scales retiled
+    by ``retile_w1`` so each (expert, n-block, K tile) is one contiguous run
+    (TILE_N*TILE_K bytes of W + TILE_N*TILE_K/16 bytes of scales).
     """
     assert epilog in ("bf16", "q8", "q8s", "q8push", "q8pushs"), epilog
+    assert w_layout in ("std", "tile"), w_layout
+    assert flush_tiny or not fast_dec, "fast_dec needs flush_tiny"
+    TILE_W = w_layout == "tile"
     PUSH = epilog in ("q8push", "q8pushs")
     SORTED = epilog in ("q8s", "q8pushs")  # rows by sorted position
     SCALE_RUN = epilog == "q8pushs"  # scales via LDS as [NB][rows] runs
@@ -286,6 +334,12 @@ def compile_a8w4_gemm1(
     SCALE_K_PAD = ((K + 255) // 256) * 256
     SC_STRIDE_N0 = (SCALE_K_PAD // 256) * 64
     WS_BYTES = NE * N_OUT * (SCALE_K_PAD // 32)
+    # "tile" layout (retile_w1): W 1 KB chunks as [E][NB][K/TILE_K][gu][TILE_N/16]
+    # [TILE_K/128]; scale 256 B chunks as [E][NB][Kpad/256][gu][TILE_N/32].
+    W_TILE_U16 = 2 * (TILE_N // 16) * K_GROUPS * 64  # one K tile, 16 B units
+    SC_KB_DW = 2 * (TILE_N // 32) * 64  # one 256-K scale block, dwords
+    if TILE_W:
+        assert K % 256 == 0 and TILE_N % 32 == 0
 
     ftz_tag = "_ftz" if flush_tiny else ""
     wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
@@ -294,6 +348,8 @@ def compile_a8w4_gemm1(
     kname = (
         f"a8w4_gemm1_h{K}_i{INTER}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
         f"_bcm{b_cache_mod}_xcd{xcd_swizzle}{wpe_tag}{ftz_tag}{dyn_tag}_{pipe_tag}"
+        + ("_wt" if TILE_W else "")
+        + (f"_fd{int(fast_dec)}" if fast_dec else "")
         + ("" if epilog == "bf16" else f"_{epilog}_k{TOPK}_r{AG_ROWS}_w{NPES}")
         + "".join(f"_{v}" for v in sorted(PUSH_VAR))
     )
@@ -372,25 +428,32 @@ def compile_a8w4_gemm1(
         n_wave_base = wave * fx.Int32(TILE_N // NUM_WAVES)
         out_cols = []
         w_base, sc_base, sc_key, sc_npack = {}, {}, {}, {}
+        tile_id = e * fx.Int32(NUM_N_BLOCKS) + n_block  # "tile" layout run index
         for ni in range_constexpr(N_REPEAT):
             n_local = by_n + n_wave_base + fx.Int32(ni * 16)
             out_cols.append(n_local + lane_mod_16)
+            j16 = (n_wave_base + fx.Int32(ni * 16)) // fx.Int32(16)  # n16 in tile
             for gu in range_constexpr(2):
                 n0 = expert_off + n_local + (inter_i32 if gu else fx.Int32(0))
-                w_base[gu, ni] = (
-                    (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64)
-                    + lane_div_16 * fx.Int32(16)
-                    + lane_mod_16
-                )
+                if const_expr(TILE_W):
+                    w_chunk = tile_id * fx.Int32(K_TILES * W_TILE_U16) + (
+                        fx.Int32(gu * (TILE_N // 16)) + j16
+                    ) * fx.Int32(K_GROUPS * 64)
+                else:
+                    w_chunk = (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64)
+                w_base[gu, ni] = w_chunk + lane_div_16 * fx.Int32(16) + lane_mod_16
                 key = (gu, ni // 2) if share_scale else (gu, ni)
                 sc_key[gu, ni] = key
                 sc_npack[gu, ni] = (n0 // fx.Int32(16)) % fx.Int32(2)
                 if key not in sc_base:
-                    sc_base[key] = (
-                        (n0 // fx.Int32(32)) * fx.Int32(SC_STRIDE_N0)
-                        + lane_div_16 * fx.Int32(16)
-                        + lane_mod_16
-                    )
+                    if const_expr(TILE_W):
+                        j32 = (n_wave_base + fx.Int32(ni * 16)) // fx.Int32(32)
+                        s_chunk = tile_id * fx.Int32(
+                            (SCALE_K_PAD // 256) * SC_KB_DW
+                        ) + (fx.Int32(gu * (TILE_N // 32)) + j32) * fx.Int32(64)
+                    else:
+                        s_chunk = (n0 // fx.Int32(32)) * fx.Int32(SC_STRIDE_N0)
+                    sc_base[key] = s_chunk + lane_div_16 * fx.Int32(16) + lane_mod_16
 
         # Register staging of one W tile (raw fp4 dwordx4 + packed e8m0 dwords); the
         # tile for kt+1 is loaded into them while kt computes from SSA copies.
@@ -408,11 +471,15 @@ def compile_a8w4_gemm1(
 
         def load_w_global(base_k):
             # e8m0 dword of 128-K group g sits in K-block (base_k + g*128) // 256.
-            s_off = (base_k // fx.Int32(256)) * fx.Int32(64)
+            SKB = SC_KB_DW if TILE_W else 64  # dwords per 256-K scale block step
+            s_off = (base_k // fx.Int32(256)) * fx.Int32(SKB)
             for (key, g), r in s_regs.items():
-                idx = sc_base[key] + s_off + fx.Int32((g // 2) * 64)
+                idx = sc_base[key] + s_off + fx.Int32((g // 2) * SKB)
                 fx.copy(ws_atom, fx.slice(ws_tiles, (None, idx)), r)
-            w_off = (base_k // fx.Int32(128)) * fx.Int32(64)
+            if const_expr(TILE_W):
+                w_off = (base_k // fx.Int32(TILE_K)) * fx.Int32(W_TILE_U16)
+            else:
+                w_off = (base_k // fx.Int32(128)) * fx.Int32(64)
             for (gu, ni, g), r in w_regs.items():
                 idx = w_base[gu, ni] + w_off + fx.Int32(g * 64)
                 fx.copy(w_atom, fx.slice(w_tiles, (None, idx)), r)
@@ -428,6 +495,14 @@ def compile_a8w4_gemm1(
             for (gu, ni, g), r in w_regs.items():
                 v4 = fx.Vector(fx.memref_load_vec(r))
                 raw[gu, ni, g] = [fx.Int32(v4[j]) for j in range(4)]
+                if const_expr(fast_dec >= 2):
+                    # byte (g%2)*2 + npack of the dword, broadcast by one v_perm
+                    p = packed[sc_key[gu, ni], g]
+                    sel = (fx.Int32((g % 2) * 2) + sc_npack[gu, ni]) * fx.Int32(
+                        0x01010101
+                    )
+                    code[gu, ni, g] = _perm_u32(p, p, sel)
+                    continue
                 shift = fx.Int32((g % 2) * 16) + sc_npack[gu, ni] * fx.Int32(8)
                 code[gu, ni, g] = packed[sc_key[gu, ni], g].shrui(shift) & fx.Int32(
                     0xFF
@@ -526,15 +601,20 @@ def compile_a8w4_gemm1(
                 for ni in range_constexpr(N_REPEAT):
                     luts = [
                         [
-                            _fp8_lut(code[gu, ni, g], exps[gu][ni], flush_tiny)
+                            _fp8_lut_predelta(code[gu, ni, g])
+                            if fast_dec >= 2
+                            else _fp8_lut_fast(code[gu, ni, g], exps[gu][ni])
+                            if fast_dec
+                            else _fp8_lut(code[gu, ni, g], exps[gu][ni], flush_tiny)
                             for g in range_constexpr(K_GROUPS)
                         ]
                         for gu in range_constexpr(2)
                     ]
+                    dec = _fp4x8_to_fp8x8_fast if fast_dec else _fp4x8_to_fp8x8
                     for ku in range_constexpr(K_STEPS):
                         g, j = ku // 4, ku % 4
                         bs = [
-                            _fp4x8_to_fp8x8(raw[gu, ni, g][j], luts[gu][g])
+                            dec(raw[gu, ni, g][j], luts[gu][g])
                             for gu in range_constexpr(2)
                         ]
                         # A is re-read from LDS per N block (cheap) instead of holding
@@ -964,7 +1044,7 @@ def a8w4_gemm1(
     tile_m=64,
     tile_n=128,
     tile_k=256,
-    b_cache_mod=1,
+    b_cache_mod=2,
     xcd_swizzle=0,
     flush_tiny=True,
     pipeline=None,
@@ -977,6 +1057,8 @@ def a8w4_gemm1(
     tbl=None,
     rank=0,
     epoch=0,
+    w_layout="std",
+    fast_dec=False,
 ):
     """Host launcher. ``out`` is bf16 ``[sorted_expert_ids.numel()*tile_m, inter]``
     (``epilog="bf16"``), the local q8 buffer (``"q8"``), or ignored (``"q8push"``:
@@ -1007,6 +1089,8 @@ def a8w4_gemm1(
         ) if q8 else None,
         NPES=npes,
         MAX_TILES=sorted_expert_ids.numel() * (inter_dim // tile_n) if q8 else None,
+        w_layout=w_layout,
+        fast_dec=fast_dec,
     )
     grid = sorted_expert_ids.numel() * (inter_dim // tile_n)
     _run_compiled(
@@ -1028,6 +1112,69 @@ def a8w4_gemm1(
         torch.cuda.current_stream(),
     )
     return out
+
+
+def retile_w1(w1_u8, w1_scale_u8, *, num_experts, inter_dim, model_dim, tile_n, tile_k):
+    """Standard-preshuffled W1 / e8m0 scales -> the ``w_layout="tile"`` layout:
+    every (expert, n-block, K tile) becomes one contiguous run, gate then up.
+
+    W 1 KB chunks (n16 block x 128-K group): std [E][gu][NB][TILE_N/16][K/TILE_K]
+    [TILE_K/128] -> [E][NB][K/TILE_K][gu][TILE_N/16][TILE_K/128].
+    Scale 256 B chunks (n32 block x 256-K block): std [E][gu][NB][TILE_N/32][K/256]
+    -> [E][NB][K/256][gu][TILE_N/32]. Weight-static: do it once per weight."""
+    E, K, nb = num_experts, model_dim, inter_dim // tile_n
+    assert K % 256 == 0 and K % tile_k == 0 and tile_n % 32 == 0
+    w = w1_u8.reshape(E, 2, nb, tile_n // 16, K // tile_k, tile_k // 128, 1024)
+    w = w.permute(0, 2, 4, 1, 3, 5, 6).contiguous().view(-1)
+    assert w1_scale_u8.numel() == E * 2 * inter_dim * K // 32, w1_scale_u8.numel()
+    s = w1_scale_u8.reshape(E, 2, nb, tile_n // 32, K // 256, 256)
+    s = s.permute(0, 2, 4, 1, 3, 5).contiguous().view(-1)
+    return w, s
+
+
+def prep_w1_fast_decode(w_u8):
+    """W bytes (any of the layouts above) -> the ``fast_dec`` form, per dword:
+    nibble order k0..k7 -> byte j = (k_j | k_{j+4} << 4), and -0 (0x8) -> +0."""
+    b = w_u8.reshape(-1, 4)
+    nib = torch.stack([b & 0xF, b >> 4], dim=-1).reshape(-1, 8)  # k0..k7
+    nib = torch.where(nib == 8, torch.zeros_like(nib), nib)
+    return (nib[:, :4] | (nib[:, 4:] << 4)).contiguous().view(-1)
+
+
+def prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp):
+    """``fast_dec=2`` prep on the STANDARD-preshuffled W1 bytes / e8m0 scale bytes
+    (before ``retile_w1`` / ``prep_w1_fast_decode``): scale byte ->
+    min(max_code - code, 11) * 8, and W of flushed groups (max_code - code > 11,
+    which the kernel decodes to 0) set to 0. ``w1_exp``: ``channel_exponents``.
+
+    W bytes are (N/16, K/128, klane 4, nlane 16, 16 B): 16 B = the 32-K group
+    kg = k128*4 + klane of column n = n16*16 + nlane. Scale bytes are (N/32, K/256,
+    klane 4, nlane 16, kpack 2, npack 2): column n32*32 + npack*16 + nlane, group
+    k256*8 + kpack*4 + klane."""
+    NT = w1_exp.numel()  # all experts' output channels
+    K = w1_u8.numel() * 2 // NT
+    G = K // 32
+    assert K % 256 == 0 and NT % 32 == 0 and w1_scale_u8.numel() == NT * G
+    s6 = w1_scale_u8.reshape(NT // 32, K // 256, 4, 16, 2, 2)
+    code = s6.permute(0, 5, 3, 1, 4, 2).reshape(NT, G).to(torch.int32)
+    max_code = w1_exp.reshape(NT, 1).to(torch.int32)
+    assert torch.equal(code.amax(-1, keepdim=True), max_code), "channel max mismatch"
+    diff = max_code - code
+    d8 = (diff.clamp(max=11) * 8).to(torch.uint8)
+    s = d8.view(NT // 32, 2, 16, K // 256, 2, 4).permute(0, 3, 5, 2, 4, 1)
+    flushed = (diff > 11).view(NT // 16, 16, K // 128, 4).permute(0, 2, 3, 1)
+    w = w1_u8.reshape(NT // 16, K // 128, 4, 16, 16).clone()
+    w[flushed] = 0
+    return w.view(w1_u8.shape), s.contiguous().view(-1)
+
+
+def prep_w1_fast(w1_u8, w1_scale_u8, w1_exp, fast_dec):
+    """Standard-preshuffled W1 / scale bytes -> the ``fast_dec`` (1 or 2) form for
+    the std ``w_layout``. ``w1_exp`` must come from the ORIGINAL scales."""
+    assert fast_dec in (1, 2), fast_dec
+    if fast_dec == 2:
+        w1_u8, w1_scale_u8 = prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp)
+    return prep_w1_fast_decode(w1_u8).view(w1_u8.shape), w1_scale_u8
 
 
 # =============================================================================
@@ -1084,7 +1231,7 @@ def bench_a8w4_gemm1(
     routing="uniform",
     tile_m=32,
     tile_n=128,
-    b_cache_mod=1,
+    b_cache_mod=2,
     xcd_swizzle=1,
     flush_tiny=True,
     pipeline=None,
@@ -1141,7 +1288,18 @@ def bench_a8w4_gemm1(
     def _out():
         return torch.zeros((sorted_size, inter_dim), dtype=dtypes.bf16, device=device)
 
-    out_new, out_port = _out(), _out()
+    out_new, out_port, out_tile, out_fd, out_fd2 = _out(), _out(), _out(), _out(), _out()
+    w1_tile, w1_scale_tile = retile_w1(
+        w1_u8,
+        w1_scale_u8,
+        num_experts=expert,
+        inter_dim=inter_dim,
+        model_dim=model_dim,
+        tile_n=tile_n,
+        tile_k=tile_k,
+    )
+    w1_fd1, w1_scale_fd1 = prep_w1_fast(w1_u8, w1_scale_u8, w1_exp, 1)
+    w1_fd2, w1_scale_fd2 = prep_w1_fast(w1_u8, w1_scale_u8, w1_exp, 2)
     candidates = {
         # this file's standalone kernel
         "a8w4_gemm1": lambda: a8w4_gemm1(
@@ -1189,6 +1347,75 @@ def bench_a8w4_gemm1(
             b_exp=w1_exp,
             flush_tiny=flush_tiny,
         ),
+        # standalone kernel on the retiled (per-WG K-tile contiguous) W layout
+        "a8w4_tile": lambda: a8w4_gemm1(
+            x_fp8,
+            x_scale,
+            w1_tile,
+            w1_scale_tile,
+            w1_exp,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out_tile,
+            num_experts=expert,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            b_cache_mod=b_cache_mod,
+            xcd_swizzle=xcd_swizzle,
+            flush_tiny=flush_tiny,
+            pipeline=pipeline,
+            waves_per_eu=waves_per_eu,
+            dyn_m=dyn_m,
+            w_layout="tile",
+        ),
+        # fast decode 1 (nibble-reordered, no -0 W), production std layout
+        "a8w4_fd1": lambda: a8w4_gemm1(
+            x_fp8,
+            x_scale,
+            w1_fd1,
+            w1_scale_fd1,
+            w1_exp,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out_fd,
+            num_experts=expert,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            b_cache_mod=b_cache_mod,
+            xcd_swizzle=xcd_swizzle,
+            flush_tiny=flush_tiny,
+            pipeline=pipeline,
+            waves_per_eu=waves_per_eu,
+            dyn_m=dyn_m,
+            fast_dec=1,
+        ),
+        # + per-group delta precomputed in the scale bytes, flushed groups zeroed
+        "a8w4_fd2": lambda: a8w4_gemm1(
+            x_fp8,
+            x_scale,
+            w1_fd2,
+            w1_scale_fd2,
+            w1_exp,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out_fd2,
+            num_experts=expert,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            b_cache_mod=b_cache_mod,
+            xcd_swizzle=xcd_swizzle,
+            flush_tiny=flush_tiny,
+            pipeline=pipeline,
+            waves_per_eu=waves_per_eu,
+            dyn_m=dyn_m,
+            fast_dec=2,
+        ),
     }
 
     routed = token * topk
@@ -1226,6 +1453,9 @@ def bench_a8w4_gemm1(
         ret[f"{name} cos"] = _cos_diff(ref_v, out_v)
     # Same math as the port (only scheduling differs): expect bit-identical rows.
     ret["bitexact vs port"] = bool(torch.equal(out_new[rows], out_port[rows]))
+    ret["tile bitexact"] = bool(torch.equal(out_tile[rows], out_new[rows]))
+    ret["fd bitexact"] = bool(torch.equal(out_fd[rows], out_new[rows]))
+    ret["fd2 bitexact"] = bool(torch.equal(out_fd2[rows], out_new[rows]))
     return ret
 
 
@@ -1252,10 +1482,13 @@ def test_a8w4_gemm1_silu(
         tile_m=tile_m,
         dyn_m=dyn_m,
     )
-    for name in ("a8w4_gemm1", "port"):
+    for name in ("a8w4_gemm1", "port", "a8w4_tile", "a8w4_fd1", "a8w4_fd2"):
         assert ret[f"{name} err"] <= TOL_ERR_RATIO, f"{name} mismatch {ret}"
         assert ret[f"{name} cos"] < 1e-4, f"{name} cos diff too large {ret}"
     assert ret["bitexact vs port"], f"standalone kernel diverged from port {ret}"
+    assert ret["tile bitexact"], f"tile W layout diverged from std layout {ret}"
+    assert ret["fd bitexact"], f"fast decode diverged from std decode {ret}"
+    assert ret["fd2 bitexact"], f"fast decode 2 diverged from std decode {ret}"
 
 
 def main():

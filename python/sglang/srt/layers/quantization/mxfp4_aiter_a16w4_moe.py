@@ -19,10 +19,17 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm1 import a8w4_gemm1
-from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm2 import a8w4_gemm2
+from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm1 import a8w4_gemm1, prep_w1_fast
+from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm2 import a8w4_gemm2, prep_w2_fast
 from aiter.fused_moe import moe_sorting
 from aiter import ActivationType, QuantType, dtypes
+
+# Fast fp4 decode of gemm1 / gemm2 (bit-exact vs 0). 1: W nibbles reordered
+# and -0 -> +0 (drops the interleave / sign perms). 2: additionally stores the
+# per-group scale delta vs the channel max and zeroes flushed groups (one
+# v_perm LUT); W2's scale buffer then carries its channel max codes. W / scales
+# are rewritten in place, so the aiter-runner path in ``apply`` needs 0.
+A8W4_FAST_DEC = 2
 
 # block_m -> (gemm1 kwargs, gemm2 kwargs). Both stages share the sorting block_m.
 #  32: gemm1 pipelined (prefetch) + XCD swizzle; gemm2 skips all-padding sub-blocks.
@@ -52,6 +59,8 @@ def a8w4_fused_moe(
     from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import quantize_rows
 
     g1_cfg, g2_cfg = A8W4_E2E_CFGS[block_m]
+    g1_cfg = dict(g1_cfg, fast_dec=weights.get("w1_fast_dec", 0))
+    g2_cfg = dict(g2_cfg, fast_dec=weights.get("w2_fast_dec", 0))
     E, model_dim, _ = weights["w2"].shape
     inter_dim = weights["w1"].shape[1] // 2
 
@@ -222,15 +231,29 @@ class Mxfp4AiterA16W4MoEMethod:
 
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import channel_exponents
         w1_u8 = layer.w13_weight.data.view(torch.uint8)
+        w2_u8 = layer.w2_weight.data.view(torch.uint8)
         w1_scale_u8 = layer.w13_weight_scale_inv.data.view(torch.uint8).contiguous().view(-1)
         w2_scale_u8 = layer.w2_weight_scale_inv.data.view(torch.uint8).contiguous().view(-1)
+        w1_exp = channel_exponents(w1_u8, w1_scale_u8)  # from the original scales
+
+        fast_dec = A8W4_FAST_DEC
+        if fast_dec:
+            # Swap the layer storage to the rewritten bytes so the originals are freed.
+            w1_u8, w1_scale_u8 = prep_w1_fast(w1_u8, w1_scale_u8, w1_exp, fast_dec)
+            w2_u8, w2_scale_u8 = prep_w2_fast(w2_u8, w2_scale_u8, fast_dec)
+            layer.w13_weight.data = w1_u8.view(fp4_dtype)
+            layer.w2_weight.data = w2_u8.view(fp4_dtype)
+            layer.w13_weight_scale_inv = torch.nn.Parameter(w1_scale_u8, requires_grad=False)
+            layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale_u8, requires_grad=False)
 
         layer.all_weights = dict(
             w1=w1_u8,
-            w2=layer.w2_weight.data.view(torch.uint8),
+            w2=w2_u8,
             w1_scale=w1_scale_u8,
             w2_scale=w2_scale_u8,
-            w1_exp=channel_exponents(w1_u8, w1_scale_u8),
+            w1_exp=w1_exp,
+            w1_fast_dec=fast_dec,
+            w2_fast_dec=fast_dec,
         )
 
         layer.dispatcher.set_quant_config(

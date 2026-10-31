@@ -35,7 +35,10 @@ if [[ -n "${AITER_ROOT:-}" ]]; then
 fi
 export PYTHONPATH="${SGLANG_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-export SGLANG_MXFP4_TO_FP8_128BLOCK=1
+# SGLANG_MXFP4_TO_FP8_128BLOCK=0 to enable weight-decompression based mxfp4 a8w4 support
+#export AITER_CONFIG_FMOE=/sgl-workspace/aiter/mimo_v2.6_flash_a8w4_tuned_fmoe.csv
+export SGLANG_MXFP4_TO_FP8_128BLOCK=0
+
 export SGLANG_INT4_WEIGHT=0
 # MiMo's encoder otherwise defaults to a CUDA-only attention implementation.
 export MM_ATTENTION_BACKEND=aiter_attn

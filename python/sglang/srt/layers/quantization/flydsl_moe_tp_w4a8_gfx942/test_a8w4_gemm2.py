@@ -77,7 +77,7 @@ EPI_DRAIN = os.environ.get("EPI_DRAIN", "1") == "1"
 BF16_FAST = os.environ.get("BF16_FAST", "0") == "1"
 # fp4 -> fp8 decode without the even/odd interleave v_perms ("_wp", 2 of 6 perms
 # per dword). Correct with the STANDARD preshuffled weight: the single-hot probe
-# (experiments/scripts/wperm_probe.py) pairs A[k] with W[k] either way; the reason
+# (experiments/fused_ar_opt_ab/wperm_probe.py) pairs A[k] with W[k] either way; the reason
 # was not pinned down. No measurable speedup (doc sec 11), so off by default.
 WPERM = os.environ.get("WPERM", "0") == "1"
 # persistent-lite experiment: launch PERSIST * #CU compute CTAs that loop over the
@@ -161,6 +161,42 @@ def _fp4x8_to_fp8x8(raw, lut):
         lo32 = _perm_u32(odd, even, 0x05010400).bitcast(fx.Int32)
         hi32 = _perm_u32(odd, even, 0x07030602).bitcast(fx.Int32)
     return fx.Vector.from_elements([lo32, hi32], fx.Int32).bitcast(fx.Float8E4M3FNUZ)
+
+
+# ---- fast decode (``fast_dec``, same scheme as test_a8w4_gemm1.py) ---------------
+# W pre-transformed by ``prep_w2_fast``: byte j of a dword = (k_j, k_{j+4}) and no -0,
+# so even/odd nibbles decode straight to K 0..3 / 4..7 and the sign is a bit move.
+# fast_dec=2 also stores min(max-code, 11)*8 per group in the scale bytes (flushed
+# groups zeroed in W) and the per-channel max codes (int32) right after the scales.
+
+
+def _fp8_lut_fast(group_code, max_code):
+    difference = max_code - group_code
+    delta = fx.min(difference, 11).to(fx.Uint32) * fx.Uint32(0x08080808)
+    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
+    hi = fx.Uint32(0x7C787470) - delta
+    flushed = difference > 11
+    lo = flushed.select(fx.Uint32(0), lo)
+    hi = flushed.select(fx.Uint32(0), hi)
+    smask = flushed.select(fx.Uint32(0), fx.Uint32(0x80808080))
+    return lo, hi, smask
+
+
+def _fp8_lut_predelta(delta):
+    delta = fx.Uint32(delta)
+    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
+    hi = fx.Uint32(0x7C787470) - delta
+    return lo, hi, fx.Uint32(0x80808080)
+
+
+def _fp4x8_to_fp8x8_fast(raw, lut):
+    lo, hi, smask = lut
+    raw = fx.Uint32(raw)
+    even = ((raw << 4) & smask) | _perm_u32(hi, lo, raw & 0x07070707)
+    odd = (raw & smask) | _perm_u32(hi, lo, (raw >> 4) & 0x07070707)
+    return fx.Vector.from_elements(
+        [even.bitcast(fx.Int32), odd.bitcast(fx.Int32)], fx.Int32
+    ).bitcast(fx.Float8E4M3FNUZ)
 
 
 def _channel_factor(exponent):
@@ -481,6 +517,7 @@ def compile_a8w4_gemm2(
     CHUNK_N=512,
     AR=None,
     AR_SEP=False,
+    fast_dec=0,
 ):
     """Build the A8W4 stage2 launcher (N = model_dim, K = inter_dim).
 
@@ -533,6 +570,7 @@ def compile_a8w4_gemm2(
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     assert (BM * TILE_K) % (256 * 16) == 0, "A tile must be whole 16 B per thread"
     assert epilog in ("direct", "lds"), f"epilog must be direct or lds, got {epilog!r}"
+    assert fast_dec in (0, 1, 2) and (flush_tiny or not fast_dec), fast_dec
     assert A_GROUP in (0, 128), f"A_GROUP must be 0 or 128, got {A_GROUP}"
     assert TILE_ORDER in ("m", "n", "nx", "g"), TILE_ORDER
     assert N_OUT % CHUNK_N == 0 and CHUNK_N % TILE_N == 0
@@ -590,6 +628,7 @@ def compile_a8w4_gemm2(
         f"_bcm{b_cache_mod}_xcd{xcd_swizzle}{wpe_tag}{ftz_tag}_{epilog}"
         f"{'_dr' if EPI_DRAIN and epilog == 'lds' else ''}"
         f"{'_bf' if BF16_FAST and epilog == 'lds' else ''}{'_wp' if WPERM else ''}"
+        f"{f'_fd{fast_dec}' if fast_dec else ''}"
         f"{f'_p{PERSIST}' if PERSIST else ''}"
         f"{'_dyn' if dyn_rows else ''}{f'_ag{A_GROUP}' if A_GROUP else ''}"
         f"{'' if TILE_ORDER == 'm' else '_o' + TILE_ORDER}{'_probe' if PROBE else ''}"
@@ -689,12 +728,28 @@ def compile_a8w4_gemm2(
         code = {}  # code[ni, G]: this lane's e8m0 byte of 128-K group G
         for ni in range_constexpr(N_REPEAT):
             for G in range_constexpr(K // 128):
+                if const_expr(fast_dec == 2):
+                    # byte (G%2)*2 + npack = delta*8, broadcast by one v_perm
+                    p = packed[sc_key[ni], G // 2]
+                    sel = (fx.Int32((G % 2) * 2) + sc_npack[ni]) * fx.Int32(0x01010101)
+                    code[ni, G] = _perm_u32(p, p, sel)
+                    continue
                 shift = fx.Int32((G % 2) * 16) + sc_npack[ni] * fx.Int32(8)
                 code[ni, G] = packed[sc_key[ni], G // 2].shrui(shift) & fx.Int32(0xFF)
         # Per-output-channel max e8m0 code over K: lane max, then across the 4
-        # lanes (L//16) that share the column.
+        # lanes (L//16) that share the column (fast_dec=2: stored after the scales).
         exp_n = []
         for ni in range_constexpr(N_REPEAT):
+            if const_expr(fast_dec == 2):
+                n_lane = expert_off + by_n + n_wave_base + fx.Int32(ni * 16) + lane_mod_16
+                exp_n.append(
+                    fx.Int32(
+                        _global_i32_at(
+                            fx.Int64(arg_w_scale) + fx.Int64(WS_BYTES), n_lane
+                        )
+                    )
+                )
+                continue
             mx = code[ni, 0]
             for G in range_constexpr(1, K // 128):
                 mx = (code[ni, G] > mx).select(code[ni, G], mx)
@@ -798,11 +853,16 @@ def compile_a8w4_gemm2(
                 gpu.barrier()  # A(kt) visible in LDS
                 for ni in range_constexpr(N_REPEAT):
                     luts = [
-                        _fp8_lut(code[ni, base_k // 128 + g], exp_n[ni], flush_tiny)
+                        _fp8_lut_predelta(code[ni, base_k // 128 + g])
+                        if fast_dec == 2
+                        else _fp8_lut_fast(code[ni, base_k // 128 + g], exp_n[ni])
+                        if fast_dec
+                        else _fp8_lut(code[ni, base_k // 128 + g], exp_n[ni], flush_tiny)
                         for g in range_constexpr(K_GROUPS)
                     ]
+                    dec = _fp4x8_to_fp8x8_fast if fast_dec else _fp4x8_to_fp8x8
                     for ku in range_constexpr(K_STEPS):
-                        b8 = _fp4x8_to_fp8x8(raw[ni][ku // 4][ku % 4], luts[ku // 4])
+                        b8 = dec(raw[ni][ku // 4][ku % 4], luts[ku // 4])
                         gg = base_k // 128 + ku // 4  # 128-K group of this K step
                         acc = accg[gg if A_GROUP else 0]
                         for mi in range_constexpr(M_REPEAT):
@@ -1175,12 +1235,14 @@ def a8w4_gemm2(
     rank=0,
     epoch=0,
     ar_sep=False,
+    fast_dec=0,
 ):
     """Host launcher. ``out`` is bf16 ``[tokens, model_dim]``; it is accumulated
     into (atomics), so the caller zeroes it (moe_sorting's moe_buf already is).
     ``a_group=128``: ``a_scale`` is f32 [sorted_size, inter_dim/128].
     ``dbg``: int64 [m_blocks * n_blocks * 2] -> per-WG timestamp probe.
-    ``ar``/``tbl``/``rank``/``epoch``: fused all-reduce (see gemm2_ar_fused)."""
+    ``ar``/``tbl``/``rank``/``epoch``: fused all-reduce (see gemm2_ar_fused).
+    ``fast_dec``: 1/2 need ``w2`` / ``w2_scale`` from ``prep_w2_fast``."""
     tokens, model_dim = out.shape
     if ar is not None and len(ar) > 6 and ar[6]:
         tokens //= ar[6]  # route mode: out is [tokens * topk, model_dim]
@@ -1204,6 +1266,7 @@ def a8w4_gemm2(
         CHUNK_N=chunk_n,
         AR=ar,
         AR_SEP=ar_sep,
+        fast_dec=fast_dec,
     )
     grid = sorted_expert_ids.numel() * (model_dim // tile_n)
     if PERSIST:  # k compute CTAs per CU (multiple of 8: XCD-aligned)
@@ -1229,6 +1292,29 @@ def a8w4_gemm2(
         torch.cuda.current_stream(),
     )
     return out
+
+
+def prep_w2_fast(w2_u8, w2_scale_u8, fast_dec):
+    """Standard-preshuffled W2 [E, N, K/2] / e8m0 scale bytes -> the ``fast_dec``
+    (1/2) form (weight-static, once per weight). fast_dec=2 returns the scale
+    buffer with the per-channel max codes (int32 [E*N]) appended after the
+    rewritten scale bytes (the kernel reads them at offset WS_BYTES)."""
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import channel_exponents
+
+    if __package__:
+        from .test_a8w4_gemm1 import prep_w1_fast
+    else:  # run as a standalone script
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from test_a8w4_gemm1 import prep_w1_fast
+
+    w2_scale_u8 = w2_scale_u8.contiguous().view(-1)
+    exp = channel_exponents(w2_u8, w2_scale_u8)
+    w, s = prep_w1_fast(w2_u8, w2_scale_u8, exp, fast_dec)
+    if fast_dec == 2:
+        s = torch.cat([s, exp.contiguous().view(-1).view(torch.uint8)])
+    return w, s
 
 
 # =============================================================================
@@ -1368,35 +1454,38 @@ def bench_a8w4_gemm2(
     def _out():
         return torch.zeros((token, model_dim), dtype=dtypes.bf16, device=device)
 
-    out_new, out_port = _out(), _out()
+    out_new, out_port, out_fd1, out_fd2 = _out(), _out(), _out(), _out()
+    w2_fd = {fd: prep_w2_fast(w2_u8, w2_scale_u8, fd) for fd in (1, 2)}
+
+    def _standalone(out, w, ws, fd):
+        return lambda: a8w4_gemm2(
+            a_fp8,
+            a_scale,
+            w,
+            ws,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            out,
+            num_experts=expert,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            b_cache_mod=b_cache_mod,
+            xcd_swizzle=xcd_swizzle,
+            flush_tiny=flush_tiny,
+            waves_per_eu=waves_per_eu,
+            epilog=epilog,
+            dyn_rows=dyn_rows,
+            a_group=a_group,
+            tile_order=tile_order,
+            fast_dec=fd,
+        )
+
     candidates = {
         # this file's standalone kernel
-        "a8w4_gemm2": (
-            out_new,
-            lambda: a8w4_gemm2(
-                a_fp8,
-                a_scale,
-                w2_u8,
-                w2_scale_u8,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                out_new,
-                num_experts=expert,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                b_cache_mod=b_cache_mod,
-                xcd_swizzle=xcd_swizzle,
-                flush_tiny=flush_tiny,
-                waves_per_eu=waves_per_eu,
-                epilog=epilog,
-                dyn_rows=dyn_rows,
-                a_group=a_group,
-                tile_order=tile_order,
-            ),
-        ),
+        "a8w4_gemm2": (out_new, _standalone(out_new, w2_u8, w2_scale_u8, 0)),
         # production a16w4 port built for fp8r (baseline)
         "port": (
             out_port,
@@ -1426,6 +1515,9 @@ def bench_a8w4_gemm2(
                 flush_tiny=flush_tiny,
             ),
         ),
+        # fast decode on prep_w2_fast weights (1: nibble/sign, 2: + scale deltas)
+        "a8w4_fd1": (out_fd1, _standalone(out_fd1, *w2_fd[1], 1)),
+        "a8w4_fd2": (out_fd2, _standalone(out_fd2, *w2_fd[2], 2)),
     }
     if a_group:  # the port only takes per-row A scales
         del candidates["port"]
@@ -1495,7 +1587,8 @@ def test_a8w4_gemm2(
         dyn_rows=dyn_rows,
         a_group=a_group,
     )
-    for name in ("a8w4_gemm2",) if a_group else ("a8w4_gemm2", "port"):
+    names = ("a8w4_gemm2", "a8w4_fd1", "a8w4_fd2")
+    for name in names if a_group else names + ("port",):
         assert ret[f"{name} err"] <= TOL_ERR_RATIO, f"{name} mismatch {ret}"
         assert ret[f"{name} cos"] < 1e-4, f"{name} cos diff too large {ret}"
 

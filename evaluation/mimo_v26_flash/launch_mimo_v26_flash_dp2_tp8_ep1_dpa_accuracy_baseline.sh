@@ -28,6 +28,9 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export SGLANG_FLYPA_MIMO_PREFILL="${SGLANG_FLYPA_MIMO_PREFILL:-1}"
 export SGLANG_FLYDSL_MIMO_PREFILL=0
 export SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d
+# Use paged metadata for the draft too; avoids its unused legacy PA workspace.
+export SGLANG_USE_AITER_UNIFIED_ATTN="${SGLANG_USE_AITER_UNIFIED_ATTN:-1}"
+export SGLANG_AITER_UNIFIED_VERIFY="${SGLANG_AITER_UNIFIED_VERIFY:-1}"
 export SGLANG_AITER_PA_DECODE_IMPL="${SGLANG_AITER_PA_DECODE_IMPL:-flydsl}"
 # Both attention families must select FlyDSL to allocate native V128 caches.
 export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL="${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL:-${SGLANG_AITER_PA_DECODE_IMPL}}"
@@ -38,19 +41,20 @@ export SGLANG_AITER_MIMO_FRESH_BF16_ASM=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=0
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
 
-# DPA divides both limits by DP2: 32K prefill and 96 requests/group.
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-65536}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-192}"
+# DPA divides both limits by DP2: 16K prefill and 96 requests/group.
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-1048576}"
 CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_DIR="${LOG_DIR:-${SGLANG_ROOT}/evaluation/logs/mimo_dp_attention_${RUN_ID}}"
-ENABLE_DFLASH="${ENABLE_DFLASH:-0}"
+ENABLE_DFLASH="${ENABLE_DFLASH:-1}"
 default_mem_fraction=0.75
 dflash_args=()
 case "${ENABLE_DFLASH}" in
   0) ;;
   1)
-    # Five draft KV layers mirror target slots outside the target KV budget.
+    # Five draft KV layers mirror full target slots and are included in sizing.
     # TP8 MoE frees more target capacity; reserve scratch for 32K prefill too.
     default_mem_fraction=0.60
     export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-flydsl}"

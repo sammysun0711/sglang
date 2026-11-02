@@ -2,6 +2,11 @@
 set -euo pipefail
 
 # Prefill-only client benchmark.
+# Default customer_pressure follows the executable arrays in
+# benchmark_sglang_prefill.sh: OSL=1, text prompts, 32 warmups on the first
+# selected case only. Its 4K/8K rows differ from that script's header comments.
+# Set DATASET_PATH to the customer's ShareGPT JSON; when unset, bench_serving
+# uses its standard cached/downloaded ShareGPT dataset. Model/host/port are local.
 # The legacy customer preset's server reference is CHUNKED_PREFILL_SIZE=65536. Run the
 # same client matrix against separately launched TBO/radix-cache configurations
 # and record those server-side settings with each result.
@@ -18,12 +23,46 @@ set -euo pipefail
 # Server topology, chunk size, quantization and backends are configured separately.
 # NUM_PROMPTS_OVERRIDE overrides all counts; SMALL_INPUT_NUM_PROMPTS_OVERRIDE
 # overrides counts for inputs <=8K. PROMPT_WAVES/MIN_NUM_PROMPTS are sweep-only.
-benchmark_preset="${BENCHMARK_PRESET:-simple}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+export PYTHONPATH="${SGLANG_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
+benchmark_preset="${BENCHMARK_PRESET:-customer_pressure}"
 dry_run="${DRY_RUN:-0}"
 model="${MODEL:-/models/MiMo-V2.6-Flash-MOPD}"
 host="${HOST:-0.0.0.0}"
 port="${PORT:-30001}"
+dataset_path="${DATASET_PATH:-}"
+default_warmup_requests=4
+declare -A matrix_output_tokens matrix_num_prompts matrix_concurrency
 case "${benchmark_preset}" in
+  customer_pressure)
+    short_input_max_tokens=65536
+    default_tokens=""
+    # ISL      OSL  measured prompts  global concurrency
+    while read -r isl osl prompts concurrency; do
+      default_tokens+="${default_tokens:+ }${isl}"
+      matrix_output_tokens["${isl}"]="${osl}"
+      matrix_num_prompts["${isl}"]="${prompts}"
+      matrix_concurrency["${isl}"]="${concurrency}"
+    done <<'CUSTOMER_PRESSURE_MATRIX'
+4096       1    1536    96
+8192       1    1024    48
+16384      1    512     32
+32768      1    256     32
+65536      1    128     32
+131072     1    64      16
+262144     1    32      8
+524288     1    16      4
+786432     1    10      4
+1048000    1    8       4
+CUSTOMER_PRESSURE_MATRIX
+    default_small_concurrency="${matrix_concurrency[4096]}"
+    default_short_concurrency="${matrix_concurrency[16384]}"
+    default_long_concurrency="${matrix_concurrency[1048000]}"
+    default_small_num_prompts="${matrix_num_prompts[4096]}"
+    default_warmup_requests=32
+    ;;
   customer)
     default_tokens="4096 8192 16384 32768 65536 131068 262144 524284 786428 1047548"
     default_small_concurrency="32"
@@ -51,13 +90,12 @@ case "${benchmark_preset}" in
   mimo_v26_flash)
     short_input_max_tokens=65536
     default_tokens=""
-    declare -A flash_output_tokens flash_num_prompts flash_concurrency
     # ISL     OSL  measured prompts  global concurrency
     while read -r flash_isl flash_osl flash_prompts flash_c; do
       default_tokens+="${default_tokens:+ }${flash_isl}"
-      flash_output_tokens["${flash_isl}"]="${flash_osl}"
-      flash_num_prompts["${flash_isl}"]="${flash_prompts}"
-      flash_concurrency["${flash_isl}"]="${flash_c}"
+      matrix_output_tokens["${flash_isl}"]="${flash_osl}"
+      matrix_num_prompts["${flash_isl}"]="${flash_prompts}"
+      matrix_concurrency["${flash_isl}"]="${flash_c}"
     done <<'MIMO_V26_FLASH_MATRIX'
 8192      1    1024    32
 16384     1    1024    32
@@ -68,13 +106,13 @@ case "${benchmark_preset}" in
 524288    1    32      4
 983040    1    16      4
 MIMO_V26_FLASH_MATRIX
-    default_small_concurrency="${flash_concurrency[8192]}"
-    default_short_concurrency="${flash_concurrency[16384]}"
-    default_long_concurrency="${flash_concurrency[983040]}"
-    default_small_num_prompts="${flash_num_prompts[8192]}"
+    default_small_concurrency="${matrix_concurrency[8192]}"
+    default_short_concurrency="${matrix_concurrency[16384]}"
+    default_long_concurrency="${matrix_concurrency[983040]}"
+    default_small_num_prompts="${matrix_num_prompts[8192]}"
     ;;
   *)
-    echo "BENCHMARK_PRESET must be customer, sweep, simple, or mimo_v26_flash, observed '${benchmark_preset}'" >&2
+    echo "BENCHMARK_PRESET must be customer_pressure, customer, sweep, simple, or mimo_v26_flash, observed '${benchmark_preset}'" >&2
     exit 2
     ;;
 esac
@@ -84,7 +122,7 @@ output_tokens=1
 small_input_concurrency_list="${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_small_concurrency}}}"
 short_concurrency_list="${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_short_concurrency}}"
 long_concurrency_list="${LONG_CONCURRENCY_LIST_OVERRIDE:-${default_long_concurrency}}"
-warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
+warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-${default_warmup_requests}}"
 tokenize_prompt="${TOKENIZE_PROMPT:-0}"
 small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-${default_small_num_prompts}}"
 prompt_waves="${PROMPT_WAVES:-4}"
@@ -123,14 +161,16 @@ concurrency_spec_for_input() {
   local input_tokens="$1"
   if [[ -n "${CONCURRENCY_LIST_OVERRIDE:-}" ]]; then
     echo "${CONCURRENCY_LIST_OVERRIDE}"
+  elif [[ "${benchmark_preset}" == "customer_pressure" || "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    if (( input_tokens <= 8192 )); then
+      echo "${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_CONCURRENCY_LIST_OVERRIDE:-${matrix_concurrency[${input_tokens}]}}}"
+    elif (( input_tokens <= short_input_max_tokens )); then
+      echo "${SHORT_CONCURRENCY_LIST_OVERRIDE:-${matrix_concurrency[${input_tokens}]}}"
+    else
+      echo "${LONG_CONCURRENCY_LIST_OVERRIDE:-${matrix_concurrency[${input_tokens}]}}"
+    fi
   elif (( input_tokens <= 8192 )); then
     echo "${small_input_concurrency_list}"
-  elif [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
-    if (( input_tokens <= short_input_max_tokens )); then
-      echo "${SHORT_CONCURRENCY_LIST_OVERRIDE:-${flash_concurrency[${input_tokens}]}}"
-    else
-      echo "${LONG_CONCURRENCY_LIST_OVERRIDE:-${flash_concurrency[${input_tokens}]}}"
-    fi
   elif [[ "${benchmark_preset}" == "simple" ]] && (( input_tokens <= 65536 )); then
     if (( input_tokens <= 16384 )); then
       echo "${short_concurrency_list}"
@@ -150,10 +190,14 @@ num_prompts_for_input() {
   local input_tokens="$1" concurrency="$2" num_prompts
   if [[ -n "${NUM_PROMPTS_OVERRIDE:-}" ]]; then
     echo "${NUM_PROMPTS_OVERRIDE}"
+  elif [[ "${benchmark_preset}" == "customer_pressure" || "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    if (( input_tokens <= 8192 )) && [[ -n "${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-}" ]]; then
+      echo "${SMALL_INPUT_NUM_PROMPTS_OVERRIDE}"
+    else
+      echo "${matrix_num_prompts[${input_tokens}]}"
+    fi
   elif (( input_tokens <= 8192 )); then
     echo "${small_input_num_prompts}"
-  elif [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
-    echo "${flash_num_prompts[${input_tokens}]}"
   elif [[ "${benchmark_preset}" == "simple" ]]; then
     echo 64
   elif [[ "${benchmark_preset}" == "customer" ]]; then
@@ -182,13 +226,13 @@ if (( ${#TOKEN_LIST[@]} == 0 )); then
 fi
 for input_tokens in "${TOKEN_LIST[@]}"; do
   require_positive_integer "Input length" "${input_tokens}"
-  if [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
-    if [[ -z "${flash_num_prompts[${input_tokens}]+set}" ]]; then
-      echo "mimo_v26_flash has no row for input ${input_tokens}; select from: ${default_tokens}" >&2
+  if [[ "${benchmark_preset}" == "customer_pressure" || "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    if [[ -z "${matrix_num_prompts[${input_tokens}]+set}" ]]; then
+      echo "${benchmark_preset} has no row for input ${input_tokens}; select from: ${default_tokens}" >&2
       exit 2
     fi
-    require_positive_integer "Output length" "${flash_output_tokens[${input_tokens}]}"
-    require_positive_integer "Measured prompts" "${flash_num_prompts[${input_tokens}]}"
+    require_positive_integer "Output length" "${matrix_output_tokens[${input_tokens}]}"
+    require_positive_integer "Measured prompts" "${matrix_num_prompts[${input_tokens}]}"
   fi
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   if (( ${#concurrency_list[@]} == 0 )); then
@@ -201,6 +245,12 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
 done
 
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
+echo "Dataset: ${dataset_path:-standard ShareGPT cache/download}; tokenize-prompt=${tokenize_prompt}"
+if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
+  echo "Client matrix: benchmark_sglang_prefill.sh active arrays; ${warmup_requests} warmups on the first selected case only."
+  echo "Offered request rate is unlimited; each case uses its global concurrency cap."
+  echo "Server topology, chunk size, DFlash, quantization and radix-cache mode are configured separately."
+fi
 if [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
   echo "Client matrix: MiMo-v2.6-Flash-H200-prefill-data.csv; input K=1024 tokens."
   echo "Record actual server topology, effective chunk size, TBO, quantization, and backends with results."
@@ -217,20 +267,26 @@ if [[ "${dry_run}" == "0" ]]; then
   mkdir -p "$LOG_DIR"
 fi
 
+test_count=0
+failed_cases=()
 for input_tokens in "${TOKEN_LIST[@]}"; do
-  if [[ "${benchmark_preset}" == "mimo_v26_flash" ]]; then
-    output_tokens="${flash_output_tokens[${input_tokens}]}"
+  if [[ "${benchmark_preset}" == "customer_pressure" || "${benchmark_preset}" == "mimo_v26_flash" ]]; then
+    output_tokens="${matrix_output_tokens[${input_tokens}]}"
   fi
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
+    current_warmup="${warmup_requests}"
+    if [[ "${benchmark_preset}" == "customer_pressure" ]] && (( test_count > 0 )); then
+      current_warmup=0
+    fi
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Output Token = ${output_tokens}, Concurrency = ${concurrency} | Run 1"
-    echo "Measured prompts = ${num_prompts}, warmups = ${warmup_requests}"
+    echo "Measured prompts = ${num_prompts}, warmups = ${current_warmup}"
     echo "Log file: benchmark_${input_tokens}_con${concurrency}.log"
     echo "============================================================"
 
-    benchmark_cmd=(python3 -m sglang.bench_serving \
+    benchmark_cmd=("${PYTHON_BIN}" -m sglang.bench_serving \
         --backend sglang \
         --model "${model}" \
         --host "${host}" \
@@ -242,8 +298,11 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --flush-cache \
         --seed 12345 \
         --num-prompts "${num_prompts}" \
-        --warmup-requests "${warmup_requests}" \
+        --warmup-requests "${current_warmup}" \
         --max-concurrency "${concurrency}")
+    if [[ -n "${dataset_path}" ]]; then
+      benchmark_cmd+=(--dataset-path "${dataset_path}")
+    fi
     if [[ "${tokenize_prompt}" == "1" ]]; then
       benchmark_cmd+=(--tokenize-prompt)
     fi
@@ -252,14 +311,27 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
     printf ' %q' "${benchmark_cmd[@]}"
     printf '\n'
     if [[ "${dry_run}" == "0" ]]; then
-      "${benchmark_cmd[@]}" 2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"
+      if "${benchmark_cmd[@]}" 2>&1 | tee "$LOG_DIR/benchmark_${input_tokens}_con${concurrency}.log"; then
+        :
+      else
+        benchmark_status=$?
+        if [[ "${benchmark_preset}" != "customer_pressure" ]]; then
+          exit "${benchmark_status}"
+        fi
+        failed_cases+=("${input_tokens}/C${concurrency}")
+        echo "Benchmark failed: input=${input_tokens}, concurrency=${concurrency}, exit=${benchmark_status}; continuing remaining cases." >&2
+      fi
     fi
+    test_count=$((test_count + 1))
     echo -e "============================================================\n"
   done
 done
 
 if [[ "${dry_run}" == "1" ]]; then
   echo "Dry run complete; no benchmark requests sent."
+elif (( ${#failed_cases[@]} > 0 )); then
+  echo "Completed ${test_count} cases with ${#failed_cases[@]} failures: ${failed_cases[*]}" >&2
+  exit 1
 else
   echo "All lengths and concurrency tests completed!"
 fi

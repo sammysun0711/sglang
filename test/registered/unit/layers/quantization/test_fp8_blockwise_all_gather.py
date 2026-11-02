@@ -49,3 +49,9 @@ def test_packet_rejects_incompatible_shapes_and_dtype():
         Fp8BlockwisePacket.allocate(2, 130, torch.float8_e4m3fnuz, "cpu")
     with pytest.raises(ValueError):
         Fp8BlockwisePacket.allocate(2, 256, torch.bfloat16, "cpu")
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

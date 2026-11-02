@@ -118,3 +118,9 @@ def test_hip_masks_padded_expert_ids_without_eplb(monkeypatch):
     )
     assert result.tolist() == [[2, 3], [0, 0]]
     assert weights.tolist() == [[1.0, 1.0], [0.0, 0.0]]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

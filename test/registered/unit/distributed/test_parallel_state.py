@@ -446,21 +446,4 @@ def test_aiter_all_gather_capture_copy_in(
 
 
 if __name__ == "__main__":
-    # Run tests without requiring GPUs
-    import sys
-
-    try:
-        test_parallel_group_construction_tp8_attn_cp2(False)
-        test_parallel_group_construction_tp8_attn_cp2(True)
-        test_parallel_group_construction_tp8_moe_ep4_cp2()
-
-        sys.exit(0)
-    except AssertionError as e:
-        print(f"\n Test failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n Unexpected error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    sys.exit(pytest.main([__file__]))

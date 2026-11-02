@@ -665,6 +665,8 @@ class Envs:
     SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
     # Fuse compact-window request-table preparation without reading GPU sizes.
     SGLANG_DFLASH_FUSED_COMPACT_KV = EnvBool(False)
+    # Fill the existing CPU length buffers through shared NumPy views.
+    SGLANG_DFLASH_FAST_CPU_STAGING = EnvBool(False)
     # Opt-in grouped PA for MiMo target DFlash SWA verification.
     SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)
     # Keep target graphs enabled while comparing eager and captured DP drafts.

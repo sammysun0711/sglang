@@ -50,7 +50,9 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter = ModuleType("aiter")
     fake_aiter.__path__ = []
     fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
-    fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
+    fake_aiter.QuantType = SimpleNamespace(
+        per_1x32="per_1x32", per_128x128="per_128x128"
+    )
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
@@ -215,6 +217,44 @@ def test_aiter_runner_adds_ep_tuning_sentinel_for_legacy_aiter(monkeypatch):
     assert captured["topk_ids"][0, -1].item() == expert_mask.numel()
     assert captured["topk_weight"][0, -1].item() == 0
     assert captured["expert_mask"].tolist() == [1, 1, 0, 0]
+
+
+def test_aiter_runner_forwards_shared_output(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    inp = _runner_input()
+    inp.quant_type = AiterQuantType.PER_128X128
+    inp.output_buffer = torch.empty_like(inp.hidden_states)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    result = runner.run(
+        inp, _quant_info(quant_type=AiterQuantType.PER_128X128), running_state={}
+    )
+    assert captured["output"] is inp.output_buffer
+    assert result.hidden_states is inp.output_buffer
+
+
+def test_aiter_runner_rejects_shared_output_for_other_quantization(monkeypatch):
+    _install_fake_aiter(monkeypatch, lambda **kwargs: None)
+    inp = _runner_input()
+    inp.output_buffer = torch.empty_like(inp.hidden_states)
+    runner = AiterRunnerCore(MoeRunnerConfig())
+    with pytest.raises(ValueError, match="FP8 blockscale"):
+        runner.run(inp, _quant_info(), running_state={})
+
+
+def test_aiter_runner_rejects_shared_output_for_unquantized_weights(monkeypatch):
+    _install_fake_aiter(monkeypatch, lambda **kwargs: None)
+    inp = _runner_input()
+    inp.quant_type = AiterQuantType.PER_128X128
+    inp.output_buffer = torch.empty_like(inp.hidden_states)
+    runner = AiterRunnerCore(MoeRunnerConfig())
+    with pytest.raises(ValueError, match="FP8 blockscale"):
+        runner.run(inp, _quant_info(quant_type=AiterQuantType.NONE), running_state={})
 
 
 if __name__ == "__main__":

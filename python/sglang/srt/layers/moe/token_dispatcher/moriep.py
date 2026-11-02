@@ -21,6 +21,8 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPPDispatchHooks
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
+    MoeRunnerBackend,
+    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -86,6 +88,7 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    combine_output_buffer: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -526,9 +529,13 @@ class _MoriEPDispatcherImplBase:
 
 
 class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
-    def __init__(self, async_finish: bool, **kwargs):
+    def __init__(self, async_finish: bool, zero_copy_combine: bool = False, **kwargs):
         super().__init__(**kwargs)
 
+        self.zero_copy_combine = zero_copy_combine
+        self._combine_input_buffer = None
+        # Per-call override leaves the shared, cached MORI op config unchanged.
+        self._combine_kwargs = {"use_external_inp_buf": 0} if zero_copy_combine else {}
         self.async_finish = async_finish
         self.quant_config = {}
         self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
@@ -537,6 +544,29 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self._comm_stream = None
         if self.enable_dual_stream:
             self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+
+    def _prepare_combine_input_buffer(self):
+        if not self.zero_copy_combine or self._combine_input_buffer is not None:
+            return
+        import mori
+
+        if (
+            self.dispatch_dtype != DispatchDtype.fp8
+            or self.combine_dtype != CombineDtype.bf16
+            or self.params_dtype != torch.bfloat16
+            or self.mori_op.config.kernel_type
+            != mori.ops.EpDispatchCombineKernelType.IntraNode
+        ):
+            raise ValueError(
+                "SGLANG_MORI_ZERO_COPY_COMBINE requires intranode FP8 dispatch "
+                "and BF16 combine/output"
+            )
+        # MORI owns this allocation separately from dispatchOut. Cache the view
+        # before dispatch; there is no allocation or GPU count read per batch.
+        self._combine_input_buffer = self.mori_op.get_registered_combine_input_buffer(
+            torch.bfloat16, self.hidden_size
+        )
+        logger.info("MORI zero-copy combine: AITER writes registered BF16 output")
 
     def _capture_event_if_async(self) -> Optional[torch.cuda.Event]:
         assert self.enable_dual_stream, "dual stream must be enabled"
@@ -639,6 +669,11 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            combine_output_buffer=(
+                self._combine_input_buffer[: packed_recv_hidden.shape[0]]
+                if self.zero_copy_combine
+                else None
+            ),
         )
 
     def _dispatch_core(
@@ -651,6 +686,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
+        self._prepare_combine_input_buffer()
         record = _should_record_expert_distribution()
 
         if self._comm_stream:
@@ -767,6 +803,11 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
+        if self.zero_copy_combine and (
+            hidden_states.data_ptr() != self._combine_input_buffer.data_ptr()
+        ):
+            raise ValueError("MORI zero-copy combine must receive its registered buffer")
+
         if self._comm_stream:
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream
@@ -799,7 +840,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
 
         else:
             combined_hidden_states = self.mori_op.combine(
-                hidden_states, None, topk_ids
+                hidden_states, None, topk_ids, **self._combine_kwargs
             )[0]
 
         return combined_hidden_states, done_event
@@ -1014,6 +1055,17 @@ class MoriEPDispatcher(BaseDispatcher):
         super().__init__()
 
         self.deepep_mode = deepep_mode
+        zero_copy_combine = get_bool_env_var("SGLANG_MORI_ZERO_COPY_COMBINE")
+        if zero_copy_combine and (
+            deepep_mode != DeepEPMode.NORMAL
+            or get_moe_runner_backend() != MoeRunnerBackend.AITER
+            or is_tbo_enabled()
+            or get_bool_env_var("MORI_ENABLE_SDMA", "false")
+        ):
+            raise ValueError(
+                "SGLANG_MORI_ZERO_COPY_COMBINE requires AITER, --deepep-mode normal, "
+                "TBO disabled, and MORI_ENABLE_SDMA=0"
+            )
 
         async_mode = self.deepep_mode.enable_low_latency()
         if get_bool_env_var("SGLANG_ROCM_USE_MULTI_STREAM") and not async_mode:
@@ -1047,6 +1099,7 @@ class MoriEPDispatcher(BaseDispatcher):
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _MoriEPDispatcherImplNormal(
                 async_finish=async_finish,
+                zero_copy_combine=zero_copy_combine,
                 **common_kwargs,
             )
 

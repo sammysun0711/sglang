@@ -84,6 +84,7 @@ class AiterRunnerInput(RunnerInput):
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    output_buffer: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -239,6 +240,14 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        if runner_input.output_buffer is not None:
+            if (
+                runner_input.quant_type != AiterQuantType.PER_128X128
+                or quant_info.quant_type != AiterQuantType.PER_128X128
+                or self.config.no_combine
+            ):
+                raise ValueError("MORI shared output requires FP8 blockscale AITER MoE")
+            extra["output"] = runner_input.output_buffer
         if runner_input.a1_scale_is_transposed:
             if not _aiter_fused_moe_supports_transposed_a1_scale():
                 raise NotImplementedError(
@@ -421,6 +430,7 @@ def _pre_permute_deepep_to_aiter(
     a1_scale: Optional[torch.Tensor] = None
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    output_buffer = getattr(dispatch_output, "combine_output_buffer", None)
     quant_type = quant_info.quant_type
 
     if is_mori:
@@ -440,6 +450,8 @@ def _pre_permute_deepep_to_aiter(
                 a1_scale = a1_scale[:mori_max]
             topk_ids = topk_ids[:mori_max]
             topk_weights = topk_weights[:mori_max]
+            if output_buffer is not None:
+                output_buffer = output_buffer[:mori_max]
 
         # Upscale dispatched activations when there is no AITER kernel for the
         # weight/activation dtype pair.
@@ -529,6 +541,7 @@ def _pre_permute_deepep_to_aiter(
         a1_scale=a1_scale,
         num_local_tokens=num_local_tokens,
         output_dtype=output_dtype,
+        output_buffer=output_buffer,
     )
 
 

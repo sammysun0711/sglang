@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
+from .flydsl_moe_tp_w4a8_gfx942.a8w4_moe_tuned import tuned_moe
 from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm1 import a8w4_gemm1, prep_w1_fast
 from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm2 import a8w4_gemm2, prep_w2_fast
 from aiter.fused_moe import moe_sorting
@@ -285,8 +286,16 @@ class Mxfp4AiterA16W4MoEMethod:
             from sglang.srt.layers.moe.topk import TopKOutputChecker            
             topk_output = dispatch_output.topk_output
             hidden_states = dispatch_output.hidden_states
-            output = a8w4_fused_moe(hidden_states, layer.all_weights,
-                                    topk_output.topk_weights, topk_output.topk_ids, block_m=64, fuse_quant=True)
+            if layer.all_weights["w1_fast_dec"] == 2:
+                # per-batch-size best of 2-kernel / fused single-kernel variants
+                # (flydsl_moe_tp_w4a8_gfx942/configs/a8w4_moe_tuned.txt; untuned
+                # shapes fall back to the 2-kernel bm64 config)
+                output = tuned_moe(hidden_states, layer.all_weights,
+                                   topk_output.topk_weights, topk_output.topk_ids)
+            else:
+                output = a8w4_fused_moe(hidden_states, layer.all_weights,
+                                        topk_output.topk_weights, topk_output.topk_ids,
+                                        block_m=64, fuse_quant=True)
             return StandardCombineInput(hidden_states=output)
 
         from aiter.ops.flydsl.moe_common import GateMode

@@ -1044,7 +1044,7 @@ def a8w4_gemm1(
     tile_m=64,
     tile_n=128,
     tile_k=256,
-    b_cache_mod=2,
+    b_cache_mod=1,
     xcd_swizzle=0,
     flush_tiny=True,
     pipeline=None,

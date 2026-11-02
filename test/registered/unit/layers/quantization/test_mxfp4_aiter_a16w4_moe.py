@@ -197,6 +197,52 @@ class TestMxfp4AiterA16W4MoEMethod(CustomTestCase):
                 # gemm2's bf16 atomic accumulation order.
                 self.assertLess(_cos_diff(outs[0], outs[2]), 1e-4)
 
+    def test_tuned_moe_kernel_combinations(self):
+        """Every kernel kind tuned_moe can dispatch to (2-kernel base / nt4, fused
+        single kernel with ksplit 1 / 2, persistent work-queue fused) on the same
+        fd2 weights matches the 2-kernel default."""
+        from aiter.fused_moe import fused_topk
+
+        from sglang.srt.layers.quantization.flydsl_moe_tp_w4a8_gfx942 import (
+            a8w4_moe_tuned as tm,
+        )
+
+        _, layer = self._make_layer(2)
+        W = layer.all_weights
+        cfgs = [
+            dict(kind="2k", block_m=32, g1_bcm=2, g2="base"),
+            dict(kind="2k", block_m=64, g1_bcm=1, g2="nt4"),
+            dict(kind="1k", block_m=64, bcm=1, wpe=2, ksplit=1),
+            dict(kind="1k", block_m=64, bcm=2, wpe=2, ksplit=2),
+            dict(kind="1kq", block_m=64, bcm=1),
+        ]
+        for tokens in (1, 37, 512):
+            x = torch.randn((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+            score = torch.randn((tokens, E), dtype=torch.bfloat16, device="cuda")
+            tw, ti = fused_topk(x, score, TOPK, True)
+            ref = tm.run_config(tm.DEFAULT_CFG, x, W, tw, ti).float().clone()
+            self.assertEqual(
+                tm.lookup_config(tokens, HIDDEN, INTER, E, TOPK), tm.DEFAULT_CFG
+            )  # untuned shape -> default
+            for cfg in cfgs:
+                with self.subTest(tokens=tokens, cfg=tm.config_name(cfg)):
+                    out = tm.run_config(cfg, x, W, tw, ti)
+                    self.assertEqual(tuple(out.shape), (tokens, HIDDEN))
+                    self.assertLess(_cos_diff(ref, out.float()), 1e-4)
+
+    def test_tuned_lookup(self):
+        """num_tokens rounds up to 2^N and clamps to the table range."""
+        from sglang.srt.layers.quantization.flydsl_moe_tp_w4a8_gfx942 import (
+            a8w4_moe_tuned as tm,
+        )
+
+        table = tm._load_table(tm.DEFAULT_CSV)
+        key = (4096, 256, 256, 8, "uniform")
+        self.assertIn(key, table)
+        rows = dict(table[key])
+        for tokens, t2 in ((1, 1), (3, 4), (1000, 1024), (3000, 4096), (10**6, 32768)):
+            self.assertEqual(tm.lookup_config(tokens, *key), rows[t2])
+
 
 if __name__ == "__main__":
     unittest.main()

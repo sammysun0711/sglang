@@ -83,7 +83,7 @@ cd /sgl-workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-### Run DP2 + attention TP4 + EP8 prefill benchmark
+### Run DP2/TP8 with DP attention and EP8 prefill benchmark
 
 Launch global TP8 with DP attention, MORI EP8,
 and DFlash block 8. TBO is disabled in this launcher. The global prefill chunk
@@ -100,7 +100,7 @@ SGLANG_USE_PYHIP_MIMO_PREFILL=1 \
 DISABLE_RADIX_CACHE=1 \
 ENABLE_DFLASH=1 \
 PERFORMANCE_MODE=1 \
-./launch_mimo_v26_flash_dp2_tp4_ep8_dflash_accuracy_baseline.sh
+./launch_mimo_v26_flash_dp2_tp8_ep8_dpa_accuracy_baseline.sh
 ```
 
 `PERFORMANCE_MODE=1` enables fake expert routing. The server uses ordinary
@@ -116,7 +116,7 @@ In another terminal, run the full `mimo_v26_flash` preset:
 cd /sgl-workspace/sglang/evaluation
 BENCHMARK_PRESET=mimo_v26_flash \
 HOST=127.0.0.1 \
-LOG_DIR=./logs/mimo_v26_flash_dp2_attn_tp4_ep8_prefill \
+LOG_DIR=./logs/mimo_v26_flash_dp2_tp8_ep8_dpa_prefill \
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 

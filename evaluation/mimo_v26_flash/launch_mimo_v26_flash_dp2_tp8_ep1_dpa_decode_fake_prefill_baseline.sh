@@ -15,7 +15,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EVALUATION_DIR="$(dirname -- "${SCRIPT_DIR}")"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Accept the older decode-launcher names while preferring baseline names.
 if [[ -z "${MODEL_PATH:-}" && -n "${MODEL:-}" ]]; then
@@ -31,7 +30,6 @@ if [[ -z "${SPECULATIVE_DRAFT_MODEL_PATH:-}" && -n "${SPECULATIVE_DRAFT_MODEL:-}
   export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL}"
 fi
 
-export SGLANG_PROFILE_V2=0
 MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD/}"
 export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL_PATH:-${MODEL_PATH%/}/dflash}"
 export DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-8}"
@@ -126,7 +124,7 @@ export SGLANG_SIMULATE_ACC_METHOD=match-expected
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-5000}"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-5000}"
 DECODE_LOG_INTERVAL="${DECODE_LOG_INTERVAL:-1}"
-WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-300}"
+WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1200}"
 
 for name in MAX_RUNNING_REQUESTS TOKENIZER_WORKER_NUM DFLASH_BLOCK_SIZE \
   CHUNKED_PREFILL_SIZE CUDA_GRAPH_MAX_BS_DECODE DECODE_LOG_INTERVAL WATCHDOG_TIMEOUT; do
@@ -218,7 +216,9 @@ echo "Quick Reduce: disabled; mixed-router=${SGLANG_MIMO_MIXED_ROUTER}; custom a
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 
-server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
+# Select one system ROCm runtime in the parent and spawned workers. ROCm 7.2.4
+# fixes graph activity delivery without missing kernel in profiler trace
+server_cmd=(python3 -u "${EVALUATION_DIR}/launch_rocm_server.py" \
   --mm-attention-backend "${MM_ATTENTION_BACKEND}" \
   --model-path "${MODEL_PATH}" \
   --skip-server-warmup \

@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Set SGLANG_PROFILE_V2=0 to select the classic profiler and ensure use consistent
-# HIP/HSA runtime in the SERVER process before startup as follow:
-#    bash /mimo_v26_flash/launch_mimo_v26_flash_dp2_tp8_ep1_dpa_accuracy_baseline.sh
+# Classic profiling is the current server default when SGLANG_PROFILE_V2 is unset.
+# The current V2 manager does not support this client's manual start/stop flow.
+# The MiMo decode baseline launcher uses launch_rocm_server.py to load one system
+# ROCm runtime before Torch, including in spawned workers. ROCm 7.2.4 fixes the
+# graph activity-delivery issue without adding waits to graph replay:
+#   bash mimo_v26_flash/launch_mimo_v26_flash_dp2_tp8_ep1_dpa_decode_fake_prefill_baseline.sh
 # Set SGLANG_PROFILE_WITH_STACK and SGLANG_PROFILE_RECORD_SHAPES in that server
 # environment: 1 enables collection, 0 disables it to reduce profiling overhead.
 # Then run this profiling client separately:
 #   INPUT_TOKENS=1040000 OUTPUT_TOKENS=20 MAX_CONCURRENCY=24 NUM_PROMPTS=48 \
 #     WARMUP_REQUESTS=32 FAKE_PREFILL=1 TOKENIZE_PROMPT=1 ./run_sglang_profile.sh
-# For SGLANG_PROFILE_V2=0, we can enable _flush_rocm_profiler_activity function in
-# python/sglang/srt/managers/scheduler_components/profiler_manager.py to use same
-#
 # Setting SGLANG_PROFILE_V2 only on this client cannot change a running server.
 # Torch and HIP/HSA/ROCTracer runtime selection belongs to the server environment;
 # SGLANG_PROFILE_V2 selects the profiler implementation, not the runtime libraries.
 #
-# The classic /stop_profile handler synchronizes GPU work, then drains ROCTracer
-# activity three times before stopping Kineto and exporting. This drains profiler
-# records.
+# The classic /stop_profile handler synchronizes completed GPU work, calls the
+# live ROCTracer's stop/drain API, then stops Kineto and exports. There is no
+# Python sleep or repeated flush; exclude teardown from workload latency analysis.
+# Use the same server runtime for throughput benchmarks and profiling. The old
+# Torch-bundled ROCm 7.2.0 runtime can lose graph records despite successful flush.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 input_tokens="${INPUT_TOKENS:-8192}"

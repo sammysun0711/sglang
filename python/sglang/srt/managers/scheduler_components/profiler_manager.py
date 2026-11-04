@@ -44,11 +44,12 @@ logger = logging.getLogger(__name__)
 from sglang.srt.utils.profile_utils import ProfileManager
 
 
-def _flush_rocm_profiler_activity():
-    """Drain the live ROCTracer before Kineto stops consuming GPU records.
+def _stop_rocm_profiler_activity():
+    """Stop and drain the live ROCTracer before Kineto finalizes GPU records.
 
-    This flushes profiling records. A mixed HIP/HSA runtime cannot be repaired
-    by flushing a second, newly loaded tracer.
+    ROCm 7.2.4's stop API drains pending activity. This runs only at the end of
+    profiling; graph replay remains asynchronous. A second tracer cannot drain
+    records from a mixed runtime.
     """
     names = ("libamdhip64.so", "libhsa-runtime64.so", "libroctracer64.so")
     loaded = {name: set() for name in names}
@@ -70,20 +71,13 @@ def _flush_rocm_profiler_activity():
     torch.cuda.synchronize()
     library = next(iter(loaded["libroctracer64.so"]))
     tracer = ctypes.CDLL(library)
-    flush = tracer.roctracer_flush_activity
-    flush.argtypes = []
-    flush.restype = ctypes.c_int
-    statuses = []
-    # GPU completion and delivery by ROCTracer's asynchronous consumer are
-    # separate. Repeated drains avoid losing the final graph dispatch records.
-    for index in range(3):
-        status = flush()
-        statuses.append(status)
-        if status != 0:
-            raise RuntimeError(f"roctracer_flush_activity returned {status}")
-        if index < 2:
-            time.sleep(0.25)
-    return {"library": library, "statuses": statuses}
+    stop = tracer.roctracer_stop
+    stop.argtypes = []
+    stop.restype = None
+    # Let native activity delivery finish before Kineto flushes its own HIP_OPS
+    # pool. Flushing ROCTracer's default pool does not drain Kineto's pool.
+    stop()
+    return {"library": library}
 
 
 @dataclass(kw_only=True)
@@ -350,14 +344,14 @@ class SchedulerProfilerManager:
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
-        flush_error = None
+        drain_error = None
         if self.torch_profiler is not None:
             if torch.version.hip and "GPU" in self.profiler_activities:
                 try:
-                    self.last_rocm_profile_flush = _flush_rocm_profiler_activity()
+                    self.last_rocm_profile_drain = _stop_rocm_profiler_activity()
                 except (OSError, AttributeError, RuntimeError) as error:
-                    flush_error = str(error)
-                    logger.warning("ROCm trace drain failed: %s", flush_error)
+                    drain_error = str(error)
+                    logger.warning("ROCm trace drain failed: %s", drain_error)
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
@@ -424,10 +418,10 @@ class SchedulerProfilerManager:
         self.profiler_active_stage = None
 
         return ProfileReqOutput(
-            success=flush_error is None,
+            success=drain_error is None,
             message=(
-                f"Trace exported, but GPU record completeness is unverified: {flush_error}"
-                if flush_error
+                f"Trace exported, but GPU record completeness is unverified: {drain_error}"
+                if drain_error
                 else f"Succeeded.{merge_message}"
             ),
         )

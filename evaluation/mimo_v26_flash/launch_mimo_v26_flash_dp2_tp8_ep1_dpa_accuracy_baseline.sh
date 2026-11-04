@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Eight GPUs, global MoE TP8, two attention TP4 groups, FP8 experts.
+# Eight GPUs, global MoE TP8, two attention TP4 groups, FP8 experts by default.
 # Stage 1 is non-speculative; ENABLE_DFLASH=1 selects the stage-2 draft.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -9,7 +9,16 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD/}"
 export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT:-/root/workspace/aiter}${PYTHONPATH:+:${PYTHONPATH}}"
 
-export SGLANG_MXFP4_TO_FP8_128BLOCK=1
+export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-1}"
+case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
+  0)
+    moe_weight_description="native MXFP4 experts"
+    # Native A16W4/A8W4 expects BF16 input, not fused per-block FP8 activations.
+    export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
+    ;;
+  1) moe_weight_description="converted FP8 experts" ;;
+  *) echo "SGLANG_MXFP4_TO_FP8_128BLOCK must be 0 or 1" >&2; exit 2 ;;
+esac
 export SGLANG_INT4_WEIGHT=0
 export SGLANG_USE_AITER=1
 export SGLANG_MOE_PADDING=1
@@ -100,7 +109,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
 )
 
 echo "Experimental MiMo DP attention: global TP8 / attention DP2 x TP4 / EP1"
-echo "FP8 experts; DP LM head; DFlash=${ENABLE_DFLASH}; vision attention TP=4; TBO disabled"
+echo "${moe_weight_description}; DP LM head; DFlash=${ENABLE_DFLASH}; vision attention TP=4; TBO disabled"
 echo "Requested chunk=${CHUNKED_PREFILL_SIZE}, requests=${MAX_RUNNING_REQUESTS}; each is divided by DP2"
 printf 'Command:'
 printf ' %q' "${server_cmd[@]}"

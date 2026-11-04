@@ -22,14 +22,22 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 if is_cuda():
     from sgl_kernel.flash_attn import flash_attn_varlen_func
+elif is_hip():
+
+    def flash_attn_varlen_func(*args, **kwargs):
+        # Keep AITER optional while registering models; audio execution on ROCm
+        # uses the same packed-sequence, causal and local-window contract.
+        from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
+
+        return aiter_flash_attn_varlen_func(*args, **kwargs)
 else:
 
     def flash_attn_varlen_func(*args, **kwargs):
-        raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
+        raise RuntimeError("MiMoAudioTokenizer requires CUDA or ROCm to run.")
 
 
 logger = logging.getLogger(__name__)

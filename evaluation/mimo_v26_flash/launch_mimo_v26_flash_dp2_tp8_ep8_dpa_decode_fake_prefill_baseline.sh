@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Eight GPUs: global TP8 / EP8, two attention TP4 groups, dense TP1, DFlash.
 # Fake-prefill decode launcher for gfx942 with simulated acceptance mean 3.5.
+# Throughput tests use fake expert routing, fake prefill, and simulated acceptance.
 # Default: native MXFP4 weights, with BF16 MORI dispatch/combine.
 # Set AITER_CONFIG_FMOE to the forthcoming EP8 A16W4/A8W4 recipe. With it unset,
 # AITER uses its normal config lookup/heuristics; no EP8 tuning is claimed.
@@ -35,7 +36,7 @@ export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL_PATH:-${MODEL_PAT
 export DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-8}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-30001}"
-export AITER_ROOT="${AITER_ROOT:-/workspace/aiter}"
+export AITER_ROOT="${AITER_ROOT:-/sgl-workspace/aiter}"
 export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-0}"
@@ -141,7 +142,6 @@ export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-0}"
 export SGLANG_MORI_DISPATCH_DTYPE="${SGLANG_MORI_DISPATCH_DTYPE:-${mori_dispatch_dtype_default}}"
 export SGLANG_MORI_COMBINE_DTYPE="${SGLANG_MORI_COMBINE_DTYPE:-bf16}"
 unset MORI_DISABLE_P2P
-export ENABLE_FAKE_EP_DISPATCH="${ENABLE_FAKE_EP_DISPATCH:-1}"
 case "${MORI_MODE}" in
   normal|low_latency|auto) ;;
   *) echo "MORI_MODE must be normal, low_latency, or auto" >&2; exit 2 ;;
@@ -156,12 +156,10 @@ case "${MORI_EP_LAUNCH_CONFIG_MODE}" in
     ;;
   *) echo "MORI_EP_LAUNCH_CONFIG_MODE must be MANUAL or AUTO" >&2; exit 2 ;;
 esac
-for name in ENABLE_FAKE_EP_DISPATCH MORI_ENABLE_SDMA; do
-  if [[ "${!name}" != "0" && "${!name}" != "1" ]]; then
-    echo "${name} must be 0 or 1" >&2
-    exit 2
-  fi
-done
+if [[ "${MORI_ENABLE_SDMA}" != "0" && "${MORI_ENABLE_SDMA}" != "1" ]]; then
+  echo "MORI_ENABLE_SDMA must be 0 or 1" >&2
+  exit 2
+fi
 
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-5000}"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-5000}"
@@ -271,11 +269,6 @@ if [[ -n "${MAX_TOTAL_TOKENS:-}" ]]; then
   decode_args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
 fi
 
-ep_args=()
-if [[ "${ENABLE_FAKE_EP_DISPATCH}" == "1" ]]; then
-  ep_args+=(--ep-dispatch-algorithm fake)
-fi
-
 echo "MiMo-V2.6-Flash: ${moe_weight_description}"
 echo "MoE recipe file: ${AITER_CONFIG_FMOE:-AITER default lookup/heuristics (EP8 recipe pending)}"
 echo "Configuration: model=${MODEL_PATH}, global-tp=8, attention-dp=2 x tp=4, ep=8, moe-tp=1, dense-tp=1, dp-attention=enabled, dp-lm-head=enabled, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}"
@@ -285,7 +278,8 @@ echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT
 echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; compact draft table=${SGLANG_DFLASH_FUSED_COMPACT_KV}; fused bounds checks=${SGLANG_FUSED_ASYNC_OOB_CHECKS}; fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}; fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}"
 echo "Simulated acceptance: expected bonus-inclusive length=${SGLANG_SIMULATE_ACC_LEN}, method=${SGLANG_SIMULATE_ACC_METHOD} (throughput only)"
 echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
-echo "MORI: mode=${MORI_MODE}, sdma=${MORI_ENABLE_SDMA}, launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tuning-config=${MORI_EP_TUNING_CONFIG:-unset} (AUTO only), dispatch=${SGLANG_MORI_DISPATCH_DTYPE}, combine=${SGLANG_MORI_COMBINE_DTYPE}, capacity/rank=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}, fake-ep=${ENABLE_FAKE_EP_DISPATCH}"
+echo "MORI: mode=${MORI_MODE}, sdma=${MORI_ENABLE_SDMA}, launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tuning-config=${MORI_EP_TUNING_CONFIG:-unset} (AUTO only), dispatch=${SGLANG_MORI_DISPATCH_DTYPE}, combine=${SGLANG_MORI_COMBINE_DTYPE}, capacity/rank=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}"
+echo "Expert routing: fake (throughput only)"
 echo "Decode: preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, log-interval=${DECODE_LOG_INTERVAL}, watchdog=${WATCHDOG_TIMEOUT}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}"
 echo "Quick Reduce: disabled; mixed-router=${SGLANG_MIMO_MIXED_ROUTER}; custom all-reduce=${custom_all_reduce_status}; radix cache=${radix_cache_status}; tbo=${ENABLE_TWO_BATCH_OVERLAP}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
@@ -302,7 +296,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   --enable-dp-lm-head \
   --moe-a2a-backend mori \
   --deepep-mode "${MORI_MODE}" \
-  "${ep_args[@]}" \
+  --ep-dispatch-algorithm fake \
   --moe-dense-tp-size 1 \
   --moe-runner-backend aiter \
   --speculative-moe-a2a-backend none \

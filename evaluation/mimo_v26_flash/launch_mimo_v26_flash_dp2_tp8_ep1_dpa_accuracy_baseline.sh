@@ -76,7 +76,7 @@ case "${ENABLE_DFLASH}" in
 esac
 # MiMo vision stays within each attention TP4 replica.
 
-server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
+server_cmd=("${PYTHON_BIN}" -u "${SGLANG_ROOT}/evaluation/launch_rocm_server.py"
   --model-path "${MODEL_PATH}"
   --skip-server-warmup
   --tp-size 8 --dp-size 2 --ep-size 1

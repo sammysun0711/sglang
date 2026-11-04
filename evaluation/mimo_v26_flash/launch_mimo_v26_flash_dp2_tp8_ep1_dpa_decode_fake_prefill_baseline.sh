@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Eight GPUs: global MoE TP8, two attention TP4 groups, EP1, DFlash.
+# Eight GPUs: global MoE TP8, DP2, two attention TP4 groups, EP1, DFlash.
 # Fake-prefill decode launcher for gfx942 with simulated acceptance mean 3.5.
-# Default: native MXFP4 weights with adaptive A8W4 decode row tiles.
-# AITER_CONFIG_FMOE selects the MoE recipe; override it to compare another CSV.
-# Set SGLANG_MXFP4_TO_FP8_128BLOCK=1 for static FP8 blockscale conversion.
-# Requires AITER's gfx942 MXFP4 kernels (aiter PR #16) alongside Flash attention
-# support. Recipes must match Flash MoE TP8: model_dim=4096, inter_dim=256,
-# expert=256, topk=8; Pro TP8 recipes have different shapes.
-# Match the validated accuracy launcher's FlyDSL and fusion defaults. Fused
-# MoE RMSNorm requires AITER's N=4096/6144 kernel and a rebuilt RMS module.
+# - option 1 (Default A8W4 MOE: current best perf):
+#   set SGLANG_MXFP4_TO_FP8_128BLOCK=0, and unset AITER_CONFIG_FMOE to use native
+#   MXFP4 weights with adaptive A8W4 decode kernel integrate in sglang.
+# - option 2 (AITER A8W4 MoE recipe)
+#   set SGLANG_MXFP4_TO_FP8_128BLOCK=0, and set AITER_CONFIG_FMOE=aiter/mimo_v2.6_flash_decode_adaptive_a8w4.csv
+# - option 3 (AITER A8W8 Blockscale MOE)
+#   Set SGLANG_MXFP4_TO_FP8_128BLOCK=1 for static FP8 blockscale conversion, unset AITER_CONFIG_FMOE
+#   to use tuned AITER asm blockscale FP8 MOE
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EVALUATION_DIR="$(dirname -- "${SCRIPT_DIR}")"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -30,6 +31,7 @@ if [[ -z "${SPECULATIVE_DRAFT_MODEL_PATH:-}" && -n "${SPECULATIVE_DRAFT_MODEL:-}
   export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL}"
 fi
 
+export SGLANG_PROFILE_V2=0
 MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD/}"
 export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL_PATH:-${MODEL_PATH%/}/dflash}"
 export DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-8}"
@@ -37,7 +39,6 @@ SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-30001}"
 export AITER_ROOT="${AITER_ROOT:-/sgl-workspace/aiter}"
 export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-
 export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-0}"
 export SGLANG_INT4_WEIGHT=0
 case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
@@ -45,11 +46,6 @@ case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
     moe_weight_description="static FP8 blockscale MoE weights converted from MXFP4 at load time"
     ;;
   0)
-    export AITER_CONFIG_FMOE="${AITER_CONFIG_FMOE:-${AITER_ROOT}/mimo_v2.6_flash_decode_adaptive_a8w4.csv}"
-    if [[ "${DRY_RUN:-0}" != "1" && ! -r "${AITER_CONFIG_FMOE}" ]]; then
-      echo "AITER_CONFIG_FMOE is not readable: ${AITER_CONFIG_FMOE}" >&2
-      exit 2
-    fi
     # The fused MoE RMSNorm path produces per-1x128 FP8 activations, not the
     # BF16 input expected by the native A16W4/A8W4 MoE wrappers.
     export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
@@ -97,7 +93,6 @@ export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-${SGLANG_AI
 # FlyDSL handles Qlen8 directly; retain qlen-1 expansion for the Gluon fallback.
 export SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
 export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-96}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"

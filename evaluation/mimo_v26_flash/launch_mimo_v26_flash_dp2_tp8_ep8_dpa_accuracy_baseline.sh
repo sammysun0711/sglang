@@ -278,6 +278,7 @@ fi
 server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   "${mm_attention_args[@]}" \
   --model-path "${MODEL_PATH}" \
+  --skip-server-warmup \
   --tp-size 8 \
   --dp-size 2 \
   --ep-size 8 \

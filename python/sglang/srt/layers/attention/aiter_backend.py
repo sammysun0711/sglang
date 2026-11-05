@@ -3198,8 +3198,12 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
-            token_num = kv_indptr[-1]
-            kv_indices[token_num:] = kv_indices[0]
+            # Entries past kv_indptr[-1] get kv_indices[0], masked on the device:
+            # a host slice bound would need kv_indptr[-1].item() (a stream sync).
+            pos = torch.arange(
+                kv_indices.numel(), dtype=torch.int32, device=kv_indices.device
+            )
+            kv_indices = torch.where(pos >= kv_indptr[-1], kv_indices[0], kv_indices)
 
             extend_lens = seq_lens - prefix_lens
 
@@ -3222,10 +3226,9 @@ class AiterIndicesUpdaterPrefill:
                     page_size,
                     rounding_mode="floor",
                 ).to(torch.int32)
-                paged_kv_indptr = torch.empty(
+                paged_kv_indptr = torch.zeros(
                     bs + 1, dtype=torch.int32, device=req_pool_indices.device
                 )
-                paged_kv_indptr[0] = 0
                 torch.cumsum(page_lens, dim=0, out=paged_kv_indptr[1:])
 
                 # sum(ceil(seq_i / page_size)) is bounded by

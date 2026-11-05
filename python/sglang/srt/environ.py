@@ -518,6 +518,19 @@ class Envs:
     SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
     # Optional gfx942 BF16 MiMo full prefill, behind the existing FlyPA guards.
     SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
+    # gfx942 FP8 block-scale linears on the CK bpreshuffle path (>= 2048 tokens) via the
+    # FlyDSL kernel ported from PyHIP (layers/quantization/pyhip_fp8_blockscale_gemm.py).
+    # With SGLANG_ENABLE_DPA_SP on 8 ranks, the sequence-parallel TP MoE (I = 256 per rank)
+    # also runs PyHIP's MoE with the top-k sum fused into the reduce-scatter
+    # (layers/moe/pyhip_fp8_blockscale_moe.py).
+    SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
+    # MiMo DP attention with TP MoE (moe_a2a_backend=none), forward passes with >= 2048
+    # global tokens: the residual stays token-scattered over the attention-TP ranks. MoE
+    # all-gathers its FP8 input and reduce-scatters its output over the TP group;
+    # full-attention layers all-to-all the attention output into a full-weight o_proj;
+    # SWA layers in extend batches run QKV, attention (all heads) and o_proj on the token
+    # shard, exchanging only K/V and window halos. Decode and CUDA graphs are unchanged.
+    SGLANG_ENABLE_DPA_SP = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -925,7 +938,8 @@ class Envs:
     # lookup at the cost of replicated embedding weights). Drives both the
     # target and every draft that shares its embedding (see
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
-    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
+    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts
+    # and MiMo-V2 (+ MTP; DFlash uses the target embedding module).
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)

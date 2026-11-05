@@ -223,6 +223,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
+        # Targets that prefill token-sharded (MiMo SP) project the context on their shard.
+        set_projector = getattr(
+            self._target_worker.model_runner.model, "set_dflash_context_projector", None
+        )
+        if set_projector is not None:
+            set_projector(self.draft_model.project_target_hidden)
         self.draft_model_runner.draft_parallel_layout = self.draft_parallel_layout
         self.model_runner.draft_parallel_layout = self.draft_parallel_layout
         draft_cell_size = dflash_draft_cell_size_per_token(
@@ -999,6 +1005,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _target_hidden_is_projected(self, target_hidden: torch.Tensor) -> bool:
+        """The target already applied project_target_hidden (draft-width features)."""
+        width = int(target_hidden.shape[-1])
+        return width == int(self.draft_model.config.hidden_size) and width != int(
+            self.draft_model.fc.in_features
+        )
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1099,7 +1112,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(torch.int32)
 
         with torch.inference_mode(), self._draft_context():
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            ctx_hidden = (
+                target_hidden
+                if self._target_hidden_is_projected(target_hidden)
+                else self.draft_model.project_target_hidden(target_hidden)
+            )
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])

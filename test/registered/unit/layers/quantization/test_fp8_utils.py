@@ -368,6 +368,69 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 input.dtype,
             )
 
+    def test_aiter_tgemm_ptpc_loaded_weight_and_fused_input(self):
+        if not (fp8_utils._use_aiter and fp8_utils.is_gfx942_supported()):
+            self.skipTest("AITER PTPC tgemm requires gfx942 and SGLANG_USE_AITER=1")
+
+        import aiter
+        from compressed_tensors.quantization import QuantizationStrategy
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+            CompressedTensorsW8A8Fp8,
+        )
+
+        scheme = CompressedTensorsW8A8Fp8(
+            SimpleNamespace(
+                strategy=QuantizationStrategy.CHANNEL, block_structure=None
+            ),
+            is_static_input_scheme=False,
+        )
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.randn(64, 128).to(torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.linspace(0.01, 0.03, 64).view(-1, 1), requires_grad=False
+        )
+        canonical = layer.weight.float() * layer.weight_scale
+        scheme.process_weights_after_loading(layer)
+        self.assertEqual(tuple(layer.weight.shape), (64, 128))
+        self.assertTrue(layer.weight.is_shuffled)
+
+        x = torch.randn(2, 2, 128, dtype=torch.bfloat16)
+        qx, scale = aiter.per_token_quant_hip(
+            x.view(-1, 128), quant_dtype=aiter.dtypes.fp8
+        )
+        bias = torch.randn(64, dtype=torch.bfloat16)
+        fused = (qx.view_as(x), scale, x.dtype)
+        expected = ((qx.float() * scale) @ canonical.t() + bias.float()).view(2, 2, 64)
+        with envs.SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB.override(True):
+            for input in (x, fused):
+                with self.subTest(fused=isinstance(input, tuple)):
+                    output = scheme.apply_weights(layer, input, bias)
+                    self.assertEqual(output.dtype, x.dtype)
+                    self.assertEqual(tuple(output.shape), (2, 2, 64))
+                    torch.testing.assert_close(
+                        output.float(), expected, rtol=0.03, atol=0.03
+                    )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = scheme.apply_weights(layer, fused, bias)
+            for _ in range(2):
+                new_qx, new_scale = aiter.per_token_quant_hip(
+                    torch.randn_like(x).view(-1, 128), quant_dtype=aiter.dtypes.fp8
+                )
+                qx.copy_(new_qx)
+                scale.copy_(new_scale)
+                graph.replay()
+                expected = (
+                    (new_qx.float() * new_scale) @ canonical.t() + bias.float()
+                ).view(2, 2, 64)
+                torch.testing.assert_close(
+                    captured.float(), expected, rtol=0.03, atol=0.03
+                )
+
 
 class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
     """apply_fp8_linear with a pre-quantized fp8 activation must emit the

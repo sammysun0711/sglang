@@ -9,6 +9,7 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 from torch.nn import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -182,6 +183,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
+                # Parameter construction drops the shuffle tensor's metadata.
+                layer.weight.is_shuffled = True
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
@@ -232,6 +235,20 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(x, tuple):
+            if (
+                _use_aiter
+                and envs.SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB.get()
+                and getattr(layer.weight, "is_shuffled", False)
+                and self.strategy == QuantizationStrategy.CHANNEL
+                and x[1].numel() == x[0].numel() // x[0].shape[-1]
+                and (len(x) == 2 or x[2] == torch.bfloat16)
+            ):
+                return apply_fp8_ptpc_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                )
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
             # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;

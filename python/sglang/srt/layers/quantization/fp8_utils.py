@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -2343,7 +2344,11 @@ def can_auto_enable_marlin_fp8() -> bool:
 
 
 def apply_fp8_ptpc_linear(
-    input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    input: Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.dtype],
+    ],
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
@@ -2355,36 +2360,51 @@ def apply_fp8_ptpc_linear(
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
     """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend."""
-    # Handle pre-quantized (fp8_tensor, scale) tuple from fused RMSNorm+Quant
+    # Reuse fused quantization and preserve the original leading dimensions.
     if isinstance(input, tuple):
-        q_input, x_scale = input
+        q_input, x_scale = input[:2]
+        leading_shape = q_input.shape[:-1]
+        out_dtype = input[2] if len(input) > 2 else torch.bfloat16
         q_input = q_input.view(-1, q_input.shape[-1])
-        output_shape = [*q_input.shape[:-1], weight.shape[0]]
-        output = aiter.gemm_a8w8_bpreshuffle(
-            q_input, weight, x_scale, weight_scale, None, torch.bfloat16
+        output_shape = [*leading_shape, weight.shape[0]]
+    else:
+        input_2d = input.view(-1, input.shape[-1])
+        out_dtype = input.dtype
+        q_input, x_scale = aiter.per_token_quant_hip(
+            input_2d, quant_dtype=aiter.dtypes.fp8
         )
-        if bias is not None:
-            output = output + bias
-        return output.view(*output_shape)
+        per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
+        per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
+        output_shape = [
+            *input.shape[:-1],
+            weight.shape[1]
+            if per_tensor_weights and per_tensor_activations
+            else weight.shape[0],
+        ]
 
-    # View input as 2D matrix for fp8 methods
-    input_2d = input.view(-1, input.shape[-1])
+    if (
+        envs.SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB.get()
+        and is_gfx942_supported()
+        and getattr(weight, "is_shuffled", False)
+        and out_dtype == torch.bfloat16
+        and q_input.shape[0] > 0
+        and x_scale.numel() == q_input.shape[0]
+        and weight_scale.numel() == weight.shape[0]
+    ):
+        from aiter.tuned_gemm import tgemm
 
-    # weight is transposed (K, N)
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-
-    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
-
-    per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
-    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-
-    if not (per_tensor_weights and per_tensor_activations):
-        # weight is in (N, K)
-        output_shape = [*input.shape[:-1], weight.shape[0]]
-
-    output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
-    )
+        # tgemm takes packed [N, K] weights and transposes them internally.
+        output = tgemm.mm(
+            q_input,
+            weight,
+            otype=out_dtype,
+            scale_a=x_scale.view(-1, 1),
+            scale_b=weight_scale.view(1, -1),
+        )
+    else:
+        output = aiter.gemm_a8w8_bpreshuffle(
+            q_input, weight, x_scale, weight_scale, None, out_dtype
+        )
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)

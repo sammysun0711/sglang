@@ -518,6 +518,12 @@ class Envs:
     SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
     # Optional gfx942 BF16 MiMo full prefill, behind the existing FlyPA guards.
     SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
+    # Opt-in MiMo Flash prefill SP on gfx942, TP8/DP2/EP1 with static converted FP8
+    # experts. Residuals stay on token shards; AITER MoE uses FP8 all-gather and
+    # RCCL reduce-scatter. Attention uses full-weight o_proj and SWA KV/halo exchange.
+    # Only globally agreed plain prefill (including idle replicas) may enter;
+    # decode, speculative verify, mixed batches and CUDA graphs use the original path.
+    SGLANG_ENABLE_DPA_SP = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

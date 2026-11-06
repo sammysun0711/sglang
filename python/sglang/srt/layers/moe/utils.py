@@ -8,10 +8,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.distributed.parallel_state import (
+    get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
+    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.utils import is_cuda, is_npu
@@ -435,6 +439,10 @@ def should_use_dpa_sp_moe():
     return (
         envs.SGLANG_ENABLE_DPA_SP.get()
         and is_dp_attention_enabled()
+        and get_tensor_model_parallel_world_size() == 8
+        and get_attention_dp_size() == 2
+        and get_attention_tp_size() == 4
+        and get_moe_expert_parallel_world_size() == 1
         and get_moe_a2a_backend().is_none()
         and not should_use_flashinfer_cutlass_moe_fp4_allgather()
     )

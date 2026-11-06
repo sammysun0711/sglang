@@ -163,16 +163,33 @@ def _mimo_sp_moe_sizes() -> List[int]:
 _MIMO_SP_MIN_TOKENS = 2048
 
 
+@functools.lru_cache(maxsize=1)
+def _log_mimo_tp_sp():
+    logger.info("Using MiMo TP prefill sequence parallel (TP8/DP2/EP1, static FP8)")
 
 
-def _mimo_sp_moe_active() -> bool:
+def _mimo_sp_moe_active(forward_batch: Optional[ForwardBatch]) -> bool:
     """Use the SGLANG_ENABLE_DPA_SP layout for this forward: the same decision on every rank
     and layer (global token count); small passes and graph capture keep the all-reduce path.
     """
-    if torch.cuda.is_current_stream_capturing():
+    if (
+        forward_batch is None
+        or not forward_batch.all_extend_in_batch
+        or forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.IDLE)
+        or forward_batch.can_run_tbo
+        or torch.cuda.is_current_stream_capturing()
+    ):
         return False
     sizes = get_dp_global_num_tokens()
-    return sizes is not None and sum(sizes) >= _MIMO_SP_MIN_TOKENS
+    active = (
+        sizes is not None
+        and len(sizes) == 2
+        and all(n >= 0 and n % 4 == 0 for n in sizes)
+        and sum(sizes) >= _MIMO_SP_MIN_TOKENS
+    )
+    if active:
+        _log_mimo_tp_sp()
+    return active
 
 
 def _mimo_sp_moe_quant(hidden_states: torch.Tensor):
@@ -211,8 +228,45 @@ def _mimo_sp_moe_gather_scales(scale: torch.Tensor, sizes: List[int]) -> torch.T
 
 
 def _mimo_sp_attn_enabled() -> bool:
-    """Full-weight o_proj (all-to-all input) and SWA on the token shard need attention TP > 1."""
-    return should_use_dpa_sp_moe() and get_attention_tp_size() > 1
+    """Shared, construction-time eligibility for the TP MoE and attention layouts."""
+    if not should_use_dpa_sp_moe():
+        return False
+    args = get_global_server_args()
+    return (
+        is_gfx942_supported()
+        and envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+        and get_bool_env_var("SGLANG_FLYPA_MIMO_PREFILL")
+        and mimo_flydsl_target_verify_enabled()
+        and (get_moe_runner_backend().is_aiter() or get_moe_runner_backend().is_auto())
+        and args.attention_backend == "aiter"
+        and args.prefill_attention_backend in (None, "aiter")
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        and args.page_size == 64
+        and args.kv_cache_dtype == "bf16"
+        and args.attn_cp_size == 1
+        and args.pp_size == 1
+        and args.moe_dense_tp_size == 1
+        and not args.enable_two_batch_overlap
+    )
+
+
+def _mimo_tp_sp_flash_config(config) -> bool:
+    """Initial TP SP model geometry; other MiMo variants need separate qualification."""
+    expected = {
+        "hidden_size": 4096,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 192,
+        "v_head_dim": 128,
+        "swa_num_attention_heads": 64,
+        "swa_num_key_value_heads": 8,
+        "swa_head_dim": 192,
+        "swa_v_head_dim": 128,
+        "n_routed_experts": 256,
+        "moe_intermediate_size": 2048,
+        "num_experts_per_tok": 8,
+    }
+    return all(getattr(config, key, None) == value for key, value in expected.items())
 
 
 def _mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method):
@@ -238,8 +292,6 @@ def _mimo_attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
     out = data.new_empty((get_attention_tp_size() * data.shape[0], *data.shape[1:]))
     get_attention_tp_group().all_gather_into_tensor(out, data)
     return out.view(tensor.dtype)
-
-
 
 
 @dataclass
@@ -274,7 +326,11 @@ def _mimo_sp_swa_metadata(
         return meta
     attn_tp, rank = get_attention_tp_size(), get_attention_tp_rank()
     lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
-    prefixes = [int(x) for x in forward_batch.extend_prefix_lens_cpu]
+    from sglang.srt.layers.attention.aiter_utils import _mimo_effective_prefix_lengths
+
+    prefixes = _mimo_effective_prefix_lengths(forward_batch)
+    if prefixes is None:
+        raise ValueError("MiMo TP SWA SP needs effective prefix lengths")
     tail = min(window, rows)
     cache_counts = [min(p, window) if n > 0 else 0 for p, n in zip(prefixes, lens)]
     cache_ends = list(itertools.accumulate(cache_counts))
@@ -759,7 +815,11 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
-        self._sp_tp_moe = should_use_dpa_sp_moe()
+        self._sp_tp_moe = _mimo_sp_attn_enabled()
+        if self._sp_tp_moe and not getattr(
+            self.experts.quant_method, "convert_mxfp4_to_fp8", False
+        ):
+            raise ValueError("MiMo TP prefill SP requires static MXFP4-to-FP8 experts")
 
     def get_moe_weights(self):
         return [
@@ -775,7 +835,7 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if self._sp_tp_moe and _mimo_sp_moe_active():
+        if self._sp_tp_moe and _mimo_sp_moe_active(forward_batch):
             return self.forward_sp(hidden_states)
         if not self._enable_a2a_moe:
             return self.forward_normal(
@@ -843,7 +903,6 @@ class MiMoV2MoE(nn.Module):
             tp_group.reduce_scatter_tensor(output, final_hidden_states)
             return output
         return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
-
 
     def forward_normal(
         self,
@@ -1070,7 +1129,14 @@ class MiMoV2Attention(nn.Module):
         # SGLANG_ENABLE_DPA_SP: all-head QKV of SWA layers in [Q | K | V] order, filled from
         # the TP shards before weight post-processing.
         self.qkv_proj_full = None
-        if _mimo_sp_attn_enabled() and sliding_window_size > 0:
+        if (
+            _mimo_sp_attn_enabled()
+            and sliding_window_size > 0
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and (num_heads, num_kv_heads, self.head_dim, self.original_v_head_dim)
+            == (64, 8, 192, 128)
+            and not self.needs_v_pad
+        ):
             self.qkv_proj_full = QKVParallelLinear(
                 hidden_size,
                 self.head_dim,
@@ -1264,29 +1330,30 @@ class MiMoV2Attention(nn.Module):
         alloc = max(128, 1 << max(pages - 1, 0).bit_length())
         k_pages = q.new_empty((alloc, kv_heads, dq // 8, _SP_SWA_PAGE, 8))
         v_pages = q.new_empty((alloc, kv_heads, _SP_SWA_PAGE // 8, dv, 8))
-        _mimo_sp_swa_pages_kernel[(pages, kv_heads)](
-            meta.kv_src,
-            cached,
-            tails,
-            k,
-            v,
-            k_pages,
-            v_pages,
-            k.stride(0),
-            v.stride(0),
-            v_scale,
-            meta.cache_rows,
-            own_base,
-            own_base + rows,
-            HEADS=kv_heads,
-            LOCAL_HEADS=local_kv_heads,
-            DQ=dq,
-            DV=dv,
-            PAGE=_SP_SWA_PAGE,
-            X=8,
-            BLOCK_DQ=triton.next_power_of_2(dq),
-            HAS_V_SCALE=self.v_scale is not None,
-        )
+        if pages:
+            _mimo_sp_swa_pages_kernel[(pages, kv_heads)](
+                meta.kv_src,
+                cached,
+                tails,
+                k,
+                v,
+                k_pages,
+                v_pages,
+                k.stride(0),
+                v.stride(0),
+                v_scale,
+                meta.cache_rows,
+                own_base,
+                own_base + rows,
+                HEADS=kv_heads,
+                LOCAL_HEADS=local_kv_heads,
+                DQ=dq,
+                DV=dv,
+                PAGE=_SP_SWA_PAGE,
+                X=8,
+                BLOCK_DQ=triton.next_power_of_2(dq),
+                HAS_V_SCALE=self.v_scale is not None,
+            )
 
         out = (q.new_zeros if meta.q_rows < rows else q.new_empty)((rows, heads, dv))
         if meta.q_rows:
@@ -1531,7 +1598,7 @@ class MiMoV2DecoderLayer(nn.Module):
         )
         # SGLANG_ENABLE_DPA_SP: token-scattered residual and MoE layout for large forward passes.
         self.layer_communicator_sp = None
-        if should_use_dpa_sp_moe():
+        if _mimo_sp_attn_enabled():
             self.layer_communicator_sp = LayerCommunicator(
                 layer_scatter_modes=LayerScatterModes.init_new(
                     layer_id=layer_id,
@@ -1627,12 +1694,16 @@ class MiMoV2DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
         sp_o_proj = sp_swa = False
-        if self.layer_communicator_sp is not None and _mimo_sp_moe_active():
+        if self.layer_communicator_sp is not None and _mimo_sp_moe_active(
+            forward_batch
+        ):
             communicator = self.layer_communicator_sp
             if (
                 self.layer_communicator_sp_attn is not None
+                and self.self_attn.o_proj_full is not None
                 and forward_batch.forward_mode == ForwardMode.EXTEND
                 and forward_batch.extend_seq_lens_cpu is not None
+                and positions.ndim == 1
             ):
                 communicator = self.layer_communicator_sp_attn
                 sp_swa = True
@@ -1849,7 +1920,6 @@ class MiMoV2Model(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
-
 
     def _no_ep_tbo_ineligible_reason(
         self, forward_batch: ForwardBatch
@@ -2094,6 +2164,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
+
+        if _mimo_sp_attn_enabled() and not _mimo_tp_sp_flash_config(config):
+            raise ValueError(
+                "MiMo TP prefill SP currently supports the Flash geometry only"
+            )
 
         if not self.config.encoder_only:
             self.model = MiMoV2Model(
@@ -2350,7 +2425,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         # DFlash layer ids describe outputs after target layer k. The model
         # captures that tensor immediately before layer k + 1.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
-
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

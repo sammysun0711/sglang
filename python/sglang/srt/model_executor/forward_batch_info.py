@@ -329,7 +329,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
-    # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
+    # Synchronized plain-prefill eligibility across active DP replicas.
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False

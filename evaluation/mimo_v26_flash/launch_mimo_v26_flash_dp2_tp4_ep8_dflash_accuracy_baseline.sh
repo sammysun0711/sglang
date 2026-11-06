@@ -79,7 +79,8 @@ export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-192}"
-export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
+# Parallel text preparation reduces admission skew between the two DP groups.
+export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-4}"
 # Optional reproducibility control; unset preserves SGLang's seed selection.
 export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.75}"

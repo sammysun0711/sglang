@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Prefill-only client benchmark.
 # Default customer_pressure follows the executable arrays in
-# benchmark_sglang_prefill.sh: OSL=1, text prompts, 32 warmups on the first
-# selected case only. Its 4K/8K rows differ from that script's header comments.
+# benchmark_sglang_prefill.sh: OSL=1, text prompts, 4 warmups before each case.
+# Its 4K/8K rows differ from that script's header comments.
 # Set DATASET_PATH to the customer's ShareGPT JSON; when unset, bench_serving
 # uses its standard cached/downloaded ShareGPT dataset. Model/host/port are local.
 # The legacy customer preset's server reference is CHUNKED_PREFILL_SIZE=65536. Run the
@@ -61,7 +61,6 @@ CUSTOMER_PRESSURE_MATRIX
     default_short_concurrency="${matrix_concurrency[16384]}"
     default_long_concurrency="${matrix_concurrency[1048000]}"
     default_small_num_prompts="${matrix_num_prompts[4096]}"
-    default_warmup_requests=32
     ;;
   customer)
     default_tokens="4096 8192 16384 32768 65536 131068 262144 524284 786428 1047548"
@@ -247,7 +246,7 @@ done
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 echo "Dataset: ${dataset_path:-standard ShareGPT cache/download}; tokenize-prompt=${tokenize_prompt}"
 if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
-  echo "Client matrix: benchmark_sglang_prefill.sh active arrays; ${warmup_requests} warmups on the first selected case only."
+  echo "Client matrix: benchmark_sglang_prefill.sh active arrays; ${warmup_requests} warmups before each case."
   echo "Offered request rate is unlimited; each case uses its global concurrency cap."
   echo "Server topology, chunk size, DFlash, quantization and radix-cache mode are configured separately."
 fi
@@ -277,9 +276,6 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
     current_warmup="${warmup_requests}"
-    if [[ "${benchmark_preset}" == "customer_pressure" ]] && (( test_count > 0 )); then
-      current_warmup=0
-    fi
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Output Token = ${output_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${current_warmup}"

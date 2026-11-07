@@ -2,12 +2,14 @@
 """Check MiMo media grounding and DP isolation against a real-prefill server.
 
 Test media is prepared automatically and cached beside this script. Results
-default to the script directory and are replaced on each run.
+default to the script directory and are replaced on each run. Each evaluation
+writes summary.json and summary.md, and prints the Markdown results table.
 """
 
 import argparse
 import base64
 import hashlib
+import html
 import json
 import re
 import subprocess
@@ -322,6 +324,35 @@ def check_case(case, args, model):
     return result
 
 
+def format_markdown_summary(summary):
+    def cell(value):
+        text = html.escape(str(value), quote=False)
+        text = text.replace("\\", "\\\\").replace("|", "\\|")
+        return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+    status = "PASS" if summary["passed"] else "FAIL"
+    lines = [
+        "## MiMo multimodal feature checks",
+        "",
+        f"**{status}: {summary['passed_cases']}/{summary['total_cases']} checks passed.**",
+        "",
+        "| Test case | DP rank | Result | Response / error |",
+        "| --- | ---: | --- | --- |",
+    ]
+    for result in summary["results"]:
+        detail = result.get("error") or result.get("answer", "")
+        if result.get("matches_serial") is False:
+            detail += " (does not match the normalized serial response)"
+        cells = [
+            result["name"],
+            result["routed_dp_rank"],
+            "Pass" if result["passed"] else "Fail",
+            detail,
+        ]
+        lines.append("| " + " | ".join(cell(value) for value in cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
 def main():
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
@@ -351,7 +382,7 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
         # Remove only this script's results so an interrupted retry cannot leave
         # an old successful summary or stale cases alongside new results.
-        result_names = ["summary.json", "server_info.json"] + [
+        result_names = ["summary.json", "summary.md", "server_info.json"] + [
             case["name"] + ".json" for case in all_cases + mixed_cases
         ]
         for name in result_names:
@@ -392,7 +423,10 @@ def main():
         results=results,
     )
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    markdown = format_markdown_summary(summary)
+    (args.output / "summary.md").write_text(markdown)
     print(json.dumps({k: v for k, v in summary.items() if k != "results"}), flush=True)
+    print(markdown, flush=True)
     raise SystemExit(0 if summary["passed"] else 1)
 
 

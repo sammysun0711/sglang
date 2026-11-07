@@ -17,6 +17,27 @@ pip uninstall sglang sglang-kernel sgl-kernel amd-aiter flydsl mimo-flydsl-kerne
 rm -rf /sgl-workspace/sglang /sgl-workspace/aiter
 ```
 
+### Setup multimodal support
+```bash
+apt-get update
+apt-get install -y --no-install-recommends \
+  ffmpeg espeak-ng fonts-dejavu-core pkg-config \
+  libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
+  libavfilter-dev libswresample-dev libswscale-dev
+
+python -m pip install 'setuptools==80.9.0' pybind11
+python -m pip install --no-deps decord==0.6.0 soundfile==0.13.1
+# PyAV 17.0.1 was already present in the evaluated image.
+
+git clone --branch v0.9.0 --depth 1 \
+  https://github.com/pytorch/torchcodec.git torchcodec-rocm720
+cd torchcodec-rocm720
+export CMAKE_PREFIX_PATH="$(python -m pybind11 --cmakedir):/opt/rocm"
+TORCHCODEC_CMAKE_BUILD_DIR="$PWD/build" \
+TORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR=ON \
+CMAKE_BUILD_PARALLEL_LEVEL=8 ENABLE_CUDA=0 \
+python -m pip install -e . --no-build-isolation --no-deps
+```
 ### Install sglang
 
 ```bash

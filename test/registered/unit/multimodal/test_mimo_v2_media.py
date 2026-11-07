@@ -116,7 +116,7 @@ def test_input_local_transformer_respects_its_own_attention_mode(full_attention)
 
 
 @pytest.mark.parametrize("with_audio", [False, True])
-def test_video_frames_and_short_audio_track(tmp_path, with_audio):
+def test_video_frames_and_short_audio_track(tmp_path, with_audio, monkeypatch):
     if mimo_v2.AudioDecoder is None or not shutil.which("ffmpeg"):
         pytest.skip("A working TorchCodec/FFmpeg installation is required")
     path = tmp_path / "video.mp4"
@@ -149,6 +149,12 @@ def test_video_frames_and_short_audio_track(tmp_path, with_audio):
     assert frames.shape == (2, 64, 64, 3)
     assert np.mean(frames[..., 0]) > 200
     assert np.mean(frames[..., 1:]) < 10
+    # Exercise CPU frame sampling without the wrapper's accelerator-only pinning.
+    monkeypatch.setattr(
+        video,
+        "get_frames_as_tensor",
+        lambda indices: torch.from_numpy(video.get_frames_at(indices)),
+    )
     sampled, timestamps = mimo_v2._decode_frames_and_timestamps(video, {"nframes": 4})
     assert sampled.shape == (4, 3, 64, 64)
     torch.testing.assert_close(timestamps, torch.tensor([0.0, 0.5, 1.5, 2.5]))

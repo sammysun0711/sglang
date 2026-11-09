@@ -693,6 +693,7 @@ class Envs:
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
     SGLANG_DFLASH_REQUEST_OWNER_VERIFY = EnvBool(False)
+    SGLANG_DFLASH_FUSED_CHAIN_VERIFY = EnvBool(False)
     SGLANG_DFLASH_PROB_SORT32 = EnvBool(False)
 
     # Deterministic inference

@@ -359,6 +359,8 @@ def _renorm_target_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
+    *,
+    reference_rows: int | None = None,
 ) -> torch.Tensor:
     """Torch fallback for top-k/top-p probability renormalization.
 
@@ -386,7 +388,12 @@ def _renorm_target_probs_torch(
         probs_sort = probs_sort / renorm.clamp_min(torch.finfo(probs_sort.dtype).tiny)
 
     if need_top_p:
-        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        if reference_rows is None:
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
+        else:
+            from sglang.srt.speculative.request_owner_scan import cumsum_like_full_batch
+
+            probs_sum = cumsum_like_full_batch(probs_sort, reference_rows)
         probs_sort = probs_sort.masked_fill(
             (probs_sum - probs_sort) > top_ps.view(-1, 1), 0.0
         )
@@ -401,6 +408,8 @@ def _renorm_target_probs_torch(
 def _sample_from_weights_with_coin(
     weights: torch.Tensor,
     coins: torch.Tensor,
+    *,
+    reference_rows: int | None = None,
 ) -> torch.Tensor:
     """Sample one token per row using pre-generated [0, 1) coins."""
 
@@ -413,7 +422,12 @@ def _sample_from_weights_with_coin(
         weights[empty, -1] = 1.0
         sums = weights.sum(dim=-1, keepdim=True)
 
-    cdf = torch.cumsum(weights, dim=-1)
+    if reference_rows is None:
+        cdf = torch.cumsum(weights, dim=-1)
+    else:
+        from sglang.srt.speculative.request_owner_scan import cumsum_like_full_batch
+
+        cdf = cumsum_like_full_batch(weights, reference_rows)
     thresholds = coins.to(device=weights.device, dtype=weights.dtype).view(-1, 1) * sums
     sampled = (cdf <= thresholds).sum(dim=-1)
     return sampled.clamp(max=weights.shape[-1] - 1).to(torch.int64)
@@ -433,6 +447,7 @@ def _tree_speculative_sampling_target_only_topk1_torch(
     uniform_samples_for_final_sampling: torch.Tensor,
     threshold_single: float,
     threshold_acc: float,
+    reference_batch_size: int | None = None,
 ) -> None:
     """Torch/Python implementation of target-only verification for topk=1.
 
@@ -511,6 +526,7 @@ def _tree_speculative_sampling_target_only_topk1_torch(
     sampled_ids = _sample_from_weights_with_coin(
         final_weights,
         uniform_samples_for_final_sampling,
+        reference_rows=reference_batch_size,
     ).to(torch.int32)
     predict[last_accepted_retrieve_idx] = sampled_ids
 

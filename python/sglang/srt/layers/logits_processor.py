@@ -34,6 +34,7 @@ from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_attention_dp_rank,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_size,
     get_dp_device,
     get_dp_dtype,
@@ -131,6 +132,9 @@ class LogitsProcessorOutput:
     customized_info: Optional[Dict[str, List[Any]]] = None
 
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # Captured request count owned by each attention-TP rank; zero means dense.
+    request_owner_chunk_size: int = 0
 
 
 @dataclasses.dataclass
@@ -297,6 +301,9 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
+        # A compatible target model opts in before graph-buffer allocation.
+        self.request_owner_world_size = 1
+        self.request_owner_block_size = 1
         self.enable_mis = get_global_server_args().enable_mis
 
         # enable chunked logprobs processing
@@ -367,6 +374,22 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if (self.request_owner_world_size > 1
+                    and logits_metadata.forward_mode.is_target_verify()
+                    and pruned_states.shape[0] > 0):
+                if sample_indices is not None or self.final_logit_softcapping:
+                    raise ValueError("Unsupported request-owner logits consumer")
+                from sglang.srt.speculative.request_owner_verify import distribute_logits
+
+                logits = self._compute_lm_head(pruned_states, lm_head)
+                if self.logit_scale is not None:
+                    logits.mul_(self.logit_scale)
+                logits, chunk = distribute_logits(
+                    logits, get_attention_tp_group(), block_size=self.request_owner_block_size,
+                    vocab_size=self.vocab_size, output_buffer=logits_metadata.next_token_logits_buffer)
+                return LogitsProcessorOutput(
+                    next_token_logits=logits, request_owner_chunk_size=chunk,
+                    hidden_states=hidden_states_to_store, mm_input_embeds=logits_metadata.mm_input_embeds)
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (

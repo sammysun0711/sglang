@@ -2491,6 +2491,24 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
+        if envs.SGLANG_DFLASH_REQUEST_OWNER_VERIFY.get():
+            args = get_global_server_args()
+            if not (
+                is_gfx942_supported() and _mimo_tp_sp_flash_config(self.config)
+                and self.config.vocab_size == 152576 and self.logits_processor is not None
+                and args.speculative_algorithm == "DFLASH" and args.speculative_dflash_block_size == 8
+                and args.tp_size == 8 and args.dp_size == 2 and args.attn_cp_size == 1
+                and args.pp_size == 1 and args.enable_dp_attention and args.enable_dp_lm_head
+                and not args.enable_fp32_lm_head and not args.enable_lora
+                and not args.enable_two_batch_overlap and args.kv_cache_dtype == "bf16"
+                and self.logits_processor.use_attn_tp_group
+                and self.logits_processor.do_tensor_parallel_all_gather
+                and not self.logits_processor.final_logit_softcapping
+            ):
+                raise ValueError("Request-owner verification requires the validated gfx942 Flash DFlash8 TP8/DP2 BF16 configuration")
+            self.logits_processor.request_owner_world_size = 4
+            self.logits_processor.request_owner_block_size = 8
+            logger.info("Enabled request-owner target logits: attention TP4, DFlash8, BF16")
         self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)

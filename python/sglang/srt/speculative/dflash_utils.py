@@ -713,6 +713,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
+    reference_batch_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
@@ -807,6 +808,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             torch.repeat_interleave(
                 sampling_info.top_ps, draft_token_num, dim=0
             ),
+            reference_rows=(reference_batch_size * draft_token_num
+                            if reference_batch_size is not None else None),
         )
         sparse_topk_applied = True
     elif use_sparse_topk and need_top_k:
@@ -889,6 +892,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
             threshold_single=threshold_single,
             threshold_acc=threshold_acc,
+            reference_batch_size=reference_batch_size,
         )
     else:
         tree_speculative_sampling_target_only(

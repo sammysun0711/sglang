@@ -668,7 +668,8 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
         _ep_sp_swa = mode == "ep_swa"
         o_proj_full = object() if swa else None
 
-        def __call__(self, positions, hidden_states, forward_batch, sp_swa):
+        def __call__(self, positions, hidden_states, forward_batch, sp_swa, scatter_output=False):
+            assert not scatter_output
             assert sp_swa == swa
             return hidden_states + 1
 
@@ -681,7 +682,8 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
         ["MiMoV2DecoderLayer"],
         nn=torch.nn,
         ForwardMode=Mode,
-        mimo_tp_sp_active=lambda batch: True,
+        _mimo_sp_moe_active=lambda batch: True,
+        _mimo_graph_verify_sp_active=lambda batch: False,
         _mimo_ep_sp_active=lambda batch: True,
         _mimo_hidden_num_tokens=lambda x: x.shape[0],
     ).MiMoV2DecoderLayer
@@ -705,6 +707,55 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
     assert calls == expected_calls
     expected = x[:local_rows] + 3 if swa else 4 * (x[:local_rows] + 1) + 2
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.parametrize("graph_selected", [False, True])
+def test_native_sp_only_uses_explicit_graph_selection(graph_selected):
+    fn = load(
+        "models/mimo_v2.py", ["_mimo_sp_moe_active"],
+        _mimo_graph_verify_sp_active=lambda batch: graph_selected,
+        _log_mimo_graph_verify_sp=lambda: None,
+        envs=SimpleNamespace(SGLANG_MXFP4_TO_FP8_128BLOCK=SimpleNamespace(get=lambda: False)),
+    )._mimo_sp_moe_active
+    assert fn(SimpleNamespace()) is graph_selected
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({}, True),
+        ({"enabled": False}, False),
+        ({"capture_mode": False}, False),
+        ({"mode": Mode.IDLE}, False),
+        ({"global_mode": Mode.EXTEND}, False),
+        ({"max_len": False}, False),
+        ({"sizes": [1920, 1912]}, False),
+        ({"batch": 64, "sizes": [512, 512]}, False),
+        ({"dflash": False}, False),
+        ({"block": 4}, False),
+        ({"tbo": True}, False),
+    ],
+)
+def test_target_graph_sp_requires_uniform_dflash_capture(change, expected):
+    config = dict(enabled=True, capture_mode=True, mode=Mode.TARGET_VERIFY,
+                  global_mode=Mode.TARGET_VERIFY, max_len=True, sizes=[1920, 1920],
+                  batch=240, dflash=True, block=8, tbo=False)
+    config.update(change)
+    fn = load(
+        "models/mimo_v2.py", ["_mimo_graph_verify_sp_active"],
+        envs=SimpleNamespace(SGLANG_MIMO_GRAPH_VERIFY_SP=SimpleNamespace(get=lambda: config["enabled"])),
+        get_is_capture_mode=lambda: config["capture_mode"],
+        ForwardMode=Mode,
+        get_dp_global_num_tokens=lambda: config["sizes"],
+        _MIMO_SP_MIN_TOKENS=2048,
+    )._mimo_graph_verify_sp_active
+    batch = SimpleNamespace(
+        forward_mode=config["mode"], global_forward_mode=config["global_mode"],
+        can_run_tbo=config["tbo"], all_extend_in_batch=False, batch_size=config["batch"],
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: config["dflash"]),
+        spec_info=SimpleNamespace(draft_token_num=config["block"]),
+        dp_padding_mode=SimpleNamespace(is_max_len=lambda: config["max_len"]),
+    )
+    assert fn(batch) is expected
 
 
 if __name__ == "__main__":

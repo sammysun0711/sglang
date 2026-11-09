@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _backend(query_length, partitions=8, dtype=torch.bfloat16):
+def _backend(query_length, partitions=8, dtype=torch.bfloat16, max_batch=4):
     backend = object.__new__(aiter_backend.AiterAttnBackend)
     backend.device = torch.device("cuda")
     backend.page_size = 64
@@ -38,13 +38,13 @@ def _backend(query_length, partitions=8, dtype=torch.bfloat16):
         aiter_backend.envs.SGLANG_AITER_PA_DECODE_IMPL.override("flydsl"),
         patch.dict(os.environ, {"SGLANG_FLYDSL_PA_NUM_PARTITIONS": str(partitions)}),
     ):
-        backend._configure_flydsl_pa_decode(4)
+        backend._configure_flydsl_pa_decode(max_batch)
     return backend
 
 
-def _inputs(qlen, kv_heads, head_dim, dtype):
+def _inputs(qlen, kv_heads, head_dim, dtype, batch=3):
     torch.manual_seed(213)
-    batch, pages = 3, 33
+    pages = 33
     blocks = batch * pages
     k = (torch.randn(blocks, 64, kv_heads, head_dim, device="cuda") * 0.3).to(dtype)
     v = (torch.randn(blocks, 64, kv_heads, 128, device="cuda") * 0.3).to(dtype)
@@ -95,7 +95,7 @@ def _reference(
 
 @pytest.mark.parametrize("query_length", [1, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, fp8_dtype], ids=["bf16", "fp8"])
-@pytest.mark.parametrize("partitions", [8, 64])
+@pytest.mark.parametrize("partitions", [0, 8, 64])
 def test_full_pa_transport_eager_and_dynamic_graph(query_length, dtype, partitions):
     backend = _backend(query_length, partitions, dtype)
     backend._compile_flydsl_pa_decode()
@@ -168,6 +168,44 @@ def test_full_pa_transport_eager_and_dynamic_graph(query_length, dtype, partitio
         assert plan.reduce_info.data_ptr() == reduce_ptr
     assert backend._flydsl_pa_decode_pout.data_ptr() == scratch
     assert len(backend._flydsl_pa_work_plans) == len(plans)
+
+
+@pytest.mark.parametrize("batch_size,partitions,splits", [(12, 24, 1), (40, 64, 2), (96, 3, 1),
+                                                       (152, 2, 1), (208, 8, 2), (240, 4, 2)])
+def test_calibrated_full_pa_plan_and_graph_refresh(batch_size, partitions, splits):
+    backend = _backend(8, partitions=0, max_batch=batch_size)
+    k, v, kc, vc, table, q, guarded = _inputs(8, 1, 192, torch.bfloat16, batch_size)
+    output = guarded[1:-1]
+    layer = SimpleNamespace(tp_q_head_num=16, tp_k_head_num=1, qk_head_dim=192,
+                            v_head_dim=128, sliding_window_size=-1, logit_cap=0., scaling=192**-.5)
+    lengths = torch.tensor(([0, 67, 2081] * ((batch_size + 2) // 3))[:batch_size],
+                           dtype=torch.int64, device="cuda")
+    batch = SimpleNamespace(batch_size=batch_size, seq_lens=lengths)
+    backend.forward_metadata = SimpleNamespace(max_q_len=8, kv_indices=table[:batch_size])
+
+    def run():
+        aiter_utils.forward_target_verify_flydsl_5d(backend, q, layer, batch, kc, vc, output, None)
+
+    def check():
+        # Every output is compared with an independent FP32 attention reference.
+        expected = _reference(q, k, v, table, (lengths + 8).tolist(), 8, 192)
+        torch.testing.assert_close(output, expected, atol=.006, rtol=.04)
+        assert torch.all(guarded[[0, -1]] == 19)
+
+    run()
+    check()
+    plan = next(iter(backend._flydsl_pa_work_plans.values()))
+    assert (plan.max_partitions, plan.query_splits, plan.capacity) == (partitions, splits, batch_size * partitions)
+    scratch = backend._flydsl_pa_decode_pout.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    lengths.fill_(1027)
+    table[:batch_size].copy_(table[:batch_size].roll(1, dims=1))
+    graph.replay()
+    check()
+    assert next(iter(backend._flydsl_pa_work_plans.values())) is plan
+    assert backend._flydsl_pa_decode_pout.data_ptr() == scratch
 
 
 @pytest.mark.parametrize("query_length", [1, 4, 8])
@@ -341,12 +379,13 @@ def test_sglang_graph_backend_alternates_batch_shapes_with_shared_scratch():
         graphs.cleanup()
 
 
-def test_block4_full_pa_high_cache_addresses_and_nan_tail():
+@pytest.mark.parametrize("query_length", [4, 8])
+def test_full_pa_high_cache_addresses_and_nan_tail(query_length):
     # K extends beyond 4 GiB, as in the serving KV pool. Only two high pages
     # are live, so the Torch reference stays small and checks the real offsets.
     if torch.cuda.mem_get_info()[0] < 8 * 2**30:
         pytest.skip("requires 8 GiB free for the model-size KV address test")
-    backend = _backend(4, 16)
+    backend = _backend(query_length, 16)
     blocks = 2**32 // (192 * 64 * 2) + 2
     k_cache = torch.empty((blocks, 1, 24, 64, 8), dtype=torch.bfloat16, device="cuda")
     v_cache = torch.empty((blocks, 1, 8, 128, 8), dtype=torch.bfloat16, device="cuda")
@@ -356,8 +395,8 @@ def test_block4_full_pa_high_cache_addresses_and_nan_tail():
     torch.manual_seed(5887)
     k = torch.randn((2, 64, 1, 192), dtype=torch.bfloat16, device="cuda") * 0.2
     v = torch.randn((2, 64, 1, 128), dtype=torch.bfloat16, device="cuda") * 0.2
-    q = torch.randn((4, 16 * 192), dtype=torch.bfloat16, device="cuda")
-    output = torch.empty((4, 16 * 128), dtype=torch.bfloat16, device="cuda")
+    q = torch.randn((query_length, 16 * 192), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((query_length, 16 * 128), dtype=torch.bfloat16, device="cuda")
     lengths = torch.empty(1, dtype=torch.int64, device="cuda")
     batch = SimpleNamespace(batch_size=1, seq_lens=lengths)
     layer = SimpleNamespace(
@@ -369,7 +408,7 @@ def test_block4_full_pa_high_cache_addresses_and_nan_tail():
         logit_cap=0.0,
         scaling=192**-0.5,
     )
-    backend.forward_metadata = SimpleNamespace(max_q_len=4, kv_indices=table)
+    backend.forward_metadata = SimpleNamespace(max_q_len=query_length, kv_indices=table)
 
     def set_context(length):
         keys, values = k.clone(), v.clone()
@@ -377,7 +416,7 @@ def test_block4_full_pa_high_cache_addresses_and_nan_tail():
         values[1, length - 64 :] = float("nan")
         k_cache[-2:].copy_(keys.view(2, 64, 1, 24, 8).permute(0, 2, 3, 1, 4))
         v_cache[-2:].copy_(values.view(2, 8, 8, 1, 128).permute(0, 3, 1, 4, 2))
-        lengths.fill_(length - 4)
+        lengths.fill_(length - query_length)
 
     def run():
         aiter_utils.forward_target_verify_flydsl_5d(
@@ -386,7 +425,7 @@ def test_block4_full_pa_high_cache_addresses_and_nan_tail():
 
     set_context(65)
     run()
-    expected = _reference(q, k, v, ref_table, [65], 4, 192)
+    expected = _reference(q, k, v, ref_table, [65], query_length, 192)
     torch.testing.assert_close(output, expected, atol=0.006, rtol=0.04)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -399,5 +438,5 @@ def test_block4_full_pa_high_cache_addresses_and_nan_tail():
     for length in (124, 65):
         set_context(length)
         graph.replay()
-        expected = _reference(q, k, v, ref_table, [length], 4, 192)
+        expected = _reference(q, k, v, ref_table, [length], query_length, 192)
         torch.testing.assert_close(output, expected, atol=0.006, rtol=0.04)

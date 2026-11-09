@@ -533,6 +533,7 @@ class Envs:
     # Independent opt-in for uniform DFlash8 target graph sequence parallelism.
     SGLANG_MIMO_GRAPH_VERIFY_SP = EnvBool(False)
     SGLANG_MIMO_GRAPH_SP_PACKED = EnvBool(False)
+    SGLANG_MIMO_FUSED_SP_PACKET = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

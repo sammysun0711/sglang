@@ -195,6 +195,15 @@ def _mimo_sp_moe_sizes() -> List[int]:
 _MIMO_SP_MIN_TOKENS = 2048
 
 
+def _mimo_sp_moe_max_rows() -> int:
+    """Rows per rank of the PyHIP fused reduce-scatter buffer: one prefill chunk's shard
+    (chunked_prefill_size is per DP group), at most 8192 (1 GiB). Larger shards fall back.
+    """
+    chunk = get_global_server_args().chunked_prefill_size
+    rows = -(-chunk // get_attention_tp_size()) if chunk and chunk > 0 else 8192
+    return min(8192, -(-rows // 1024) * 1024)
+
+
 @functools.lru_cache(maxsize=1)
 def _log_mimo_tp_sp():
     logger.info("Using MiMo TP prefill sequence parallel (TP8/DP2/EP1, static FP8)")
@@ -860,6 +869,7 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._sp_tp_moe = _mimo_sp_attn_enabled()
+        self._pyhip_moe: Optional[bool] = None
         if self._sp_tp_moe and not getattr(
             self.experts.quant_method, "convert_mxfp4_to_fp8", False
         ):
@@ -939,6 +949,21 @@ class MiMoV2MoE(nn.Module):
             quantized_bytes.view(quantized.dtype),
             _mimo_sp_moe_gather_scales(scale, sizes),
         )
+        if self._use_pyhip_moe(sizes):
+            from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+            x8, x_scale = expert_input
+            tokens, hidden = x8.shape
+            return pyhip_fp8_blockscale_moe.moe_reduce_scatter(
+                self.experts,
+                x8,
+                torch.as_strided(x_scale, (hidden // 128, tokens), (tokens, 1)),
+                topk_weights,
+                topk_ids,
+                sizes,
+                tp_group,
+                _mimo_sp_moe_max_rows(),
+            )
         final_hidden_states = self.experts(expert_input, topk_output)
         if all(size == sizes[0] for size in sizes):
             output = final_hidden_states.new_empty(
@@ -947,6 +972,25 @@ class MiMoV2MoE(nn.Module):
             tp_group.reduce_scatter_tensor(output, final_hidden_states)
             return output
         return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
+
+    def _use_pyhip_moe(self, sizes: List[int]) -> bool:
+        """PyHIP MoE + fused top-k sum / reduce-scatter (SGLANG_MIMO_PREFILL_PYHIP_MOE)
+        for this forward; the layer check runs once, after weight post-processing."""
+        if self._pyhip_moe is None:
+            self._pyhip_moe = False
+            if envs.SGLANG_MIMO_PREFILL_PYHIP_MOE.get():
+                from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+                self._pyhip_moe = pyhip_fp8_blockscale_moe.supports_layer(
+                    self.experts, get_tp_group().world_size
+                )
+        if not self._pyhip_moe:
+            return False
+        from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+
+        return pyhip_fp8_blockscale_moe.fits(
+            sizes, self.experts.w13_weight.shape[0], _mimo_sp_moe_max_rows()
+        )
 
     def forward_normal(
         self,

@@ -207,6 +207,11 @@ def _log_mimo_graph_verify_sp():
     logger.info("Using MiMo DFlash8 target graph sequence parallel (TP8/DP2/EP1, %s)", storage)
 
 
+@functools.lru_cache(maxsize=1)
+def _log_mimo_fused_sp_packet():
+    logger.info("Using fused native SP quantization and packet kernels")
+
+
 def _mimo_graph_verify_sp_active(forward_batch: ForwardBatch) -> bool:
     """Select SP only while warming/capturing a uniform DFlash8 target graph.
 
@@ -1050,25 +1055,36 @@ class MiMoV2MoE(nn.Module):
 
             # The native row quantizer is independent of the number of rows.
             # Gather its bytes and exact FP32 scales before the expert GEMMs.
-            quantized, scale = quantize_rows(hidden_states)
-            rows, hidden = quantized.shape
+            rows, hidden = hidden_states.shape
             count = topk.topk_weights.shape[1]
             data_words = hidden // 4
             words = ((data_words + 1 + 2 * count + 3) // 4) * 4
-            packed = torch.empty((rows, words), dtype=torch.float32, device=hidden_states.device)
-            packed[:, :data_words].view(torch.uint8).copy_(quantized.view(torch.uint8))
-            packed[:, data_words].copy_(scale)
-            packed[:, data_words + 1:data_words + 1 + count].copy_(topk.topk_weights)
-            packed[:, data_words + 1 + count:data_words + 1 + 2 * count].view(torch.int32).copy_(topk.topk_ids)
+            fused_packet = envs.SGLANG_MIMO_FUSED_SP_PACKET.get()
+            if fused_packet:
+                _log_mimo_fused_sp_packet()
+                from sglang.srt.layers.quantization.mimo_native_sp_fusion import (
+                    quantize_pack_native_sp, unpack_native_sp,
+                )
+                packed = quantize_pack_native_sp(hidden_states, topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32))
+            else:
+                quantized, scale = quantize_rows(hidden_states)
+                packed = torch.empty((rows, words), dtype=torch.float32, device=hidden_states.device)
+                packed[:, :data_words].view(torch.uint8).copy_(quantized.view(torch.uint8))
+                packed[:, data_words].copy_(scale)
+                packed[:, data_words + 1:data_words + 1 + count].copy_(topk.topk_weights)
+                packed[:, data_words + 1 + count:data_words + 1 + 2 * count].view(torch.int32).copy_(topk.topk_ids)
             merged = packed.new_empty((sum(sizes), words))
             # Float32 is a copy-only transport here; never cast the FP8 bytes
             # numerically or send them through a reduction.
             tp_group.all_gather_into_tensor(merged, packed)
-            values = merged[:, :data_words].contiguous().view(quantized.dtype)
-            scales = merged[:, data_words].contiguous()
+            if fused_packet:
+                values, scales, weights, ids = unpack_native_sp(merged, hidden, count)
+            else:
+                values = merged[:, :data_words].contiguous().view(quantized.dtype)
+                scales = merged[:, data_words].contiguous()
+                weights = merged[:, data_words + 1:data_words + 1 + count].contiguous()
+                ids = merged[:, data_words + 1 + count:data_words + 1 + 2 * count].contiguous().view(torch.int32)
             gathered = (values, scales)
-            weights = merged[:, data_words + 1:data_words + 1 + count].contiguous()
-            ids = merged[:, data_words + 1 + count:data_words + 1 + 2 * count].contiguous().view(torch.int32)
         else:
             weights, ids, gathered = tp_group.all_gatherv(
                 [topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32), hidden_states],

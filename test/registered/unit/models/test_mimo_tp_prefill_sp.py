@@ -85,6 +85,8 @@ def test_moe_collective_decision_is_identical_on_idle_and_active_replicas(
         get_dp_global_num_tokens=lambda: sizes,
         _MIMO_SP_MIN_TOKENS=2048,
         _log_mimo_tp_sp=lambda: None,
+        _mimo_graph_verify_sp_active=lambda batch: False,
+        envs=SimpleNamespace(SGLANG_MXFP4_TO_FP8_128BLOCK=SimpleNamespace(get=lambda: True)),
     )._mimo_sp_moe_active
     decisions = [
         fn(
@@ -121,10 +123,62 @@ def test_stale_prefill_flag_cannot_enable_decode_capture_or_tbo(mode, capturing,
         get_dp_global_num_tokens=lambda: [16384, 16384],
         _MIMO_SP_MIN_TOKENS=2048,
         _log_mimo_tp_sp=lambda: None,
+        _mimo_graph_verify_sp_active=lambda batch: False,
+        envs=SimpleNamespace(SGLANG_MXFP4_TO_FP8_128BLOCK=SimpleNamespace(get=lambda: True)),
     )._mimo_sp_moe_active
     assert not fn(
         SimpleNamespace(forward_mode=mode, all_extend_in_batch=True, can_run_tbo=tbo)
     )
+
+
+@pytest.mark.parametrize("graph_selected", [False, True])
+def test_native_sp_only_uses_explicit_graph_selection(graph_selected):
+    fn = load(
+        "models/mimo_v2.py", ["_mimo_sp_moe_active"],
+        _mimo_graph_verify_sp_active=lambda batch: graph_selected,
+        _log_mimo_graph_verify_sp=lambda: None,
+        envs=SimpleNamespace(SGLANG_MXFP4_TO_FP8_128BLOCK=SimpleNamespace(get=lambda: False)),
+    )._mimo_sp_moe_active
+    assert fn(SimpleNamespace()) is graph_selected
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({}, True),
+        ({"enabled": False}, False),
+        ({"capture_mode": False}, False),
+        ({"mode": Mode.IDLE}, False),
+        ({"global_mode": Mode.EXTEND}, False),
+        ({"max_len": False}, False),
+        ({"sizes": [1920, 1912]}, False),
+        ({"batch": 64, "sizes": [512, 512]}, False),
+        ({"dflash": False}, False),
+        ({"block": 4}, False),
+        ({"tbo": True}, False),
+    ],
+)
+def test_target_graph_sp_requires_uniform_dflash_capture(change, expected):
+    config = dict(enabled=True, capture_mode=True, mode=Mode.TARGET_VERIFY,
+                  global_mode=Mode.TARGET_VERIFY, max_len=True, sizes=[1920, 1920],
+                  batch=240, dflash=True, block=8, tbo=False)
+    config.update(change)
+    fn = load(
+        "models/mimo_v2.py", ["_mimo_graph_verify_sp_active"],
+        envs=SimpleNamespace(SGLANG_MIMO_GRAPH_VERIFY_SP=SimpleNamespace(get=lambda: config["enabled"])),
+        get_is_capture_mode=lambda: config["capture_mode"],
+        ForwardMode=Mode,
+        get_dp_global_num_tokens=lambda: config["sizes"],
+        _MIMO_SP_MIN_TOKENS=2048,
+    )._mimo_graph_verify_sp_active
+    batch = SimpleNamespace(
+        forward_mode=config["mode"], global_forward_mode=config["global_mode"],
+        can_run_tbo=config["tbo"], all_extend_in_batch=False, batch_size=config["batch"],
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: config["dflash"]),
+        spec_info=SimpleNamespace(draft_token_num=config["block"]),
+        dp_padding_mode=SimpleNamespace(is_max_len=lambda: config["max_len"]),
+    )
+    assert fn(batch) is expected
 
 
 @pytest.mark.parametrize(
@@ -206,6 +260,7 @@ def test_unsupported_runtime_keeps_original_layout(changed, value):
             is_aiter=lambda: settings["aiter_moe"], is_auto=lambda: False
         ),
         envs=SimpleNamespace(
+            SGLANG_MIMO_GRAPH_VERIFY_SP=SimpleNamespace(get=lambda: False),
             SGLANG_FLYPA_MIMO_PREFILL=SimpleNamespace(get=lambda: settings["flypa"]),
             SGLANG_MXFP4_TO_FP8_128BLOCK=SimpleNamespace(
                 get=lambda: not settings["native_mxfp4"]

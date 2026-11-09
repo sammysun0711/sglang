@@ -63,6 +63,7 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    pending_free_slots: list[torch.Tensor] | None = None,
 ) -> None:
     from sglang.srt.environ import envs
 
@@ -94,7 +95,10 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa(free_slots)
+        if pending_free_slots is None:
+            token_to_kv_pool_allocator.free_swa(free_slots)
+        else:
+            pending_free_slots.append(free_slots)
         req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 

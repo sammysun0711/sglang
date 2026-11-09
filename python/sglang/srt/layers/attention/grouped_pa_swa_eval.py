@@ -1,8 +1,12 @@
 """Opt-in MiMo target SWA using AITER PA and one shared plan per forward."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -85,6 +89,9 @@ def forward_grouped_pa_swa(backend, q, layer, batch, k, v, out, sinks):
         pout = torch.empty(*shape, 128, device=q.device, dtype=torch.bfloat16)
         cache[key] = (lengths, dense, plan, pmax, psum, pout)
     lengths, dense, plan, pmax, psum, pout = cache[key]
+    if not getattr(backend, "_logged_grouped_bf16_swa", False):
+        logger.info("Using grouped BF16 PA SWA with Q8 query_splits=1")
+        backend._logged_grouped_bf16_swa = True
     if layer.layer_id == backend._grouped_pa_swa_first_layer:
         # Captured once per target forward; each replay refreshes the shared
         # metadata before any SWA layer consumes its own Q/K/V and sinks.
@@ -113,4 +120,5 @@ def forward_grouped_pa_swa(backend, q, layer, batch, k, v, out, sinks):
         exp_sums=psum,
         max_logits=pmax,
         temporary_output=pout,
+        query_splits=1 if qlen == 8 else None,
     )

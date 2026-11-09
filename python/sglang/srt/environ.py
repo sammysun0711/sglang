@@ -373,6 +373,7 @@ class Envs:
     # DFLASH's decode clock advances per iteration, while its KV grows by up
     # to one speculative block. Opt in to evaluate reclamation overhead.
     SGLANG_DFLASH_SWA_TOKEN_INTERVAL = EnvBool(False)
+    SGLANG_DFLASH_BATCH_SWA_EVICTION = EnvBool(False)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get

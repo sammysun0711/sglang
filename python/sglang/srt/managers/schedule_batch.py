@@ -2847,6 +2847,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
             )
+            # No allocations or radix-lock releases occur in this decode loop.
+            # Defer only the frees, retaining the same per-request frontier.
+            pending_free_slots = (
+                []
+                if envs.SGLANG_DFLASH_BATCH_SWA_EVICTION.get()
+                and server_args.speculative_algorithm == "DFLASH"
+                and self.forward_mode.is_decode()
+                and self.tree_cache.is_chunk_cache()
+                and not release_leaf_lock
+                else None
+            )
 
             # Eviction_interval: trade-off between SWA token waste and eviction overhead
             page_size = self.tree_cache.page_size
@@ -2881,7 +2892,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             and (req.decode_batch_idx - 1) % eviction_interval == 0
                         )
                     if should_evict:
-                        self._evict_swa(req, req.seqlen - 1)
+                        if pending_free_slots is None:
+                            self._evict_swa(req, req.seqlen - 1)
+                        else:
+                            self._evict_swa(req, req.seqlen - 1, pending_free_slots)
 
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
@@ -2914,7 +2928,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     else:
                         self._evict_swa(req, pre_len)
 
-    def _evict_swa(self, req: Req, pre_len: int):
+            if pending_free_slots:
+                self.token_to_kv_pool_allocator.free_swa(torch.cat(pending_free_slots))
+
+    def _evict_swa(self, req: Req, pre_len: int, pending_free_slots=None):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
         free_swa_out_of_window_slots(
             req,
@@ -2923,6 +2940,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             page_size=self.tree_cache.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            pending_free_slots=pending_free_slots,
         )
 
     def __str__(self):

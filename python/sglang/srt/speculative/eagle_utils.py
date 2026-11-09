@@ -378,7 +378,12 @@ def _renorm_target_probs_torch(
     if not need_top_k and not need_top_p:
         return probs
 
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    if envs.SGLANG_DFLASH_PROB_SORT32.get():
+        from sglang.srt.speculative.probability_sort32 import sort_probabilities
+
+        probs_sort, probs_idx = sort_probabilities(probs)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
 
     if need_top_k:
         clamped_top_ks = top_ks.clamp(min=1, max=vocab_size)

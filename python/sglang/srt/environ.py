@@ -533,6 +533,7 @@ class Envs:
     SGLANG_ENABLE_DPA_SP = EnvBool(False)
     # DFlash target graph SP for TP8/DP2 with native MXFP4 experts.
     SGLANG_MIMO_GRAPH_VERIFY_SP = EnvBool(False)
+    SGLANG_MIMO_GRAPH_SP_PACKED = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

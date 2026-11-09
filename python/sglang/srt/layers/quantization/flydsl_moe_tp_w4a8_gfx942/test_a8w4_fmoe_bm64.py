@@ -766,12 +766,12 @@ def probe_report():
     print(f"   gemm2 time overlapped by a same-CU partner's gemm1: {100 * ov / tot:.1f}%")
 
 
-def fused_moe_a8w4_bm64(x, weights, topk_weights, topk_ids, **kw):
+def fused_moe_a8w4_bm64(x, weights, topk_weights, topk_ids, *, input_scale=None, **kw):
     """sort -> fp8 row-quant(x) -> fused kernel (the whole MoE)."""
     E, model_dim, _ = weights["w2"].shape
     sids, sw, seids, nv, moe_buf = moe_sorting(topk_ids, topk_weights, E, model_dim,
                                                dtypes.bf16, BM)[:5]
-    x8, xs = quantize_rows(x)
+    x8, xs = quantize_rows(x) if input_scale is None else (x, input_scale)
     return a8w4_fmoe_bm64(x8, xs, weights, sids, sw, seids, nv, moe_buf,
                           topk=topk_ids.shape[1], **kw)
 

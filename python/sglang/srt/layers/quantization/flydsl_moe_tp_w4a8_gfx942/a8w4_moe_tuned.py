@@ -84,7 +84,7 @@ def lookup_config(num_tokens, model_dim, inter_dim, experts, topk, routing="unif
     return rows[-1][1]
 
 
-def run_config(cfg, x, W, topk_weights, topk_ids):
+def run_config(cfg, x, W, topk_weights, topk_ids, input_scale=None):
     """Run one kernel combination end to end (moe_sorting + x quant + kernels);
     returns bf16 [tokens, model_dim]."""
     E, model_dim, _ = W["w2"].shape
@@ -93,16 +93,16 @@ def run_config(cfg, x, W, topk_weights, topk_ids):
         cfg = GRAPH_SAFE_1KQ
     if cfg["kind"] == "1k":
         return F.fused_moe_a8w4_bm64(x, W, topk_weights, topk_ids, b_cache_mod=cfg["bcm"],
-                                     waves_per_eu=cfg["wpe"], ksplit=cfg["ksplit"])
+                                     waves_per_eu=cfg["wpe"], ksplit=cfg["ksplit"], input_scale=input_scale)
     if cfg["kind"] == "1kq":
-        return Q.fused_moe_a8w4_bm64q(x, W, topk_weights, topk_ids, b_cache_mod=cfg["bcm"])
+        return Q.fused_moe_a8w4_bm64q(x, W, topk_weights, topk_ids, b_cache_mod=cfg["bcm"], input_scale=input_scale)
     assert cfg["kind"] == "2k", cfg
     bm = cfg["block_m"]
     inter = W["w1"].shape[1] // 2
     groups = inter // 128
     sids, sw, seids, nv, out = moe_sorting(topk_ids, topk_weights, E, model_dim,
                                            dtypes.bf16, bm)[:5]
-    x8, xs = quantize_rows(x)
+    x8, xs = quantize_rows(x) if input_scale is None else (x, input_scale)
     sorted_size = seids.numel() * bm
     buf = torch.empty(sorted_size * (inter + groups * 4), dtype=torch.uint8, device=x.device)
     G1.a8w4_gemm1(x8, xs, W["w1"], W["w1_scale"], W["w1_exp"], sids, seids, nv, buf,
@@ -120,11 +120,15 @@ def run_config(cfg, x, W, topk_weights, topk_ids):
     return out
 
 
-def tuned_moe(x, weights, topk_weights, topk_ids, *, csv_path=DEFAULT_CSV, routing="uniform"):
+def tuned_moe(x, weights, topk_weights, topk_ids, *, csv_path=DEFAULT_CSV, routing="uniform", input_scale=None):
     """A8W4 MoE (bf16 x [tokens, H] -> bf16 [tokens, H]) with the tuned kernel
     combination for this batch size. ``weights``: fd2 dict (w1/w2_fast_dec == 2)."""
     assert weights["w1_fast_dec"] == 2 and weights["w2_fast_dec"] == 2, "needs fd2 weights"
+    if input_scale is not None:
+        assert x.dtype == torch.float8_e4m3fnuz and x.is_contiguous()
+        assert input_scale.dtype == torch.float32 and input_scale.shape == (x.shape[0],)
+        assert input_scale.is_contiguous() and input_scale.device == x.device
     E, model_dim, _ = weights["w2"].shape
     cfg = lookup_config(x.shape[0], model_dim, weights["w1"].shape[1] // 2, E,
                         topk_ids.shape[1], routing, csv_path)
-    return run_config(cfg, x, weights, topk_weights, topk_ids)
+    return run_config(cfg, x, weights, topk_weights, topk_ids, input_scale=input_scale)

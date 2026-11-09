@@ -49,27 +49,49 @@ if TYPE_CHECKING:
 # run in chunks of this many tokens.
 EP8_MAX_TOKENS = 32768
 
+# Largest per-DP token count seen while capturing CUDA graphs (decode graphs are
+# captured from the largest batch down, so the first capture sets it).
+_capture_max_local_tokens = 0
 
-def _mori_token_bounds(capacity: int) -> Tuple[int, int]:
+
+def _mori_token_bounds(capacity: int, total_recv: torch.Tensor) -> Tuple[int, int]:
     """(rows to process, estimated valid rows) of a MORI receive buffer.
 
-    Every rank dispatches its share of the tokens once per destination rank, so a
-    rank receives at most the global token count of the forward pass: the DP
-    gather buffer length under DP attention (exact incl. padding, also when
-    captured in a CUDA graph). Without DP attention fall back to the capacity."""
+    Eager: the exact received count (one small device->host read per MoE layer).
+    With MORI + DP attention the per-forward token lists are local to the DP group
+    (``require_mlp_tp_gather`` is False), so other groups' counts are unknown on
+    the host: DP groups run different batch sizes (eager, and decode graphs each
+    pick their own padded bs). CUDA-graph capture can't read the device count;
+    graphs only run when every DP group decodes with a captured batch, so a rank
+    receives at most the local tokens + (dp_size - 1) x the largest captured
+    per-DP token count. Without DP attention fall back to the capacity."""
+    global _capture_max_local_tokens
+    if not torch.cuda.is_current_stream_capturing():
+        n = min(capacity, int(total_recv.reshape(-1)[0].item()))
+        return n, max(1, n)
+
     from sglang.srt.layers.dp_attention import (
+        get_attention_dp_size,
         get_dp_global_num_tokens,
-        get_global_dp_buffer_len,
         is_dp_attention_enabled,
     )
 
     if not is_dp_attention_enabled():
         return capacity, capacity
     try:
-        bound = int(get_global_dp_buffer_len())
-        est = int(sum(get_dp_global_num_tokens()))
+        gnt = [int(n) for n in get_dp_global_num_tokens()]
     except (AttributeError, TypeError):
         return capacity, capacity
+    if not gnt:
+        return capacity, capacity
+    dp_size = get_attention_dp_size()
+    if len(gnt) == dp_size:  # gathered over DP: every group replays the max bs
+        bound, est = dp_size * max(gnt), sum(gnt)
+    else:  # local DP group only
+        local = max(gnt)
+        _capture_max_local_tokens = max(_capture_max_local_tokens, local)
+        bound = local + (dp_size - 1) * _capture_max_local_tokens
+        est = dp_size * local
     bound = min(capacity, bound)
     return bound, max(1, min(bound, est))
 
@@ -283,9 +305,11 @@ class Mxfp4AiterEpA8W4MoEMethod:
         mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
         if mori_max > 0:
             capacity = min(capacity, mori_max)
-        rows, est = _mori_token_bounds(capacity)
+        rows, est = _mori_token_bounds(capacity, total_recv)
 
-        out = torch.empty((rows, x.shape[1]), dtype=torch.bfloat16, device=x.device)
+        # Sized by the capacity (as AITER's moe_buf) so MORI combine, which reads
+        # rows [0, total_recv), never leaves the buffer; only ``rows`` are computed.
+        out = torch.empty((capacity, x.shape[1]), dtype=torch.bfloat16, device=x.device)
         if rows > 0:
             topk_ids = topk_ids[:rows].to(torch.int32)
             topk_weights = topk_weights[:rows].to(torch.float32)

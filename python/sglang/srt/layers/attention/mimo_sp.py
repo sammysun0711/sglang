@@ -11,7 +11,6 @@ import itertools
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import torch
@@ -276,6 +275,5 @@ def run_mimo_sp_swa(
             softmax_scale=self.scaling,
             stream=torch.cuda.current_stream(q.device),
         )
-    return self.o_proj.quant_method.apply(
-        SimpleNamespace(weight=self.o_proj_full), out.view(rows, heads * dv)
-    )
+    out, _ = self.o_proj_full(out.view(rows, heads * dv))
+    return out

@@ -55,6 +55,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -250,6 +251,20 @@ def load_mimo_v2_qkv_proj_weight(
         )
 
     default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+
+
+def _mimo_reorder_fused_qkv(weight, qkv_sizes, tp_size):
+    """Checkpoint [Q0 K0 V0 | Q1 K1 V1 | ...] -> full [Q | K | V].
+
+    Scale rows have the same Q:K:V ratio as weight rows, so this also reorders
+    the block scales without dequantizing or changing their values.
+    """
+    rows = weight.shape[0] // tp_size
+    parts = [rows * size // sum(qkv_sizes) for size in qkv_sizes]
+    if rows * tp_size != weight.shape[0] or sum(parts) != rows:
+        raise ValueError(f"Cannot split fused QKV shape {tuple(weight.shape)}")
+    blocks = weight.reshape(tp_size, rows, *weight.shape[1:])
+    return torch.cat([part.flatten(0, 1) for part in blocks.split(parts, dim=1)])
 
 
 class MiMoV2MLP(nn.Module):
@@ -705,9 +720,10 @@ class MiMoV2Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # SGLANG_MIMO_SWA_SP: all-head QKV of SWA layers in [Q | K | V] order, filled from
-        # the TP shards before weight post-processing.
+        # Keep TP weights for decode/verify and small prefill. SP weights are
+        # loaded from the same checkpoint tensors, without weight collectives.
         self.qkv_proj_full = None
+        self.o_proj_full = None
         if (
             envs.SGLANG_MIMO_SWA_SP.get()
             and _mimo_ep_sp_supported()
@@ -717,6 +733,7 @@ class MiMoV2Attention(nn.Module):
             and self.head_dim == 192
             and self.original_v_head_dim == 128
             and not self.needs_v_pad
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
         ):
             self.qkv_proj_full = QKVParallelLinear(
                 hidden_size,
@@ -728,8 +745,15 @@ class MiMoV2Attention(nn.Module):
                 quant_config=quant_config,
                 tp_rank=0,
                 tp_size=1,
-                prefix=add_prefix("qkv_proj_full", prefix),
+                prefix=add_prefix("qkv_proj", prefix),
                 skip_block_quant_check=True,
+            )
+            self.o_proj_full = ReplicatedLinear(
+                self.total_num_heads * self.original_v_head_dim,
+                hidden_size,
+                bias=False,
+                params_dtype=self.o_proj.params_dtype,
+                prefix=add_prefix("o_proj", prefix),
             )
 
         self.rotary_emb = get_rope(
@@ -766,50 +790,47 @@ class MiMoV2Attention(nn.Module):
             else None
         )
 
-        # Complete o_proj weight [hidden, heads * v_head_dim] for SWA SP.
-        self.o_proj_full: Optional[torch.Tensor] = None
-        self.attention_sink_full: Optional[torch.Tensor] = None
+        self.attention_sink_full = (
+            nn.Parameter(
+                torch.empty(self.total_num_heads, dtype=torch.float32),
+                requires_grad=False,
+            )
+            if self.qkv_proj_full is not None and attention_sink_bias
+            else None
+        )
 
-    def build_sp_weights(self):
-        """Assemble full-head weights before quantization post-processing."""
+    def load_sp_weight(self, name, loaded_weight):
+        """Fill the SP copy from the same tensor used by the normal TP loader."""
         if self.qkv_proj_full is None:
             return
-        from sglang.srt.layers.attention.mimo_sp import _mimo_attn_tp_gather
-
-        if isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
-            shard = self.o_proj.weight.data
-            self.o_proj_full = (
-                _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
-            )
-        if self.attention_sink_bias is not None:
-            self.attention_sink_full = _mimo_attn_tp_gather(
-                self.attention_sink_bias.data
-            )
-        sizes = (self.q_size, self.k_size, self.v_size)
-        full_params = dict(self.qkv_proj_full.named_parameters())
-        for name, shard in self.qkv_proj.named_parameters():
-            full = full_params[name]
-            if full.shape == shard.shape:
-                full.data.copy_(shard.data)
-                continue
-            rows = shard.shape[0]
-            attn_tp = get_attention_tp_size()
-            parts = [rows * size // sum(sizes) for size in sizes]
-            assert (
-                full.shape == (attn_tp * rows, *shard.shape[1:]) and sum(parts) == rows
-            ), name
-            gathered = _mimo_attn_tp_gather(shard.data).view(
-                attn_tp, rows, *shard.shape[1:]
-            )
-            # Per-rank [q_r | k_r | v_r] blocks -> [Q | K | V].
-            full.data.copy_(
-                torch.cat(
-                    [
-                        block.reshape(attn_tp * part, *shard.shape[1:])
-                        for block, part in zip(gathered.split(parts, dim=1), parts)
-                    ]
+        if name == "o_proj.weight":
+            default_weight_loader(self.o_proj_full.weight, loaded_weight)
+        elif name == "attention_sink_bias" and self.attention_sink_full is not None:
+            default_weight_loader(self.attention_sink_full, loaded_weight)
+        elif name.startswith("qkv_proj."):
+            param_name = name.split(".", 1)[1]
+            full = getattr(self.qkv_proj_full, param_name, None)
+            if full is None:
+                return
+            if loaded_weight.shape != full.shape:
+                raise ValueError(
+                    f"MiMo SWA SP needs the full checkpoint tensor for {name}: "
+                    f"expected {tuple(full.shape)}, got {tuple(loaded_weight.shape)}. "
+                    "Disable SGLANG_MIMO_SWA_SP to load TP-only shards."
                 )
-            )
+            shard = getattr(self.qkv_proj, param_name)
+            if full.shape != shard.shape:
+                loaded_weight = _mimo_reorder_fused_qkv(
+                    loaded_weight,
+                    (self.q_size, self.k_size, self.v_size),
+                    get_attention_tp_size(),
+                )
+            default_weight_loader(full, loaded_weight)
+        elif name.startswith(("q_proj.", "k_proj.", "v_proj.")):
+            proj_name, param_name = name.split(".", 1)
+            full = getattr(self.qkv_proj_full, param_name, None)
+            if full is not None:
+                full.weight_loader(full, loaded_weight, proj_name[0])
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -1939,6 +1960,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     skipped_mtp_weights = True
                 continue
 
+            if layer_id is not None and ".self_attn." in name:
+                self.model.layers[layer_id].self_attn.load_sp_weight(
+                    name.split(".self_attn.", 1)[1], loaded_weight
+                )
+
             # The MiMo-V2.5 AITER integration keeps packed FP4 weights and E8M0
             # scales as raw bytes until Fp8MoEMethod finishes loading them.  The
             # native MXFP4 config used by MiMo-V2.6 instead expects the generic
@@ -2029,14 +2055,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
-        self.post_load_weights()
-
-    def post_load_weights(self):
-        for layer in getattr(self.model, "layers", ()):
-            attn = getattr(layer, "self_attn", None)
-            if isinstance(attn, MiMoV2Attention):
-                attn.build_sp_weights()
 
     def get_embed_and_head(self):
         assert (

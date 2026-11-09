@@ -71,7 +71,9 @@ def test_full_decode_reference_and_graph_replay(
     scalar_numel = batch_size * partitions * configured_query_length * heads
     backend = SimpleNamespace(
         _use_flydsl_pa_decode=True,
-        _flydsl_pa_decode_tile=kernels.pa_decode_tile,
+        _flydsl_pa_decode=kernels.pa_decode,
+        _flydsl_plan_pa_decode=kernels.plan_pa_decode,
+        _flydsl_pa_work_plans={},
         _flydsl_pa_decode_num_partitions=partitions,
         _flydsl_pa_decode_query_length=configured_query_length,
         _flydsl_pa_decode_pmax=torch.empty(scalar_numel, device=device),
@@ -141,6 +143,9 @@ def test_full_decode_reference_and_graph_replay(
         assert backend._flydsl_pa_decode_context_lengths.tolist() == lengths
 
     aiter_utils.warmup_flydsl_full_decode(backend)
+    # Warm the actual batch/stride and its reusable work plan before capture.
+    run()
+    check([65, 129][:batch_size])
     # The startup warmup must materialize executables, rather than just factories.
     # Different runtime lengths, batch sizes and query strides must stay warm.
     import flydsl.compiler as flyc

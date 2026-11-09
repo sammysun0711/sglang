@@ -830,7 +830,7 @@ class LayerCommunicator:
         quant_format: str = "",
     ):
         """prepare_mlp when attention already returned this rank's reduced token slice
-        (MiMo SGLANG_ENABLE_DPA_SP): only the residual add and post-attention norm remain.
+        (MiMo target graph SP): only the residual add and post-attention norm remain.
         """
         assert self.layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         assert self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED

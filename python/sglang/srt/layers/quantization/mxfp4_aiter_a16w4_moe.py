@@ -23,7 +23,7 @@ from .flydsl_moe_tp_w4a8_gfx942.a8w4_moe_tuned import tuned_moe
 from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm1 import a8w4_gemm1, prep_w1_fast
 from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm2 import a8w4_gemm2, prep_w2_fast
 from aiter.fused_moe import moe_sorting
-from aiter import ActivationType, QuantType, dtypes
+from aiter import dtypes
 
 # Fast fp4 decode of gemm1 / gemm2 (bit-exact vs 0). 1: W nibbles reordered
 # and -0 -> +0 (drops the interleave / sign perms). 2: additionally stores the
@@ -283,7 +283,6 @@ class Mxfp4AiterA16W4MoEMethod:
     ) -> CombineInput:
         if 1:
             from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-            from sglang.srt.layers.moe.topk import TopKOutputChecker            
             topk_output = dispatch_output.topk_output
             hidden_states = dispatch_output.hidden_states
             if layer.all_weights["w1_fast_dec"] == 2:

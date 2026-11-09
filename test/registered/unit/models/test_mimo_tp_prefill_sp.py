@@ -11,6 +11,7 @@ import enum
 import itertools
 import sys
 import types
+from contextlib import nullcontext
 from functools import cached_property
 from pathlib import Path
 from types import SimpleNamespace
@@ -619,10 +620,10 @@ def test_tp_swa_weight_assembly_preserves_projection_and_qkv_order(
     )
 
 
-@pytest.mark.parametrize("mode", ["tp_full", "tp_swa", "ep_swa"])
+@pytest.mark.parametrize("mode", ["tp_full", "tp_swa", "ep_swa", "graph"])
 def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
     calls = []
-    swa = mode != "tp_full"
+    swa = mode not in ("tp_full", "graph")
     local_rows = 4 if swa else 2
 
     def reduce_scatter(output, value):
@@ -656,9 +657,18 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
                 residual_input_mode=communication.ScatterMode.TP_ATTN_FULL,
             )
 
+        def prepare_scattered_mlp(x, residual, **kwargs):
+            calls.append((name, "scattered_mlp"))
+            assert x.shape[0] == local_rows
+            return x, residual
+
         return SimpleNamespace(
             prepare_attn_and_capture_last_layer_outputs=prepare_attn,
             prepare_mlp=prepare_mlp,
+            prepare_mlp_from_scattered_attn=prepare_scattered_mlp,
+            layer_scatter_modes=SimpleNamespace(
+                mlp_mode=communication.ScatterMode.SCATTERED
+            ),
             should_fuse_mlp_allreduce_with_next_layer=lambda batch: False,
             should_use_reduce_scatter=lambda batch: False,
             postprocess_layer=lambda x, residual, batch: (x, residual),
@@ -666,12 +676,14 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
 
     class Attention:
         _ep_sp_swa = mode == "ep_swa"
-        o_proj_full = object() if swa else None
+        o_proj_full = object() if swa or mode == "graph" else None
 
-        def __call__(self, positions, hidden_states, forward_batch, sp_swa, scatter_output=False):
-            assert not scatter_output
+        def __call__(
+            self, positions, hidden_states, forward_batch, sp_swa, scatter_output=False
+        ):
+            assert scatter_output == (mode == "graph")
             assert sp_swa == swa
-            return hidden_states + 1
+            return (hidden_states[:local_rows] if scatter_output else hidden_states) + 1
 
     def moe(x, batch, fused, reduce_scatter):
         assert x.shape[0] == local_rows
@@ -683,7 +695,8 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
         nn=torch.nn,
         ForwardMode=Mode,
         _mimo_sp_moe_active=lambda batch: True,
-        _mimo_graph_verify_sp_active=lambda batch: False,
+        _mimo_graph_verify_sp_active=lambda batch: mode == "graph",
+        ScatterMode=communication.ScatterMode,
         _mimo_ep_sp_active=lambda batch: True,
         _mimo_hidden_num_tokens=lambda x: x.shape[0],
     ).MiMoV2DecoderLayer
@@ -698,26 +711,38 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
     )
     x = torch.arange(32, dtype=torch.float32).view(8, 4)
     residual = torch.zeros_like(x)
-    batch = SimpleNamespace(forward_mode=Mode.EXTEND, extend_seq_lens_cpu=[8])
+    batch = SimpleNamespace(
+        forward_mode=Mode.TARGET_VERIFY if mode == "graph" else Mode.EXTEND,
+        extend_seq_lens_cpu=None if mode == "graph" else [8],
+    )
     output, _ = cls.forward(layer, torch.arange(8), x, batch, residual)
     selected = "swa" if swa else "tp"
-    expected_calls = [(selected, "attn"), (selected, "mlp")]
-    if not swa:
+    expected_calls = [
+        (selected, "attn"),
+        (selected, "scattered_mlp" if mode == "graph" else "mlp"),
+    ]
+    if not swa and mode != "graph":
         expected_calls.append(("reduce_scatter", "attn_tp"))
     assert calls == expected_calls
-    expected = x[:local_rows] + 3 if swa else 4 * (x[:local_rows] + 1) + 2
+    expected = (
+        x[:local_rows] + 3 if swa or mode == "graph" else 4 * (x[:local_rows] + 1) + 2
+    )
     torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize("graph_selected", [False, True])
 def test_native_sp_only_uses_explicit_graph_selection(graph_selected):
     fn = load(
-        "models/mimo_v2.py", ["_mimo_sp_moe_active"],
+        "models/mimo_v2.py",
+        ["_mimo_sp_moe_active"],
         _mimo_graph_verify_sp_active=lambda batch: graph_selected,
         _log_mimo_graph_verify_sp=lambda: None,
-        envs=SimpleNamespace(SGLANG_MXFP4_TO_FP8_128BLOCK=SimpleNamespace(get=lambda: False)),
+        envs=SimpleNamespace(
+            SGLANG_MXFP4_TO_FP8_128BLOCK=SimpleNamespace(get=lambda: False)
+        ),
     )._mimo_sp_moe_active
     assert fn(SimpleNamespace()) is graph_selected
+
 
 @pytest.mark.parametrize(
     "change,expected",
@@ -736,26 +761,235 @@ def test_native_sp_only_uses_explicit_graph_selection(graph_selected):
     ],
 )
 def test_target_graph_sp_requires_uniform_dflash_capture(change, expected):
-    config = dict(enabled=True, capture_mode=True, mode=Mode.TARGET_VERIFY,
-                  global_mode=Mode.TARGET_VERIFY, max_len=True, sizes=[1920, 1920],
-                  batch=240, dflash=True, block=8, tbo=False)
+    config = dict(
+        enabled=True,
+        capture_mode=True,
+        mode=Mode.TARGET_VERIFY,
+        global_mode=Mode.TARGET_VERIFY,
+        max_len=True,
+        sizes=[1920, 1920],
+        batch=240,
+        dflash=True,
+        block=8,
+        tbo=False,
+    )
     config.update(change)
     fn = load(
-        "models/mimo_v2.py", ["_mimo_graph_verify_sp_active"],
-        envs=SimpleNamespace(SGLANG_MIMO_GRAPH_VERIFY_SP=SimpleNamespace(get=lambda: config["enabled"])),
+        "models/mimo_v2.py",
+        ["_mimo_graph_verify_sp_active"],
+        envs=SimpleNamespace(
+            SGLANG_MIMO_GRAPH_VERIFY_SP=SimpleNamespace(get=lambda: config["enabled"])
+        ),
         get_is_capture_mode=lambda: config["capture_mode"],
         ForwardMode=Mode,
         get_dp_global_num_tokens=lambda: config["sizes"],
         _MIMO_SP_MIN_TOKENS=2048,
     )._mimo_graph_verify_sp_active
     batch = SimpleNamespace(
-        forward_mode=config["mode"], global_forward_mode=config["global_mode"],
-        can_run_tbo=config["tbo"], all_extend_in_batch=False, batch_size=config["batch"],
+        forward_mode=config["mode"],
+        global_forward_mode=config["global_mode"],
+        can_run_tbo=config["tbo"],
+        all_extend_in_batch=False,
+        batch_size=config["batch"],
         spec_algorithm=SimpleNamespace(is_dflash=lambda: config["dflash"]),
         spec_info=SimpleNamespace(draft_token_num=config["block"]),
         dp_padding_mode=SimpleNamespace(is_max_len=lambda: config["max_len"]),
     )
     assert fn(batch) is expected
+
+
+@pytest.mark.parametrize(
+    "prefill,graph,static_fp8", itertools.product([False, True], repeat=3)
+)
+def test_prefill_and_graph_sp_flags_are_independent(prefill, graph, static_fp8):
+    flag = lambda value: SimpleNamespace(get=lambda: value)
+    settings = SimpleNamespace(
+        attention_backend="aiter",
+        prefill_attention_backend=None,
+        page_size=64,
+        kv_cache_dtype="bf16",
+        attn_cp_size=1,
+        pp_size=1,
+        moe_dense_tp_size=1,
+        enable_two_batch_overlap=False,
+    )
+    module = load(
+        "models/mimo_v2.py",
+        ["_mimo_sp_attn_enabled", "_mimo_graph_sp_enabled", "_mimo_sp_moe_active"],
+        envs=SimpleNamespace(
+            SGLANG_MIMO_GRAPH_VERIFY_SP=flag(graph),
+            SGLANG_ENABLE_MIMO_SWA_SP=flag(prefill),
+            SGLANG_MXFP4_TO_FP8_128BLOCK=flag(static_fp8),
+            SGLANG_FLYPA_MIMO_PREFILL=flag(True),
+            SGLANG_AITER_KV_CACHE_LAYOUT=flag("vectorized_5d"),
+        ),
+        mimo_tp_sp_enabled=lambda: prefill and static_fp8,
+        mimo_tp_sp_active=lambda batch: True,
+        _mimo_graph_verify_sp_active=lambda batch: False,
+        is_dp_attention_enabled=lambda: True,
+        get_tensor_model_parallel_world_size=lambda: 8,
+        get_attention_dp_size=lambda: 2,
+        get_attention_tp_size=lambda: 4,
+        get_moe_expert_parallel_world_size=lambda: 1,
+        get_moe_a2a_backend=lambda: SimpleNamespace(is_none=lambda: True),
+        should_use_flashinfer_cutlass_moe_fp4_allgather=lambda: False,
+        get_global_server_args=lambda: settings,
+        is_gfx942_supported=lambda: True,
+        mimo_flydsl_target_verify_enabled=lambda: True,
+        get_moe_runner_backend=lambda: SimpleNamespace(is_aiter=lambda: True),
+    )
+    assert module._mimo_graph_sp_enabled() is graph
+    assert module._mimo_sp_attn_enabled() == (graph or (prefill and static_fp8))
+    # Enabling graph SP must not enable the native or flag-disabled prefill path.
+    assert module._mimo_sp_moe_active(SimpleNamespace()) == (prefill and static_fp8)
+
+
+@pytest.mark.parametrize(
+    "changed,value",
+    [
+        ("tp", 4),
+        ("dp", 1),
+        ("attn_tp", 2),
+        ("ep", 8),
+        ("a2a_none", False),
+        ("dpa", False),
+        ("page_size", 16),
+        ("kv_cache_dtype", "fp8"),
+        ("attn_cp_size", 2),
+        ("pp_size", 2),
+        ("moe_dense_tp_size", 4),
+        ("enable_two_batch_overlap", True),
+    ],
+)
+def test_graph_sp_rejects_unsupported_topologies(changed, value):
+    settings = dict(
+        tp=8,
+        dp=2,
+        attn_tp=4,
+        ep=1,
+        a2a_none=True,
+        dpa=True,
+        attention_backend="aiter",
+        prefill_attention_backend=None,
+        page_size=64,
+        kv_cache_dtype="bf16",
+        attn_cp_size=1,
+        pp_size=1,
+        moe_dense_tp_size=1,
+        enable_two_batch_overlap=False,
+    )
+    settings[changed] = value
+    flag = lambda value: SimpleNamespace(get=lambda: value)
+    fn = load(
+        "models/mimo_v2.py",
+        ["_mimo_graph_sp_enabled"],
+        envs=SimpleNamespace(
+            SGLANG_MIMO_GRAPH_VERIFY_SP=flag(True),
+            SGLANG_FLYPA_MIMO_PREFILL=flag(True),
+            SGLANG_AITER_KV_CACHE_LAYOUT=flag("vectorized_5d"),
+        ),
+        is_dp_attention_enabled=lambda: settings["dpa"],
+        get_tensor_model_parallel_world_size=lambda: settings["tp"],
+        get_attention_dp_size=lambda: settings["dp"],
+        get_attention_tp_size=lambda: settings["attn_tp"],
+        get_moe_expert_parallel_world_size=lambda: settings["ep"],
+        get_moe_a2a_backend=lambda: SimpleNamespace(
+            is_none=lambda: settings["a2a_none"]
+        ),
+        should_use_flashinfer_cutlass_moe_fp4_allgather=lambda: False,
+        get_global_server_args=lambda: SimpleNamespace(**settings),
+        is_gfx942_supported=lambda: True,
+        mimo_flydsl_target_verify_enabled=lambda: True,
+        get_moe_runner_backend=lambda: SimpleNamespace(is_aiter=lambda: True),
+    )._mimo_graph_sp_enabled
+    assert not fn()
+
+
+def test_graph_projection_assembles_full_weight_without_prefill_qkv(monkeypatch):
+    class Unquantized:
+        pass
+
+    shard = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
+    package = types.ModuleType("sglang.srt.layers.attention.mimo_sp")
+    package._mimo_attn_tp_gather = lambda x: torch.cat([x + i * 32 for i in range(4)])
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    cls = load(
+        "models/mimo_v2.py",
+        ["MiMoV2Attention"],
+        nn=torch.nn,
+        UnquantizedLinearMethod=Unquantized,
+        envs=SimpleNamespace(
+            SGLANG_MIMO_SP_PACKED_OPROJ=SimpleNamespace(get=lambda: False)
+        ),
+    ).MiMoV2Attention
+    layer = SimpleNamespace(
+        _ep_sp_swa=False,
+        _graph_sp_o_proj=True,
+        qkv_proj_full=None,
+        o_proj_full=None,
+        o_proj=SimpleNamespace(weight=shard, quant_method=Unquantized()),
+    )
+    cls.build_sp_weights(layer)
+    torch.testing.assert_close(
+        layer.o_proj_full, torch.cat([shard + i * 32 for i in range(4)], dim=1)
+    )
+    assert not layer.o_proj_full_packed
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_static_moe_keeps_prefill_selection_and_uses_direct_graph_reduction(
+    monkeypatch, capturing
+):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def reduce(output, value, kind):
+        calls.append(kind)
+        output.copy_(value[:2])
+
+    group = SimpleNamespace(
+        all_gatherv=lambda values, sizes: [torch.cat([v] * 8) for v in values],
+        reduce_scatter_tensor=lambda output, value: reduce(output, value, "ordinary"),
+        pynccl_comm=SimpleNamespace(
+            change_state=lambda **kwargs: nullcontext(),
+            reduce_scatter=lambda output, value: reduce(output, value, "direct"),
+        ),
+    )
+
+    def pyhip_eligible(layer, sizes):
+        assert not capturing
+        calls.append("prefill_selection")
+        return False
+
+    module = load(
+        "layers/moe/mimo_sp.py",
+        ["run_mimo_tp_sp_moe", "split_mimo_moe_inputs"],
+        get_is_capture_mode=lambda: capturing,
+        _mimo_sp_moe_sizes=lambda: [2] * 8,
+        _mimo_sp_moe_gather_scales=lambda scale, sizes: scale,
+        _use_pyhip_moe=pyhip_eligible,
+        get_tp_group=lambda: group,
+        StandardTopKOutput=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    layer = SimpleNamespace(
+        gate=lambda x: x,
+        topk=lambda *args: SimpleNamespace(
+            topk_weights=torch.ones(2, 2), topk_ids=torch.zeros(2, 2, dtype=torch.int32)
+        ),
+        experts=lambda x, topk: torch.zeros(16, 128, dtype=torch.bfloat16),
+    )
+    scale = torch.ones(2, 1)
+    scale._aiter_moe_scale_is_transposed = True
+    output = module.run_mimo_tp_sp_moe(
+        layer,
+        (
+            torch.zeros(2, 128, dtype=torch.bfloat16),
+            torch.zeros(2, 128, dtype=torch.float8_e4m3fnuz),
+            scale,
+        ),
+    )
+    assert output.shape == (2, 128)
+    assert calls == (["direct"] if capturing else ["prefill_selection", "ordinary"])
 
 
 if __name__ == "__main__":

@@ -184,8 +184,12 @@ def _mimo_ep_sp_active(forward_batch: ForwardBatch) -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _log_mimo_graph_verify_sp():
-    storage = "static FP8" if envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get() else "native MXFP4"
-    logger.info("Using MiMo DFlash8 target graph sequence parallel (TP8/DP2/EP1, %s)", storage)
+    storage = (
+        "static FP8" if envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get() else "native MXFP4"
+    )
+    logger.info(
+        "Using MiMo DFlash8 target graph sequence parallel (TP8/DP2/EP1, %s)", storage
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -223,6 +227,7 @@ def _mimo_graph_verify_sp_active(forward_batch: ForwardBatch) -> bool:
         and sum(sizes) >= _MIMO_SP_MIN_TOKENS
     )
 
+
 def _mimo_sp_moe_active(forward_batch: Optional[ForwardBatch]) -> bool:
     """Keep prefill SP under its shared flag and graph SP under its own gate."""
     if forward_batch is None:
@@ -240,6 +245,7 @@ def _mimo_sp_moe_active(forward_batch: Optional[ForwardBatch]) -> bool:
 def _mimo_sp_attn_enabled() -> bool:
     """Construct token-shard communicators for either supported execution path."""
     return mimo_tp_sp_enabled() or _mimo_graph_sp_enabled()
+
 
 def _mimo_graph_sp_enabled() -> bool:
     """Construction-time eligibility for PR47 target graph SP, separate from prefill."""
@@ -271,6 +277,7 @@ def _mimo_graph_sp_enabled() -> bool:
         and not args.enable_two_batch_overlap
     )
 
+
 @functools.lru_cache(maxsize=None)
 def _mimo_init_hipblaslt(device):
     import aiter
@@ -290,11 +297,19 @@ def _mimo_full_o_proj(states, weight, quant_method, packed=False):
     if states.shape[0] == 0:
         return states.new_empty((0, weight.shape[0]))
     _mimo_init_hipblaslt(states.device)
-    return aiter.hipb_mm(states, weight.t(), solution_index=-1, bias=None,
-                        out_dtype=torch.bfloat16, bpreshuffle=True)
+    return aiter.hipb_mm(
+        states,
+        weight.t(),
+        solution_index=-1,
+        bias=None,
+        out_dtype=torch.bfloat16,
+        bpreshuffle=True,
+    )
 
 
-def _mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method, packed=False):
+def _mimo_sp_o_proj(
+    attn_output: torch.Tensor, weight: torch.Tensor, quant_method, packed=False
+):
     """o_proj for this rank's token slice: all-to-all over attention TP
     gives every rank its token slice of all head groups, then one GEMM with the full weight.
     """
@@ -658,7 +673,9 @@ class MiMoV2MoE(nn.Module):
                 and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
                 and isinstance(self.experts.quant_method, Mxfp4AiterA16W4MoEMethod)
             ):
-                raise ValueError("MiMo SP requires static FP8 or the opted-in native MXFP4 graph path")
+                raise ValueError(
+                    "MiMo SP requires static FP8 or the opted-in native MXFP4 graph path"
+                )
 
     def get_moe_weights(self):
         return [
@@ -714,16 +731,30 @@ class MiMoV2MoE(nn.Module):
             if fused_packet:
                 _log_mimo_fused_sp_packet()
                 from sglang.srt.layers.quantization.mimo_native_sp_fusion import (
-                    quantize_pack_native_sp, unpack_native_sp,
+                    quantize_pack_native_sp,
+                    unpack_native_sp,
                 )
-                packed = quantize_pack_native_sp(hidden_states, topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32))
+
+                packed = quantize_pack_native_sp(
+                    hidden_states,
+                    topk.topk_weights.to(torch.float32),
+                    topk.topk_ids.to(torch.int32),
+                )
             else:
                 quantized, scale = quantize_rows(hidden_states)
-                packed = torch.empty((rows, words), dtype=torch.float32, device=hidden_states.device)
-                packed[:, :data_words].view(torch.uint8).copy_(quantized.view(torch.uint8))
+                packed = torch.empty(
+                    (rows, words), dtype=torch.float32, device=hidden_states.device
+                )
+                packed[:, :data_words].view(torch.uint8).copy_(
+                    quantized.view(torch.uint8)
+                )
                 packed[:, data_words].copy_(scale)
-                packed[:, data_words + 1:data_words + 1 + count].copy_(topk.topk_weights)
-                packed[:, data_words + 1 + count:data_words + 1 + 2 * count].view(torch.int32).copy_(topk.topk_ids)
+                packed[:, data_words + 1 : data_words + 1 + count].copy_(
+                    topk.topk_weights
+                )
+                packed[:, data_words + 1 + count : data_words + 1 + 2 * count].view(
+                    torch.int32
+                ).copy_(topk.topk_ids)
             merged = packed.new_empty((sum(sizes), words))
             # Float32 is a copy-only transport here; never cast the FP8 bytes
             # numerically or send them through a reduction.
@@ -733,23 +764,38 @@ class MiMoV2MoE(nn.Module):
             else:
                 values = merged[:, :data_words].contiguous().view(quantized.dtype)
                 scales = merged[:, data_words].contiguous()
-                weights = merged[:, data_words + 1:data_words + 1 + count].contiguous()
-                ids = merged[:, data_words + 1 + count:data_words + 1 + 2 * count].contiguous().view(torch.int32)
+                weights = merged[
+                    :, data_words + 1 : data_words + 1 + count
+                ].contiguous()
+                ids = (
+                    merged[:, data_words + 1 + count : data_words + 1 + 2 * count]
+                    .contiguous()
+                    .view(torch.int32)
+                )
             gathered = (values, scales)
         else:
             weights, ids, gathered = tp_group.all_gatherv(
-                [topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32), hidden_states],
+                [
+                    topk.topk_weights.to(torch.float32),
+                    topk.topk_ids.to(torch.int32),
+                    hidden_states,
+                ],
                 sizes=sizes,
             )
-        partial = self.experts(gathered, StandardTopKOutput(
-            topk_weights=weights,
-            topk_ids=ids,
-            router_logits=weights.new_empty((0,)),
-        ))
+        partial = self.experts(
+            gathered,
+            StandardTopKOutput(
+                topk_weights=weights,
+                topk_ids=ids,
+                router_logits=weights.new_empty((0,)),
+            ),
+        )
         output = partial.new_empty((sizes[0], partial.shape[1]))
         comm = tp_group.pynccl_comm
         if comm is None or not comm.available:
-            raise RuntimeError("MiMo native graph SP requires the direct RCCL communicator")
+            raise RuntimeError(
+                "MiMo native graph SP requires the direct RCCL communicator"
+            )
         with comm.change_state(enable=True):
             comm.reduce_scatter(output, partial)
         return output
@@ -1076,14 +1122,21 @@ class MiMoV2Attention(nn.Module):
                 and _mimo_sp_attn_enabled()
                 and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
             ):
-                if self.o_proj_full.dtype != torch.bfloat16 or self.o_proj_full.shape != (4096, 8192):
-                    raise ValueError("Packed MiMo SP projection requires BF16 [4096, 8192] weights")
+                if (
+                    self.o_proj_full.dtype != torch.bfloat16
+                    or self.o_proj_full.shape != (4096, 8192)
+                ):
+                    raise ValueError(
+                        "Packed MiMo SP projection requires BF16 [4096, 8192] weights"
+                    )
                 from aiter.ops.shuffle import shuffle_weight
 
                 _mimo_init_hipblaslt(self.o_proj_full.device)
                 # Replace the full-weight layout, keeping the local shard for
                 # ordinary attention. Do not retain a second full-weight copy.
-                self.o_proj_full = shuffle_weight(self.o_proj_full, layout=(16, 16), use_int4=False)
+                self.o_proj_full = shuffle_weight(
+                    self.o_proj_full, layout=(16, 16), use_int4=False
+                )
                 self.o_proj_full_packed = True
                 logger.info("Using packed BF16 MiMo SP output projection")
         if self.qkv_proj_full is None:
@@ -1190,7 +1243,9 @@ class MiMoV2Attention(nn.Module):
 
         if scatter_output:
             return _mimo_sp_o_proj(
-                attn_output, self.o_proj_full, self.o_proj.quant_method,
+                attn_output,
+                self.o_proj_full,
+                self.o_proj.quant_method,
                 getattr(self, "o_proj_full_packed", False),
             )
         output, _ = self.o_proj(attn_output)
@@ -1962,21 +2017,34 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         if envs.SGLANG_DFLASH_REQUEST_OWNER_VERIFY.get():
             args = get_global_server_args()
             if not (
-                is_gfx942_supported() and _mimo_tp_sp_flash_config(self.config)
-                and self.config.vocab_size == 152576 and self.logits_processor is not None
-                and args.speculative_algorithm == "DFLASH" and args.speculative_dflash_block_size == 8
-                and args.tp_size == 8 and args.dp_size == 2 and args.attn_cp_size == 1
-                and args.pp_size == 1 and args.enable_dp_attention and args.enable_dp_lm_head
-                and not args.enable_fp32_lm_head and not args.enable_lora
-                and not args.enable_two_batch_overlap and args.kv_cache_dtype == "bf16"
+                is_gfx942_supported()
+                and _mimo_tp_sp_flash_config(self.config)
+                and self.config.vocab_size == 152576
+                and self.logits_processor is not None
+                and args.speculative_algorithm == "DFLASH"
+                and args.speculative_dflash_block_size == 8
+                and args.tp_size == 8
+                and args.dp_size == 2
+                and args.attn_cp_size == 1
+                and args.pp_size == 1
+                and args.enable_dp_attention
+                and args.enable_dp_lm_head
+                and not args.enable_fp32_lm_head
+                and not args.enable_lora
+                and not args.enable_two_batch_overlap
+                and args.kv_cache_dtype == "bf16"
                 and self.logits_processor.use_attn_tp_group
                 and self.logits_processor.do_tensor_parallel_all_gather
                 and not self.logits_processor.final_logit_softcapping
             ):
-                raise ValueError("Request-owner verification requires the validated gfx942 Flash DFlash8 TP8/DP2 BF16 configuration")
+                raise ValueError(
+                    "Request-owner verification requires the validated gfx942 Flash DFlash8 TP8/DP2 BF16 configuration"
+                )
             self.logits_processor.request_owner_world_size = 4
             self.logits_processor.request_owner_block_size = 8
-            logger.info("Enabled request-owner target logits: attention TP4, DFlash8, BF16")
+            logger.info(
+                "Enabled request-owner target logits: attention TP4, DFlash8, BF16"
+            )
         self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)

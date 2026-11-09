@@ -26,7 +26,6 @@ parity and the other parity is zeroed for the next launch.
 import argparse
 import functools
 import os
-import sys
 
 import torch
 

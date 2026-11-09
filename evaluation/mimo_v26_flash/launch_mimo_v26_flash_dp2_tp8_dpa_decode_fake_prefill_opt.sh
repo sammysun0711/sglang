@@ -22,4 +22,28 @@ export SGLANG_DFLASH_REQUEST_OWNER_VERIFY="${SGLANG_DFLASH_REQUEST_OWNER_VERIFY:
 export SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY="${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY:-1}"
 export SGLANG_DFLASH_PROB_SORT32="${SGLANG_DFLASH_PROB_SORT32:-1}"
 export SGLANG_DFLASH_FUSED_CHAIN_VERIFY="${SGLANG_DFLASH_FUSED_CHAIN_VERIFY:-1}"
-exec bash "${script_dir}/launch_mimo_v26_flash_dp2_tp8_ep1_dpa_decode_fake_prefill_baseline.sh" "$@"
+export SGLANG_DFLASH_PREFILL_REFILL_TARGET="${SGLANG_DFLASH_PREFILL_REFILL_TARGET:-1}"
+export SGLANG_FAKE_PREFILL_ZERO_KV_ON_FLUSH="${SGLANG_FAKE_PREFILL_ZERO_KV_ON_FLUSH:-1}"
+export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-4}"
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-480}"
+export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-240}"
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.9411764705882354}"
+export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.03}"
+default_args=()
+has_dense_tp=0
+has_tokenizer_backend=0
+has_batch_decode=0
+has_warmup=0
+for arg in "$@"; do
+  case "$arg" in
+    --moe-dense-tp-size|--moe-dense-tp-size=*) has_dense_tp=1 ;;
+    --tokenizer-backend|--tokenizer-backend=*) has_tokenizer_backend=1 ;;
+    --disable-tokenizer-batch-decode) has_batch_decode=1 ;;
+    --skip-server-warmup) has_warmup=1 ;;
+  esac
+done
+if [[ "$has_dense_tp" == 0 ]]; then default_args+=(--moe-dense-tp-size 1); fi
+if [[ "$has_tokenizer_backend" == 0 ]]; then default_args+=(--tokenizer-backend huggingface); fi
+if [[ "$has_batch_decode" == 0 ]]; then default_args+=(--disable-tokenizer-batch-decode); fi
+if [[ "$has_warmup" == 0 ]]; then default_args+=(--skip-server-warmup); fi
+exec bash "${script_dir}/launch_mimo_v26_flash_dp2_tp8_ep1_dpa_decode_fake_prefill_baseline.sh" "${default_args[@]}" "$@"

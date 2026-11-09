@@ -29,7 +29,6 @@ import argparse
 import collections
 import functools
 import os
-import sys
 from collections import defaultdict
 
 import torch
@@ -56,7 +55,6 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_lo
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled  # noqa: E402
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw  # noqa: E402
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4  # noqa: E402
-from aiter.test_common import run_perftest  # noqa: E402
 
 BM = 64
 NUM_WAVES = 4

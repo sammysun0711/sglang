@@ -1802,7 +1802,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        if sampling_info is not None:
+        owner_result = None
+        if logits_output.request_owner_chunk_size:
+            from sglang.srt.speculative.request_owner_verify import restore_full_logits, verify_owned
+
+            owner_result = verify_owned(
+                logits_output.next_token_logits, draft_tokens, sampling_info, get_attention_tp_group(),
+                chunk=logits_output.request_owner_chunk_size,
+                max_top_k=draft_input.max_top_k, uniform_top_k_value=draft_input.uniform_top_k_value)
+            if owner_result is None:
+                logits_output.next_token_logits = restore_full_logits(
+                    logits_output.next_token_logits, get_attention_tp_group(), batch_size=bs,
+                    block_size=int(self.block_size), chunk=logits_output.request_owner_chunk_size)
+                logits_output.request_owner_chunk_size = 0
+
+        if owner_result is None and sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -1811,7 +1825,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
-        if (
+        if owner_result is not None:
+            accept_len, bonus = owner_result
+            commit_lens = accept_len.to(torch.int32) + 1
+            out_tokens = torch.empty((bs, int(self.block_size)), dtype=torch.int64, device=device)
+            out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+            out_tokens[:, int(self.block_size) - 1].fill_(0)
+            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+        elif (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()

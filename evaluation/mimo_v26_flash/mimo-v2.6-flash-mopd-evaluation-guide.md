@@ -183,8 +183,11 @@ PERFORMANCE_MODE=1 \
 - Each MoE layer runs 3 launches on the MORI receive buffer: local-expert sort and
   tile schedule, gate/up GEMM with SiLU, and the down GEMM. The number of valid
   received rows is read on the GPU, so this path needs no host sync and works
-  inside CUDA graphs. The output is sized by the forward pass's global token count
-  (the DP-attention gather length) rather than by the MORI capacity.
+  inside CUDA graphs. Kernel buffers are sized by the received row count: the
+  exact count in eager mode (one small device-to-host read per MoE layer), and in
+  CUDA graphs local tokens + (DP size - 1) x the largest captured per-DP batch,
+  because DP groups pick their own graph batch sizes. The output buffer keeps the
+  MORI capacity, as AITER's `moe_buf` does.
 - Weights need `hidden_size` and the per-rank intermediate size to be multiples
   of 1024 and at least 2048, with at most 32 local experts per rank. MiMo-V2.6-Flash
   EP8 (4096 / 2048 / 32) satisfies these.

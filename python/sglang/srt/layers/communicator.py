@@ -422,7 +422,9 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
     is_next_layer_sparse: Optional[bool]
-    # Attention computes all heads on the local token shard.
+    # The model's MoE handles token-scattered input itself (SGLANG_ENABLE_DPA_SP).
+    sp_tp_moe: bool = False
+    # Attention runs on the token shard with all heads (MiMo SWA under SGLANG_ENABLE_DPA_SP).
     sp_attn: bool = False
 
     def previous_layer(self):
@@ -433,6 +435,7 @@ class _LayerModeComputationContext:
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
             is_next_layer_sparse=self.is_layer_sparse,
+            sp_tp_moe=self.sp_tp_moe,
         )
 
 
@@ -471,6 +474,7 @@ class LayerScatterModes:
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or context.sp_tp_moe
             ):
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
@@ -839,6 +843,25 @@ class LayerCommunicator:
             layernorm=layernorm,
             context=self._context,
         )
+
+    def prepare_mlp_from_scattered_attn(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        quant_format: str = "",
+    ):
+        """prepare_mlp when attention already returned this rank's reduced token slice
+        (MiMo SGLANG_ENABLE_DPA_SP): only the residual add and post-attention norm remain.
+        """
+        assert self.layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        assert self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED
+        if self.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL:
+            residual = residual.tensor_split(self._context.attn_tp_size)[
+                self._context.attn_tp_rank
+            ]
+        if hidden_states.shape[0] == 0:
+            return hidden_states, residual
+        return self._get_prepare_mlp_layernorm(quant_format)(hidden_states, residual)
 
     def _get_prepare_mlp_layernorm(self, quant_format: str):
         layernorm = self.post_attention_layernorm

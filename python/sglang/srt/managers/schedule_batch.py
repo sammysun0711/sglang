@@ -1766,7 +1766,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
-    all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
+    # Every active DP replica is plain EXTEND; IDLE replicas may join TP SP MoE.
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None

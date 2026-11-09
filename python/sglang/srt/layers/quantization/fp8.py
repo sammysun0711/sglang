@@ -295,6 +295,13 @@ class Fp8Config(QuantizationConfig):
                 and get_moe_runner_backend().is_aiter()
                 and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
             ):
+                if layer.moe_ep_size > 1:
+                    from sglang.srt.layers.quantization.mxfp4_aiter_ep_a8w4_moe import (
+                        Mxfp4AiterEpA8W4MoEMethod,
+                    )
+
+                    return Mxfp4AiterEpA8W4MoEMethod(fp8_method, prefix=prefix)
+
                 from sglang.srt.layers.quantization.mxfp4_aiter_a16w4_moe import (
                     Mxfp4AiterA16W4MoEMethod,
                 )

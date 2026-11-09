@@ -529,6 +529,8 @@ class Envs:
     # Only globally agreed plain prefill (including idle replicas) may enter;
     # decode, speculative verify, mixed batches and CUDA graphs use the original path.
     SGLANG_ENABLE_DPA_SP = EnvBool(False)
+    # Ablation: retain TP MoE/SWA SP while selecting the full-attention projection strategy.
+    SGLANG_MIMO_TP_SP_FULL_OPROJ = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

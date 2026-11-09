@@ -1809,6 +1809,13 @@ class MiMoV2DecoderLayer(nn.Module):
                     self.self_attn.o_proj_full is not None
                     and communicator.layer_scatter_modes.mlp_mode
                     == ScatterMode.SCATTERED
+                    and (
+                        envs.SGLANG_MIMO_TP_SP_FULL_OPROJ.get()
+                        or (
+                            self.self_attn.attn.sliding_window_size is not None
+                            and self.self_attn.attn.sliding_window_size >= 0
+                        )
+                    )
                 )
         elif (
             self.self_attn._ep_sp_swa

@@ -209,6 +209,16 @@ def _log_mimo_tp_sp():
     logger.info("Using MiMo TP prefill sequence parallel (TP8/DP2/EP1, static FP8)")
 
 
+@functools.lru_cache(maxsize=None)
+def _log_mimo_prefill_full_oproj(enabled: bool):
+    logger.info("MiMo full-attention prefill output-projection SP: %s", enabled)
+
+
+@functools.lru_cache(maxsize=1)
+def _log_mimo_prefill_pyhip_moe():
+    logger.info("Using PR40 PyHIP FP8 prefill MoE with fused reduce-scatter")
+
+
 def _mimo_sp_moe_active(forward_batch: Optional[ForwardBatch]) -> bool:
     """Use the SGLANG_ENABLE_DPA_SP layout for this forward: the same decision on every rank
     and layer (global token count); small passes and graph capture keep the all-reduce path.
@@ -950,6 +960,7 @@ class MiMoV2MoE(nn.Module):
             _mimo_sp_moe_gather_scales(scale, sizes),
         )
         if self._use_pyhip_moe(sizes):
+            _log_mimo_prefill_pyhip_moe()
             from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
 
             x8, x_scale = expert_input
@@ -1861,6 +1872,11 @@ class MiMoV2DecoderLayer(nn.Module):
                         )
                     )
                 )
+                if (
+                    self.self_attn.attn.sliding_window_size is None
+                    or self.self_attn.attn.sliding_window_size < 0
+                ):
+                    _log_mimo_prefill_full_oproj(sp_o_proj)
         elif (
             self.self_attn._ep_sp_swa
             and self.layer_communicator_sp_attn is not None

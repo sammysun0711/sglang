@@ -105,6 +105,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_worker: TpModelWorker,
     ):
         self.server_args = server_args
+        self._draft_greedy_chunk_size = envs.SGLANG_DFLASH_GREEDY_CHUNK_SIZE.get()
+        if self._draft_greedy_chunk_size <= 0:
+            raise ValueError("SGLANG_DFLASH_GREEDY_CHUNK_SIZE must be positive")
+        if self._draft_greedy_chunk_size != 256:
+            logger.info("DFlash greedy projection chunk size: %s", self._draft_greedy_chunk_size)
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
@@ -1742,6 +1747,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
+            chunk_size=self._draft_greedy_chunk_size,
         ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]

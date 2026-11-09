@@ -718,6 +718,7 @@ class Envs:
     SGLANG_DFLASH_FUSED_COMPACT_KV = EnvBool(False)
     # Fill the existing CPU length buffers through shared NumPy views.
     SGLANG_DFLASH_FAST_CPU_STAGING = EnvBool(False)
+    SGLANG_DFLASH_GREEDY_CHUNK_SIZE = EnvInt(256)
     # Opt-in grouped PA for MiMo target DFlash SWA verification.
     SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)
     # Keep target graphs enabled while comparing eager and captured DP drafts.

@@ -3,6 +3,8 @@ set -euo pipefail
 
 # MiMo-V2.6: convert checkpoint MXFP4 experts once at load time to FP8
 # 128x128 blockscale weights. Activations remain dynamically quantized.
+# SGLANG_MXFP4_TO_FP8_128BLOCK=0 instead keeps the native MXFP4 experts and runs
+# the FlyDSL EP8 A8W4 kernels directly on MORI's blockwise-FP8 dispatch.
 # Global TP8 / EP8, DP2 with attention TP4, and optional DFlash block 8.
 # ENABLE_DFLASH=1 (default) runs a TP4 draft in each DP group; 0 is target-only.
 # Defaults: global chunk 32768 and request limit 192, or 16384 / 96 per DP.
@@ -25,7 +27,22 @@ if [[ -n "${AITER_ROOT:-}" ]]; then
 fi
 export PYTHONPATH="${SGLANG_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-export SGLANG_MXFP4_TO_FP8_128BLOCK=1
+# 1 (default): MXFP4 experts -> FP8 128x128 blockscale at load time, AITER fused_moe.
+# 0: native MXFP4 experts, FlyDSL EP8 A8W4 kernels (sort + quant prep, gemm1 + SiLU,
+#    gemm2) consuming MORI's fp8 per-1x128 dispatch and writing MORI's combine input.
+export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-1}"
+case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
+  1)
+    moe_weight_description="static FP8 blockscale MoE weights converted from MXFP4 at load time"
+    ;;
+  0)
+    moe_weight_description="native MXFP4 MoE weights; FlyDSL EP8 A8W4 kernels on MORI fp8 dispatch"
+    ;;
+  *)
+    echo "SGLANG_MXFP4_TO_FP8_128BLOCK must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 export SGLANG_INT4_WEIGHT=0
 # MiMo's encoder otherwise defaults to a CUDA-only attention implementation.
 export MM_ATTENTION_BACKEND=aiter_attn
@@ -216,7 +233,7 @@ export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 export LOG_DIR="${LOG_DIR:-${SGLANG_ROOT}/evaluation/logs/mimo_v26_flash_dp2_attn_tp4_ep8_${RUN_ID}}"
 export LOG_FILE="${LOG_FILE:-server_dp2_attn_tp4_ep8_dflash.log}"
 
-echo "MiMo-V2.6: static FP8 blockscale MoE weights converted from MXFP4 at load time"
+echo "MiMo-V2.6: ${moe_weight_description}"
 echo "Attention: full target=${SGLANG_AITER_PA_DECODE_IMPL}; SWA target=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}"
 echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; fused bounds checks=${SGLANG_FUSED_ASYNC_OOB_CHECKS}"
 

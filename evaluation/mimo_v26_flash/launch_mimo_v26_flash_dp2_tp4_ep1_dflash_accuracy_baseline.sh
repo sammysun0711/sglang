@@ -19,7 +19,7 @@ if [[ -n "${AITER_ROOT:-}" ]]; then
 fi
 export PYTHONPATH="${SGLANG_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-export SGLANG_MXFP4_TO_FP8_128BLOCK=1
+export SGLANG_MXFP4_TO_FP8_128BLOCK=0
 export SGLANG_INT4_WEIGHT=0
 # MiMo's encoder otherwise defaults to a CUDA-only attention implementation.
 export MM_ATTENTION_BACKEND=aiter_attn

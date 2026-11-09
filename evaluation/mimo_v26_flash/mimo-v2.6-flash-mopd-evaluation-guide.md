@@ -151,6 +151,59 @@ with **`PERFORMANCE_MODE=0`** to enable real expert routing. Set `ENABLE_DFLASH=
 for target-only accuracy or `ENABLE_DFLASH=1` for DFlash accuracy, then follow
 the GSM8K evaluation steps in section 8.
 
+#### Native MXFP4 EP8 A8W4 MoE kernels with MORI
+
+By default this launcher converts the MXFP4 experts to FP8 128x128 blockscale
+weights at load time (`SGLANG_MXFP4_TO_FP8_128BLOCK=1`) and runs AITER
+`fused_moe`. Set **`SGLANG_MXFP4_TO_FP8_128BLOCK=0`** to keep the native MXFP4
+experts and run the FlyDSL EP8 A8W4 kernels
+(`python/sglang/srt/layers/quantization/mxfp4_aiter_ep_a8w4_moe.py`, ported from
+`tingqli/aiter` `tq/mimo-moe` `doc-mimo` section 8) on the MORI dispatch/combine
+path:
+
+```bash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
+SGLANG_MXFP4_TO_FP8_128BLOCK=0 \
+CHUNKED_PREFILL_SIZE=32768 \
+MEM_FRACTION_STATIC=0.75 \
+SWA_FULL_TOKENS_RATIO=0.03 \
+MAX_RUNNING_REQUESTS=192 \
+SGLANG_USE_PYHIP_MIMO_PREFILL=1 \
+DISABLE_RADIX_CACHE=1 \
+ENABLE_DFLASH=1 \
+PERFORMANCE_MODE=1 \
+./launch_mimo_v26_flash_dp2_tp4_ep8_dflash_accuracy_baseline.sh
+```
+
+- MORI dispatch stays `SGLANG_MORI_DISPATCH_DTYPE=fp8`: activations are FP8
+  with one FP32 scale per (token, 128) block. The kernels consume these blocks
+  directly, so no dequantize/requantize pass is needed. `bf16` dispatch also
+  works; the kernels then quantize each token row themselves. `fp4` dispatch is
+  not supported.
+- Each MoE layer runs 3 launches on the MORI receive buffer: local-expert sort and
+  tile schedule, gate/up GEMM with SiLU, and the down GEMM. The number of valid
+  received rows is read on the GPU, so this path needs no host sync and works
+  inside CUDA graphs. The output is sized by the forward pass's global token count
+  (the DP-attention gather length) rather than by the MORI capacity.
+- Weights need `hidden_size` and the per-rank intermediate size to be multiples
+  of 1024 and at least 2048, with at most 32 local experts per rank. MiMo-V2.6-Flash
+  EP8 (4096 / 2048 / 32) satisfies these.
+
+Kernel-level comparison on one MI325X with warm caches and CUDA graphs. Each rank
+is rank 0 of EP8 with real top-8 routing over 256 experts. T is the global token
+count; the receive buffer holds the T·(1-(7/8)^8) ≈ 0.66·T tokens that have a
+local expert. Times are in µs:
+
+| T | EP8 A8W4 (MORI fp8 input) | AITER fused_moe FP8 128x128 (current default) |
+|---:|---:|---:|
+| 16 | 72 | 95 |
+| 64 | 114 | 202 |
+| 256 | 139 | 260 |
+| 1024 | 202 | 314 |
+| 4096 | 404 | 567 |
+| 16384 | 1272 | 1750 |
+| 32768 | 2458 | 3317 |
+
 ## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 
 The standalone fake-prefill launcher defines the Flash baseline settings:

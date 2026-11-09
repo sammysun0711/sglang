@@ -80,8 +80,8 @@ FLYDSL_MIMO_KV_HEADS = 1
 FLYDSL_MIMO_HEAD_DIM = 192
 FLYDSL_MIMO_VALUE_HEAD_DIM = 128
 FLYDSL_MIMO_PAGE_SIZE = 64
-FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS = 8
-FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS = (8, 16, 24, 32, 64)
+FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS = 0  # AITER's cached/calibrated selection.
+FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS = (0, 1, 2, 3, 4, 8, 16, 24, 32, 64)
 FLYDSL_MIMO_NUM_PARTITIONS_ENV = "SGLANG_FLYDSL_PA_NUM_PARTITIONS"
 FLYDSL_MIMO_PREFILL_ENV = "SGLANG_FLYDSL_MIMO_PREFILL"
 FLYPA_MIMO_PREFILL_ENV = "SGLANG_FLYPA_MIMO_PREFILL"
@@ -1318,6 +1318,7 @@ class FlyDSLPADecodeKernels:
     version: str
     runtime_path: str
     kernel_path: str
+    prepare_pa_decode_plan: Callable | None = None
 
 
 @lru_cache(maxsize=1)
@@ -1343,6 +1344,12 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
             "API (PR #5809/#5887) and a compatible FlyDSL runtime"
         ) from exc
 
+    try:
+        prepare = importlib.import_module(
+            "aiter.ops.flydsl.pa_decode_tuning"
+        ).prepare_pa_decode_plan
+    except (ImportError, AttributeError):
+        prepare = None
     return FlyDSLPADecodeKernels(
         pa_decode=decode,
         plan_pa_decode=plan,
@@ -1350,6 +1357,7 @@ def load_flydsl_pa_decode_kernels() -> FlyDSLPADecodeKernels:
         version=str(getattr(flydsl, "__version__", "unknown")),
         runtime_path=str(getattr(flydsl, "__file__", "unknown")),
         kernel_path=str(getattr(module, "__file__", "unknown")),
+        prepare_pa_decode_plan=prepare,
     )
 
 
@@ -2682,7 +2690,7 @@ def forward_decode_vectorized_5d(
 
 def _full_pa_query_split_kwargs(backend: AiterAttnBackend, query_length: int) -> dict:
     splits = getattr(backend, "_flydsl_pa_decode_query_splits", None)
-    return {"query_splits": splits} if query_length == 4 and splits is not None else {}
+    return {"query_splits": splits} if query_length in (4, 8) and splits is not None else {}
 
 
 def _get_flydsl_work_plan(
@@ -2692,12 +2700,13 @@ def _get_flydsl_work_plan(
     num_partitions: int,
     query_length: int,
     sliding_window: int = 0,
+    **prepare_kwargs,
 ):
     """Refresh small per-batch plans while sharing the maximum-batch scratch.
 
-    The explicit budget preserves the configured per-sequence partition cap
-    and the existing scratch allocation. Only plan metadata is cached per
-    graph shape; lengths are read on device, including during graph replay.
+    Automatic selection runs once before capture, without candidate timing.
+    Explicit overrides retain their full partition budget. Only plan metadata
+    is cached per graph shape; lengths are refreshed on device during replay.
     """
     batch_size = context_lengths.numel()
     key = (
@@ -2716,16 +2725,32 @@ def _get_flydsl_work_plan(
             raise RuntimeError(
                 "FlyDSL PA work plan must be warmed before graph capture"
             )
-        kwargs.update(
-            max_partitions=num_partitions,
-            max_batch_size=batch_size,
-            workgroup_budget=batch_size * num_kv_heads * num_partitions,
-        )
+        if getattr(backend, "_flydsl_pa_decode_auto_partitions", False):
+            plan = backend._flydsl_prepare_pa_decode_plan(
+                context_lengths=context_lengths,
+                max_partitions=num_partitions,
+                max_batch_size=batch_size,
+                cache_only=True,
+                **kwargs,
+                **prepare_kwargs,
+            )
+            if plan.capacity > batch_size * num_partitions:
+                raise RuntimeError("FlyDSL PA work plan capacity exceeds shared scratch")
+            logger.info(
+                "Prepared automatic FlyDSL PA plan: batch=%d, query_length=%d, "
+                "partitions=%d, query_splits=%s, capacity=%d",
+                batch_size, query_length, plan.max_partitions,
+                plan.query_splits or "auto", plan.capacity,
+            )
+            plans[key] = plan
+            return plan
+        kwargs.update(max_partitions=num_partitions, max_batch_size=batch_size,
+                      workgroup_budget=batch_size * num_kv_heads * num_partitions)
     else:
         kwargs["plan"] = plan
     plan = backend._flydsl_plan_pa_decode(context_lengths, num_kv_heads, **kwargs)
-    if plan.capacity != batch_size * num_partitions:
-        raise RuntimeError("FlyDSL PA work plan capacity does not match shared scratch")
+    if plan.capacity > batch_size * num_partitions:
+        raise RuntimeError("FlyDSL PA work plan capacity exceeds shared scratch")
     plans[key] = plan
     return plan
 
@@ -2734,8 +2759,11 @@ def _get_flydsl_workspace_views(
     backend: AiterAttnBackend,
     batch_size: int,
     query_length: int,
+    capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_partitions = backend._flydsl_pa_decode_num_partitions
+    if capacity is None:
+        capacity = batch_size * num_partitions
     configured_query_length = int(backend._flydsl_pa_decode_query_length)
     if query_length not in (1, configured_query_length):
         raise RuntimeError(
@@ -2746,7 +2774,7 @@ def _get_flydsl_workspace_views(
         FLYDSL_MIMO_QUERY_HEADS // FLYDSL_MIMO_KV_HEADS
     )
     scalar_numel = (
-        batch_size * FLYDSL_MIMO_KV_HEADS * num_partitions * equivalent_group_size
+        capacity * FLYDSL_MIMO_KV_HEADS * equivalent_group_size
     )
     output_numel = scalar_numel * FLYDSL_MIMO_VALUE_HEAD_DIM
     buffers = (
@@ -2765,7 +2793,7 @@ def _get_flydsl_workspace_views(
 
     scalar_shape = (
         FLYDSL_MIMO_KV_HEADS,
-        batch_size * num_partitions,
+        capacity,
         equivalent_group_size,
     )
     pmax = backend._flydsl_pa_decode_pmax[:scalar_numel].view(scalar_shape)
@@ -2999,20 +3027,7 @@ def _forward_full_flydsl_5d(
                 f"FlyDSL MiMo {name} must be on {device}; got {tensor.device}"
             )
 
-    pmax, psum, pout, context_lengths = _get_flydsl_workspace_views(
-        backend, batch_size, query_length
-    )
-    for name, workspace, dtype in (
-        ("pmax", pmax, torch.float32),
-        ("psum", psum, torch.float32),
-        ("pout", pout, torch.bfloat16),
-        ("context lengths", context_lengths, torch.int32),
-    ):
-        if workspace.device != device or workspace.dtype != dtype:
-            raise ValueError(
-                f"FlyDSL MiMo {name} workspace must be {dtype} on {device}; "
-                f"got {workspace.dtype} on {workspace.device}"
-            )
+    context_lengths = backend._flydsl_pa_decode_context_lengths[:batch_size]
     # Decode lengths include the query; verification lengths describe its prefix.
     # Convert either convention into the persistent int32 buffer without a
     # temporary allocation or a host/device synchronization.
@@ -3027,7 +3042,30 @@ def _forward_full_flydsl_5d(
         num_kv_heads,
         backend._flydsl_pa_decode_num_partitions,
         query_length,
+        query=q_view,
+        key_cache=k_cache,
+        value_cache=v_cache,
+        block_tables=block_tables,
+        softmax_scale=layer.scaling,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        max_context_length=block_tables.shape[1] * backend.page_size,
+        **_full_pa_query_split_kwargs(backend, query_length),
     )
+    pmax, psum, pout, context_lengths = _get_flydsl_workspace_views(
+        backend, batch_size, query_length, work_plan.capacity
+    )
+    for name, workspace, dtype in (
+        ("pmax", pmax, torch.float32),
+        ("psum", psum, torch.float32),
+        ("pout", pout, torch.bfloat16),
+        ("context lengths", context_lengths, torch.int32),
+    ):
+        if workspace.device != device or workspace.dtype != dtype:
+            raise ValueError(
+                f"FlyDSL MiMo {name} workspace must be {dtype} on {device}; "
+                f"got {workspace.dtype} on {workspace.device}"
+            )
     backend._flydsl_pa_decode(
         output=output_view,
         query=q_view,
@@ -3082,9 +3120,7 @@ def warmup_flydsl_full_decode(backend: AiterAttnBackend) -> None:
             dtype=torch.bfloat16,
             device=backend.device,
         )
-        pmax, psum, pout, lengths = _get_flydsl_workspace_views(
-            backend, 1, query_length
-        )
+        lengths = backend._flydsl_pa_decode_context_lengths[:1]
         lengths.fill_(query_length)
         plan = _get_flydsl_work_plan(
             backend,
@@ -3092,6 +3128,18 @@ def warmup_flydsl_full_decode(backend: AiterAttnBackend) -> None:
             FLYDSL_MIMO_KV_HEADS,
             backend._flydsl_pa_decode_num_partitions,
             query_length,
+            query=q,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            block_tables=table,
+            softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
+            key_scale=scale,
+            value_scale=scale,
+            max_context_length=FLYDSL_MIMO_PAGE_SIZE,
+            **_full_pa_query_split_kwargs(backend, query_length),
+        )
+        pmax, psum, pout, lengths = _get_flydsl_workspace_views(
+            backend, 1, query_length, plan.capacity
         )
         backend._flydsl_pa_decode(
             output=output,

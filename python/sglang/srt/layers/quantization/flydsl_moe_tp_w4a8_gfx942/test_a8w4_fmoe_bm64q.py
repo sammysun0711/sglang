@@ -638,11 +638,11 @@ def a8w4_fmoe_bm64q(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
     return out
 
 
-def fused_moe_a8w4_bm64q(x, weights, topk_weights, topk_ids, **kw):
+def fused_moe_a8w4_bm64q(x, weights, topk_weights, topk_ids, *, input_scale=None, **kw):
     E, model_dim, _ = weights["w2"].shape
     sids, sw, seids, nv, moe_buf = moe_sorting(topk_ids, topk_weights, E, model_dim,
                                                dtypes.bf16, BM)[:5]
-    x8, xs = quantize_rows(x)
+    x8, xs = quantize_rows(x) if input_scale is None else (x, input_scale)
     return a8w4_fmoe_bm64q(x8, xs, weights, sids, sw, seids, nv, moe_buf,
                            topk=topk_ids.shape[1], **kw)
 

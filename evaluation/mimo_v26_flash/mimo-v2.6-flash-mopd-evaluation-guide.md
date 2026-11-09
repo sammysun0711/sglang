@@ -131,11 +131,11 @@ serving, and the client requests one output token to measure prefill performance
 quantization packs activations and FP32 scales into one attention-TP all-gather.
 Set it to `0` for the BF16 all-gather baseline. This requires the matching AITER
 fused-quant wrapper with caller-owned output buffers.
-In another terminal, run the full `mimo_v26_flash` preset:
+In another terminal, run the full `customer_pressure` preset:
 
 ```bash
 cd /sgl-workspace/sglang/evaluation
-BENCHMARK_PRESET=mimo_v26_flash \
+BENCHMARK_PRESET=customer_pressure \
 HOST=127.0.0.1 \
 LOG_DIR=./logs/mimo_v26_flash_dp2_tp8_ep8_dpa_prefill \
 ./run_benchmark_mimo_pro_prefill.sh

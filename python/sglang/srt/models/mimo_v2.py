@@ -153,6 +153,8 @@ def _mimo_ep_sp_supported() -> bool:
         is_gfx942_supported()
         and is_dp_attention_enabled()
         and get_attention_tp_size() == 4
+        and enable_moe_dense_fully_dp()
+        and not args.enable_two_batch_overlap
         and get_moe_a2a_backend().is_mori()
         and args.attention_backend == "aiter"
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
@@ -725,7 +727,7 @@ class MiMoV2Attention(nn.Module):
         self.qkv_proj_full = None
         self.o_proj_full = None
         if (
-            envs.SGLANG_MIMO_SWA_SP.get()
+            envs.SGLANG_ENABLE_MIMO_SWA_SP.get()
             and _mimo_ep_sp_supported()
             and sliding_window_size > 0
             and self.total_num_heads == 64
@@ -816,7 +818,7 @@ class MiMoV2Attention(nn.Module):
                 raise ValueError(
                     f"MiMo SWA SP needs the full checkpoint tensor for {name}: "
                     f"expected {tuple(full.shape)}, got {tuple(loaded_weight.shape)}. "
-                    "Disable SGLANG_MIMO_SWA_SP to load TP-only shards."
+                    "Disable SGLANG_ENABLE_MIMO_SWA_SP to load TP-only shards."
                 )
             shard = getattr(self.qkv_proj, param_name)
             if full.shape != shard.shape:

@@ -521,7 +521,7 @@ class Envs:
     # gfx942 FP8 blockscale linear kernel (e.g. for mimo fp8 qkv projection)
     SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
     # MiMo EP prefill: run SWA on local token shards.
-    SGLANG_MIMO_SWA_SP = EnvBool(False)
+    SGLANG_ENABLE_MIMO_SWA_SP = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

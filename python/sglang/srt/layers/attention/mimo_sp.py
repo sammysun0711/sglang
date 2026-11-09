@@ -43,7 +43,7 @@ def _mimo_attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class _MimoSpSwaMetadata:
-    """Per-forward layout of one rank's sliding-window attention under SGLANG_MIMO_SWA_SP.
+    """Per-forward SWA layout under SGLANG_ENABLE_MIMO_SWA_SP.
 
     Keys of every request segment in this rank's token slice are packed into page-64
     SHUFFLE-5D pages: cached keys left of the chunk, keys from earlier slices, then the
@@ -169,7 +169,7 @@ def run_mimo_sp_swa(
     hidden_states,
     forward_batch: ForwardBatch,
 ) -> torch.Tensor:
-    """SWA prefill on this rank's token slice with all heads (SGLANG_MIMO_SWA_SP)."""
+    """SWA prefill on this rank's token slice with all heads."""
     _log_path("SWA sequence parallel (64Q/8KV, head-sharded persistent cache)")
     from aiter.ops.flydsl import flydsl_paged_attention_swa_bf16
 

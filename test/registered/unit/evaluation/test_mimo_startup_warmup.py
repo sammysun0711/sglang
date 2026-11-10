@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import io
+import logging
 import os
 import sys
 import tempfile
@@ -125,6 +127,24 @@ class StartupWarmupTest(CustomTestCase, unittest.IsolatedAsyncioTestCase):
 
 
 class MemoryWarmupTest(CustomTestCase):
+    def test_startup_logs_follow_http_worker_configuration(self):
+        parent = logging.getLogger("sglang.srt.entrypoints.http_server")
+        root = logging.getLogger()
+        saved = parent.level, parent.handlers[:], parent.propagate, root.level
+        output = io.StringIO()
+        try:
+            root.setLevel(logging.WARNING)
+            parent.setLevel(logging.INFO)
+            parent.handlers = [logging.StreamHandler(output)]
+            parent.propagate = False
+            warmup.logger.info("representative startup completed")
+            self.assertIn("representative startup completed", output.getvalue())
+        finally:
+            parent.setLevel(saved[0])
+            parent.handlers = saved[1]
+            parent.propagate = saved[2]
+            root.setLevel(saved[3])
+
     def test_compiles_batch_and_dtype_families_without_launching(self):
         calls, initialized = [], []
 

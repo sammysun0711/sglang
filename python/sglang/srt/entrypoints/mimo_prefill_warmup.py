@@ -7,7 +7,8 @@ import tempfile
 import time
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+# Multi-tokenizer Uvicorn workers configure the HTTP logger, not the root.
+logger = logging.getLogger("sglang.srt.entrypoints.http_server.mimo_prefill")
 
 # Balanced pairs cover the measured MiMo FP8 GEMM tile-order/reduction modes.
 # Asymmetric pairs cover short SWA shards while the other DP group keeps SP

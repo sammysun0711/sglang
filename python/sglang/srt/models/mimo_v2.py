@@ -204,11 +204,6 @@ def _log_mimo_tp_sp():
     logger.info("Using MiMo TP prefill sequence parallel (TP8/DP2/EP1, static FP8)")
 
 
-@functools.lru_cache(maxsize=None)
-def _log_mimo_prefill_full_oproj(enabled: bool):
-    logger.info("MiMo full-attention prefill output-projection SP: %s", enabled)
-
-
 @functools.lru_cache(maxsize=1)
 def _log_mimo_prefill_pyhip_moe():
     logger.info("Using PR40 PyHIP FP8 prefill MoE with fused reduce-scatter")
@@ -733,19 +728,15 @@ class MiMoV2MoE(nn.Module):
         return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
 
     def _use_pyhip_moe(self, sizes: List[int]) -> bool:
-        """PyHIP MoE + fused top-k sum / reduce-scatter (SGLANG_MIMO_PREFILL_PYHIP_MOE)
-        for this forward; the layer check runs once, after weight post-processing."""
-        if self._pyhip_moe is None:
-            self._pyhip_moe = False
-            if envs.SGLANG_MIMO_PREFILL_PYHIP_MOE.get():
-                from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
+        """Select the supported PyHIP TP MoE path after weight post-processing."""
+        from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
 
-                self._pyhip_moe = pyhip_fp8_blockscale_moe.supports_layer(
-                    self.experts, get_tp_group().world_size
-                )
+        if self._pyhip_moe is None:
+            self._pyhip_moe = pyhip_fp8_blockscale_moe.supports_layer(
+                self.experts, get_tp_group().world_size
+            )
         if not self._pyhip_moe:
             return False
-        from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
 
         return pyhip_fp8_blockscale_moe.fits(
             sizes, self.experts.w13_weight.shape[0], _mimo_sp_moe_max_rows()
@@ -1462,19 +1453,7 @@ class MiMoV2DecoderLayer(nn.Module):
                     self.self_attn.o_proj_full is not None
                     and communicator.layer_scatter_modes.mlp_mode
                     == ScatterMode.SCATTERED
-                    and (
-                        envs.SGLANG_MIMO_TP_SP_FULL_OPROJ.get()
-                        or (
-                            self.self_attn.attn.sliding_window_size is not None
-                            and self.self_attn.attn.sliding_window_size >= 0
-                        )
-                    )
                 )
-                if (
-                    self.self_attn.attn.sliding_window_size is None
-                    or self.self_attn.attn.sliding_window_size < 0
-                ):
-                    _log_mimo_prefill_full_oproj(sp_o_proj)
         elif (
             self.self_attn._ep_sp_swa
             and self.layer_communicator_sp_attn is not None

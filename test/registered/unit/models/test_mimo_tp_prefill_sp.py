@@ -440,6 +440,56 @@ def test_shared_swa_entry_point_keeps_tp_and_ep_execution_distinct(ep):
     assert calls == [(expected, args)]
 
 
+@pytest.mark.parametrize("supported", [False, True])
+def test_tp_moe_selection_preserves_layer_and_workspace_fallbacks(
+    monkeypatch, supported
+):
+    checks = []
+    package = types.ModuleType("sglang.srt.layers.moe")
+    package.pyhip_fp8_blockscale_moe = SimpleNamespace(
+        supports_layer=lambda *args: checks.append("layer") or supported,
+        fits=lambda sizes, experts, cap: checks.append("workspace")
+        or max(sizes) <= cap,
+    )
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    tree = ast.parse((SRC / "models/mimo_v2.py").read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MiMoV2MoE"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_use_pyhip_moe"
+    )
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    scope = dict(
+        get_tp_group=lambda: SimpleNamespace(world_size=8),
+        _mimo_sp_moe_max_rows=lambda: 4096,
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, method], type_ignores=[])
+            ),
+            "moe-selection",
+            "exec",
+        ),
+        scope,
+    )
+    layer = SimpleNamespace(
+        _pyhip_moe=None,
+        experts=SimpleNamespace(w13_weight=SimpleNamespace(shape=(256,))),
+    )
+    assert not scope["_use_pyhip_moe"](layer, [8192] * 8)
+    assert scope["_use_pyhip_moe"](layer, [4096] * 8) == supported
+    assert checks.count("layer") == 1
+    assert checks.count("workspace") == (2 if supported else 0)
+
+
 @pytest.mark.parametrize(
     "modes,expected",
     [

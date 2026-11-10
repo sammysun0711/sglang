@@ -150,7 +150,7 @@ class PrefillWarmupTest(CustomTestCase):
             lengths for event, lengths in self.server.events if event == "generate"
         ]
         self.assertEqual(sum(map(len, batches)), 32)
-        self.assertEqual(len(batches), 16)
+        self.assertEqual(len(batches), 15)
         self.assertGreater(len({length for batch in batches for length in batch}), 1)
         report = json.loads((self.logs / "prefill_warmup.json").read_text())
         self.assertEqual((report["status"], report["completed"]), ("complete", 32))
@@ -218,7 +218,7 @@ class PrefillWarmupTest(CustomTestCase):
         batches = [
             lengths for event, lengths in self.server.events if event == "generate"
         ]
-        self.assertEqual(batches, [[127, 127], [127]])
+        self.assertEqual(batches, [[127, 127, 127]])
 
     def test_authentication_matches_benchmark_for_both_routes(self):
         for values, header in (
@@ -252,7 +252,7 @@ class PrefillWarmupTest(CustomTestCase):
                         for event, lengths in self.server.events
                         if event == "generate"
                     ],
-                    [[63, 63], [63]],
+                    [[63, 63, 63]],
                 )
 
 

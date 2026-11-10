@@ -10,12 +10,13 @@ from pathlib import Path
 # Multi-tokenizer Uvicorn workers configure the HTTP logger, not the root.
 logger = logging.getLogger("sglang.srt.entrypoints.http_server.mimo_prefill")
 
-# Balanced pairs cover the measured MiMo FP8 GEMM tile-order/reduction modes.
+# The first four-request batch warms non-singleton embedding masks. The
+# remaining pairs cover the measured MiMo FP8 GEMM tile-order/reduction modes.
 # Asymmetric pairs cover short SWA shards while the other DP group keeps SP
 # active. The final pairs cross the 16K chunk boundary to exercise cached halos.
 # Coverage is specific to the measured DP2 workload, not arbitrary topologies.
-INPUT_LENGTH_PAIRS = (
-    (128, 128),
+INPUT_BATCHES = (
+    (128, 128, 128, 128),
     (257, 6656),
     (64, 6656),
     (6656, 6656),
@@ -26,7 +27,6 @@ INPUT_LENGTH_PAIRS = (
     (6145, 6145),
     (8191, 8191),
     (12288, 12288),
-    (14784, 14784),
     (15744, 15744),
     (15873, 15873),
     (16385, 20480),
@@ -65,6 +65,7 @@ def warmup_mimo_prefill_memory_kernels(args, model_config, pool, max_batch):
     if "gfx942" not in torch.cuda.get_device_properties(table.device).gcnArchName:
         return
     from sglang.srt.mem_cache.triton_ops.allocator import alloc_extend_kernel
+    from sglang.srt.mem_cache.triton_ops.common import _get_last_loc_safe_kernel
     from sglang.srt.speculative.triton_ops.cache_locs import assign_req_to_token_pool
 
     count = 0
@@ -100,6 +101,25 @@ def warmup_mimo_prefill_memory_kernels(args, model_config, pool, max_batch):
                     )
                     _ = compiled.run
                     count += 1
+        # Triton specializes scalar counts equal to one and divisible by 16.
+        # Cover those ABI families without invoking the lookup kernel.
+        for num_tokens_hint in (1, 2, 16):
+            if num_tokens_hint > max_batch:
+                continue
+            for length_dtype in (torch.int32, torch.int64):
+                compiled = _get_last_loc_safe_kernel.warmup(
+                    table,
+                    torch.int64,
+                    length_dtype,
+                    torch.int32,
+                    num_tokens_hint,
+                    table.stride(0),
+                    BLOCK_SIZE=256,
+                    PREFIX_DTYPE_IS_I64=length_dtype == torch.int64,
+                    grid=(1,),
+                )
+                _ = compiled.run
+                count += 1
     logger.info(
         "MiMo prefill memory warmup: initialized %d signatures through batch %d",
         count,
@@ -110,9 +130,9 @@ def warmup_mimo_prefill_memory_kernels(args, model_config, pool, max_batch):
 def representative_batches(requests, context):
     if requests < 0 or not isinstance(context, int) or context < 2:
         raise ValueError("requests must be non-negative and context must be >= 2")
-    for index in range((requests + 1) // 2):
-        count = min(2, requests - index * 2)
-        lengths = INPUT_LENGTH_PAIRS[index % len(INPUT_LENGTH_PAIRS)][:count]
+    completed = index = 0
+    while completed < requests:
+        lengths = INPUT_BATCHES[index % len(INPUT_BATCHES)][: requests - completed]
         yield {
             "input_ids": [[100] * min(length, context - 1) for length in lengths],
             "sampling_params": {
@@ -122,6 +142,8 @@ def representative_batches(requests, context):
                 "ignore_eos": True,
             },
         }
+        completed += len(lengths)
+        index += 1
 
 
 def validate_warmup_response(outputs, payload):
@@ -150,7 +172,8 @@ async def _run_representative_prefill(tokenizer_manager):
     )
     started = time.monotonic()
     logger.info("MiMo representative startup warmup: starting 32 requests")
-    for index, payload in enumerate(representative_batches(32, context)):
+    completed = 0
+    for payload in representative_batches(32, context):
         # Repeated token IDs must still exercise full prefill when radix caching
         # is enabled. No user requests are admitted during this startup phase.
         if not args.disable_radix_cache:
@@ -159,19 +182,22 @@ async def _run_representative_prefill(tokenizer_manager):
                 raise RuntimeError("Could not flush cache before MiMo warmup")
         req = GenerateReqInput(**payload)
         if args.disaggregation_mode == "prefill":
-            req.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * 2
+            req.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * len(payload["input_ids"])
             req.bootstrap_room = [
-                (i % args.dp_size) * (2**63 // args.dp_size) + index * args.tp_size + i
-                for i in range(2)
+                (i % args.dp_size) * (2**63 // args.dp_size)
+                + (completed + i) * args.tp_size
+                + (i % args.tp_size)
+                for i in range(len(payload["input_ids"]))
             ]
         outputs = None
         # Fully drain the generator: failures after a yield must fail startup.
         async for outputs in tokenizer_manager.generate_request(req, None):
             pass
         validate_warmup_response(outputs, payload)
+        completed += len(payload["input_ids"])
         logger.info(
             "MiMo representative startup warmup: %d/32 requests, input lengths %s",
-            (index + 1) * 2,
+            completed,
             [len(ids) for ids in payload["input_ids"]],
         )
     result = await tokenizer_manager.flush_cache()

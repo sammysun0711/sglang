@@ -77,13 +77,13 @@ class StartupWarmupTest(CustomTestCase, unittest.IsolatedAsyncioTestCase):
     async def test_exact_schedule_and_cache_flush(self):
         manager = FakeManager(radix=True, mode="prefill")
         await warmup._run_representative_prefill(manager)
-        self.assertEqual(len(manager.requests), 16)
+        self.assertEqual(len(manager.requests), 15)
         self.assertEqual(
             [tuple(len(ids) for ids in req.input_ids) for req in manager.requests],
-            list(warmup.INPUT_LENGTH_PAIRS),
+            list(warmup.INPUT_BATCHES),
         )
         self.assertEqual(sum(len(req.input_ids) for req in manager.requests), 32)
-        self.assertEqual(manager.flush_cache.await_count, 17)
+        self.assertEqual(manager.flush_cache.await_count, 16)
         rooms = [room for req in manager.requests for room in req.bootstrap_room]
         self.assertEqual(len(set(rooms)), 32)
 
@@ -175,11 +175,18 @@ class MemoryWarmupTest(CustomTestCase):
         config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
         )
-        table = SimpleNamespace(device=SimpleNamespace(type="cuda"), shape=(9, 32768))
+        table = SimpleNamespace(
+            device=SimpleNamespace(type="cuda"),
+            shape=(9, 32768),
+            stride=lambda dim: 32768,
+        )
         pool = SimpleNamespace(req_to_token=table)
         modules = {
             "sglang.srt.configs.model_config": SimpleNamespace(
                 MIMO_V2_MODEL_ARCHS=("MiMoV2ForCausalLM",)
+            ),
+            "sglang.srt.mem_cache.triton_ops.common": SimpleNamespace(
+                _get_last_loc_safe_kernel=Kernel("last_loc")
             ),
             "sglang.srt.mem_cache.triton_ops.allocator": SimpleNamespace(
                 alloc_extend_kernel=Kernel("alloc")
@@ -213,7 +220,16 @@ class MemoryWarmupTest(CustomTestCase):
             },
         )
         self.assertTrue(all(a[1] is table and a[-2] == 32768 for a in assignment))
-        self.assertTrue(all(options == {"grid": (1,)} for _, _, options in calls))
+        self.assertTrue(all(options["grid"] == (1,) for _, _, options in calls))
+        lookups = [(a, opts) for name, a, opts in calls if name == "last_loc"]
+        self.assertEqual({a[4] for a, _ in lookups}, {1, 2})
+        self.assertTrue(
+            all(
+                opts["BLOCK_SIZE"] == 256
+                and opts["PREFIX_DTYPE_IS_I64"] == (a[2] == torch.int64)
+                for a, opts in lookups
+            )
+        )
         self.assertEqual(len(initialized), len(calls))
         self.assertIs(pool.req_to_token, table)
 

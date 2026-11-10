@@ -45,11 +45,7 @@ _sum_rs_kernel (sequence-parallel layout, 8 ranks): the top-k sum of every token
 summed over the ranks and scattered to the token's owner rank in one kernel (HIP IPC symmetric buffers).
 """
 
-import contextlib
 import ctypes
-import functools
-import hashlib
-import os
 import logging
 from typing import List, Optional
 
@@ -85,49 +81,13 @@ from sglang.srt.layers.quantization.pyhip_fp8_blockscale_gemm import (
     _stage_end,
     _uniform,
     _wait,
+    flydsl_disk_cache,
 )
 
 logger = logging.getLogger(__name__)
 
 # These two slots were renamed in the current shared GEMM helper module.
 P1_SLOT, P2_SLOT = 2 * SLOT, 3 * SLOT
-
-
-@functools.lru_cache(maxsize=None)
-def _source_digest(files):
-    digest = hashlib.sha256()
-    for path in files:
-        with open(path, "rb") as stream:
-            digest.update(stream.read())
-    return digest.hexdigest()[:16]
-
-
-@contextlib.contextmanager
-def flydsl_disk_cache(*sources):
-    from sglang.srt.layers.quantization import pyhip_fp8_blockscale_gemm as helpers
-
-    names = ("FLYDSL_RUNTIME_ENABLE_CACHE", "FLYDSL_RUNTIME_CACHE_DIR")
-    saved = {name: os.environ.get(name) for name in names}
-    root = saved[names[1]] or os.path.join(os.path.expanduser("~"), ".flydsl", "cache")
-    path = os.path.join(root, "sglang-" + _source_digest((__file__, helpers.__file__) + sources))
-    try:
-        os.makedirs(path, exist_ok=True)
-        writable = os.access(path, os.W_OK)
-    except OSError:
-        writable = False
-    if not writable:
-        yield
-        return
-    os.environ.update({names[0]: "1", names[1]: path})
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
 
 
 FP8_MAX = 240.0

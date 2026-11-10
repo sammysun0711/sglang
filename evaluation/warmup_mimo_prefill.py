@@ -8,27 +8,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-# Paired requests exercise both workers in the usual DP2 deployment. Varied
-# lengths cover the FP8 GEMM tile-order and split-reduction variants missed by
-# a uniform warmup. This is coverage for the measured MiMo workload, not a
-# guarantee against compilation for every future serving configuration.
-INPUT_LENGTHS = (
-    128,
-    257,
-    513,
-    6656,
-    2049,
-    3073,
-    4095,
-    10240,
-    6145,
-    8191,
-    12288,
-    14784,
-    15744,
-    15873,
-    16383,
-    16384,
+from sglang.srt.entrypoints.mimo_prefill_warmup import (
+    representative_batches,
+    validate_warmup_response,
 )
 
 
@@ -81,32 +63,12 @@ def run(args):
                 "prefill_delayer_max_delay_passes",
             )
         }
-        for index in range((args.requests + 1) // 2):
-            count = min(2, args.requests - report["completed"])
-            length = min(INPUT_LENGTHS[index % len(INPUT_LENGTHS)], context - 1)
-            payload = {
-                "input_ids": [[100] * length for _ in range(count)],
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "max_new_tokens": 1,
-                    "ignore_eos": True,
-                },
-            }
+        for payload in representative_batches(args.requests, context):
+            count = len(payload["input_ids"])
+            length = len(payload["input_ids"][0])
             started = time.time()
             outputs = request(base_url, "/generate", args.timeout, payload)
-            if not isinstance(outputs, list) or len(outputs) != count:
-                raise RuntimeError("Warmup response does not match the requested batch")
-            for output in outputs:
-                meta = output.get("meta_info", {})
-                if (
-                    meta.get("prompt_tokens") != length
-                    or meta.get("completion_tokens") != 1
-                    or meta.get("finish_reason", {}).get("type") == "abort"
-                ):
-                    raise RuntimeError(
-                        "Warmup request did not complete with the expected token counts"
-                    )
+            validate_warmup_response(outputs, payload)
             report["completed"] += count
             report["batches"].append(
                 {

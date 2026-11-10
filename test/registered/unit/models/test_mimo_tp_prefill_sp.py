@@ -11,6 +11,7 @@ import enum
 import itertools
 import sys
 import types
+from functools import cached_property
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +34,7 @@ def load(relative, names, **bindings):
     module.__dict__.update(
         torch=torch,
         dataclass=dataclasses.dataclass,
+        cached_property=cached_property,
         itertools=itertools,
         IntEnum=enum.IntEnum,
         auto=enum.auto,
@@ -324,7 +326,7 @@ def test_swa_halos_recover_zero_reported_chunk_prefix(
     )
     monkeypatch.setitem(sys.modules, context.__name__, context)
     module = load(
-        "models/mimo_v2.py",
+        "layers/attention/mimo_sp.py",
         ["_MimoSpSwaMetadata", "_mimo_sp_swa_metadata"],
         mimo_effective_prefix_lengths=helper.mimo_effective_prefix_lengths,
         _SP_SWA_PAGE=64,
@@ -353,8 +355,14 @@ def test_swa_halos_recover_zero_reported_chunk_prefix(
         torch.testing.assert_close(
             meta.cache_loc, torch.tensor(cached) + 10000000, rtol=0, atol=0
         )
+        torch.testing.assert_close(
+            meta.cache_page * 64 + meta.cache_offset, meta.cache_loc, rtol=0, atol=0
+        )
+        assert meta.cache_page is meta.cache_page
+        assert meta.cache_offset is meta.cache_offset
     else:
         assert meta.cache_loc is None
+        assert meta.cache_page is None and meta.cache_offset is None
     tail = min(window, rows)
     tails = [
         v for r in range(4) for v in queries[r * rows + rows - tail : (r + 1) * rows]
@@ -406,6 +414,30 @@ def test_skip_sync_clears_old_prefill_eligibility():
     batch = SimpleNamespace(all_extend_in_batch=True)
     update(batch, info, require_mlp_tp_gather=True, skip_all_gather=True)
     assert not batch.all_extend_in_batch
+
+
+@pytest.mark.parametrize("ep", [False, True])
+def test_shared_swa_entry_point_keeps_tp_and_ep_execution_distinct(ep):
+    calls = []
+
+    def record(path):
+        def run(*args):
+            calls.append((path, args))
+            return path
+
+        return run
+
+    run = load(
+        "layers/attention/mimo_sp.py",
+        ["run_mimo_sp_swa"],
+        _run_mimo_tp_sp_swa=record("tp"),
+        _run_mimo_ep_sp_swa=record("ep"),
+    ).run_mimo_sp_swa
+    attention = SimpleNamespace(_ep_sp_swa=ep)
+    args = (attention, object(), object(), object())
+    expected = "ep" if ep else "tp"
+    assert run(*args) == expected
+    assert calls == [(expected, args)]
 
 
 @pytest.mark.parametrize(

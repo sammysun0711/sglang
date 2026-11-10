@@ -1,6 +1,5 @@
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0.
-# Adapted from luocheng25/sglang PR #40, e3ef41b18796dfb3659992e32b1269d0bf3db05e.
 """MiMo token-sharded prefill attention with the existing head-sharded KV cache.
 
 Attention collectives stay within each DP group's attention TP group. Expert
@@ -30,6 +29,32 @@ def _log_path(name):
 
 
 _SP_SWA_PAGE = 64
+
+
+def _pack_mimo_sp_swa_pages(
+    keys: torch.Tensor, kv_heads: int, dq: int, dv: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pack live KV rows into bucketed SHUFFLE-5D page buffers."""
+    pages = keys.shape[0] // _SP_SWA_PAGE
+    # The allocated page count is part of AITER's SWA compilation key. A minimum
+    # capacity of 128 pages with power-of-two growth lets request tails reuse
+    # compiled kernels. Runtime page IDs and lengths only address the live prefix.
+    capacity = max(128, 1 << (pages - 1).bit_length()) if pages else 0
+    k_pages = keys.new_empty((capacity, kv_heads, dq // 8, _SP_SWA_PAGE, 8))
+    v_pages = keys.new_empty((capacity, kv_heads, _SP_SWA_PAGE // 8, dv, 8))
+    # Convert layouts directly into the live prefix so capacity padding does not
+    # add another copy through an intermediate contiguous page buffer.
+    k_pages[:pages].copy_(
+        keys[..., :dq]
+        .reshape(pages, _SP_SWA_PAGE, kv_heads, dq // 8, 8)
+        .permute(0, 2, 3, 1, 4)
+    )
+    v_pages[:pages].copy_(
+        keys[..., dq:]
+        .reshape(pages, _SP_SWA_PAGE // 8, 8, kv_heads, dv)
+        .permute(0, 3, 1, 4, 2)
+    )
+    return k_pages, v_pages
 
 
 def _mimo_attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
@@ -239,19 +264,7 @@ def run_mimo_sp_swa(
     sources.append(own)
     sources.append(own.new_zeros((1, kv_heads, dq + dv)))
     keys = torch.cat(sources)[meta.kv_src]
-    pages = keys.shape[0] // _SP_SWA_PAGE
-    k_pages = (
-        keys[..., :dq]
-        .reshape(pages, _SP_SWA_PAGE, kv_heads, dq // 8, 8)
-        .permute(0, 2, 3, 1, 4)
-        .contiguous()
-    )
-    v_pages = (
-        keys[..., dq:]
-        .reshape(pages, _SP_SWA_PAGE // 8, 8, kv_heads, dv)
-        .permute(0, 3, 1, 4, 2)
-        .contiguous()
-    )
+    k_pages, v_pages = _pack_mimo_sp_swa_pages(keys, kv_heads, dq, dv)
 
     out = (q.new_zeros if meta.q_rows < rows else q.new_empty)((rows, heads, dv))
     if meta.q_rows:

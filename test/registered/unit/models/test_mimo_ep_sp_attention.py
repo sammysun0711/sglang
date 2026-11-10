@@ -14,6 +14,39 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 
+@pytest.mark.parametrize(
+    "pages,capacity",
+    [
+        (0, 0),
+        (1, 128),
+        (63, 128),
+        (64, 128),
+        (65, 128),
+        (127, 128),
+        (128, 128),
+        (129, 256),
+    ],
+)
+def test_swa_sp_page_buckets_preserve_logical_kv(pages, capacity):
+    kv_heads, dq, dv = 2, 192, 128
+    # Unique integer values expose page/head/channel permutation mistakes.
+    keys = torch.arange(pages * 64 * kv_heads * (dq + dv)).reshape(
+        pages * 64, kv_heads, dq + dv
+    )
+    k_pages, v_pages = mimo_sp._pack_mimo_sp_swa_pages(keys, kv_heads, dq, dv)
+    assert k_pages.shape == (capacity, kv_heads, dq // 8, 64, 8)
+    assert v_pages.shape == (capacity, kv_heads, 8, dv, 8)
+    assert k_pages.is_contiguous() and v_pages.is_contiguous()
+    logical_k = (
+        k_pages[:pages].permute(0, 3, 1, 2, 4).reshape(pages * 64, kv_heads, dq)
+    )
+    logical_v = (
+        v_pages[:pages].permute(0, 2, 4, 1, 3).reshape(pages * 64, kv_heads, dv)
+    )
+    assert torch.equal(logical_k, keys[..., :dq])
+    assert torch.equal(logical_v, keys[..., dq:])
+
+
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize(
     "lengths,prefixes",

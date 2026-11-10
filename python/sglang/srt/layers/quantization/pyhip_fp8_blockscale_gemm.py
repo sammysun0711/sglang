@@ -54,7 +54,11 @@ most half the CUs is split K-wise into S >= 4 pieces that fill the round; each p
 FP32 partial and a second kernel sums the S partials in piece order (deterministic) to BF16.
 """
 
+import contextlib
+import functools
+import hashlib
 import logging
+import os
 import time
 
 import flydsl.compiler as flyc
@@ -952,11 +956,58 @@ def _launch_reduce(
     )
 
 
+# Per-device callables bypass JIT argument processing after first initialization.
 _compiled = {}
 _cus = {}
 _partials = {}
 # Bytes of one split piece's FP32 partial (8 waves x 64 x 128 values).
 PIECE_BYTES = 262144
+
+
+@functools.lru_cache(maxsize=None)
+def _source_digest(files):
+    """Include source constants in the persistent kernel-cache namespace."""
+    digest = hashlib.sha256()
+    for path in files:
+        with open(path, "rb") as f:
+            digest.update(f.read())
+    return digest.hexdigest()[:16]
+
+
+@contextlib.contextmanager
+def flydsl_disk_cache(*sources):
+    """Reuse compiled GEMM variants across workers and server restarts.
+
+    Some attention paths disable FlyDSL's disk cache process-wide. Enable it only
+    for this compilation scope and restore the caller's settings afterward. The
+    source namespace invalidates artifacts when kernel code or module constants
+    change, including constants not covered by FlyDSL's own cache key.
+
+    A missing specialization still compiles normally; this does not prewarm
+    unseen XCD or split-K variants.
+    """
+    names = ("FLYDSL_RUNTIME_ENABLE_CACHE", "FLYDSL_RUNTIME_CACHE_DIR")
+    saved = {name: os.environ.get(name) for name in names}
+    root = saved[names[1]] or os.path.join(os.path.expanduser("~"), ".flydsl", "cache")
+    path = os.path.join(root, "sglang-" + _source_digest((__file__,) + sources))
+    try:
+        os.makedirs(path, exist_ok=True)
+        writable = os.access(path, os.W_OK)
+    except OSError:
+        writable = False
+    if not writable:
+        # Preserve the caller's policy if the source directory is not writable.
+        yield
+        return
+    os.environ.update({names[0]: "1", names[1]: path})
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _plan(tiles, kb, cus):
@@ -1047,12 +1098,16 @@ def gemm_a8w8_blockscale_942(x, w, x_scale_t, w_scale, out=None, w_preshuffled=N
         bool(w_preshuffled),
         stream,
     )
+    # M is runtime data, but its scheduling plan can select a new XCD variant.
+    # Dimensions N/K, input row stride, and weight layout remain compile-time.
     key = (device, n, k, lda, xcd, bool(w_preshuffled))
     compiled = _compiled.get(key)
     if compiled is None:
-        # flyc.compile also launches this first call.
+        # Initialization loads a disk artifact or compiles on a miss, then
+        # launches the first call. The log measures host initialization time.
         started = time.perf_counter()
-        _compiled[key] = flyc.compile(_launch, *args)
+        with flydsl_disk_cache():
+            _compiled[key] = flyc.compile(_launch, *args)
         logging.getLogger(__name__).info(
             "Initialized PyHIP FP8 GEMM M=%d N=%d K=%d lda=%d xcd=%s in %.3f s",
             m,
@@ -1066,11 +1121,13 @@ def gemm_a8w8_blockscale_942(x, w, x_scale_t, w_scale, out=None, w_preshuffled=N
         compiled(*args)
     if tail:
         args = (partials, out.view(-1), m, tiles_m, full, tail * 64, s, n, stream)
+        # The reduction specializes on S; different M values can share N/S.
         key = ("reduce", device, n, s)
         compiled = _compiled.get(key)
         if compiled is None:
             started = time.perf_counter()
-            _compiled[key] = flyc.compile(_launch_reduce, *args)
+            with flydsl_disk_cache():
+                _compiled[key] = flyc.compile(_launch_reduce, *args)
             logging.getLogger(__name__).info(
                 "Initialized PyHIP FP8 split reduction N=%d split=%d in %.3f s",
                 n,

@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Prefill-only client benchmark.
 # Default customer_pressure follows the executable arrays in
-# benchmark_sglang_prefill.sh: OSL=1, text prompts, 4 warmups before each case.
+# benchmark_sglang_prefill.sh: OSL=1, text prompts. Warmup uses 16 concurrent
+# requests for 4K to exercise larger prefill batches, and 4 for other lengths.
 # Its 4K/8K rows differ from that script's header comments.
 # Set DATASET_PATH to the customer's ShareGPT JSON; when unset, bench_serving
 # uses its standard cached/downloaded ShareGPT dataset. Model/host/port are local.
@@ -246,7 +247,7 @@ done
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 echo "Dataset: ${dataset_path:-standard ShareGPT cache/download}; tokenize-prompt=${tokenize_prompt}"
 if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
-  echo "Client matrix: benchmark_sglang_prefill.sh active arrays; ${warmup_requests} warmups before each case."
+  echo "Client matrix: benchmark_sglang_prefill.sh active arrays; warmups: 4K=${WARMUP_REQUESTS_OVERRIDE:-16}, others=${warmup_requests}."
   echo "Offered request rate is unlimited; each case uses its global concurrency cap."
   echo "Server topology, chunk size, DFlash, quantization and radix-cache mode are configured separately."
 fi
@@ -276,6 +277,11 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
     current_warmup="${warmup_requests}"
+    if [[ "${benchmark_preset}" == "customer_pressure" &&
+          "${input_tokens}" == "4096" &&
+          -z "${WARMUP_REQUESTS_OVERRIDE:-}" ]]; then
+      current_warmup=16
+    fi
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Output Token = ${output_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${current_warmup}"

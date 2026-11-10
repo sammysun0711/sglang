@@ -14,7 +14,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils import is_cuda, is_gfx942_supported, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -713,6 +713,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
+    reference_batch_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
@@ -807,6 +808,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             torch.repeat_interleave(
                 sampling_info.top_ps, draft_token_num, dim=0
             ),
+            reference_rows=(reference_batch_size * draft_token_num
+                            if reference_batch_size is not None else None),
         )
         sparse_topk_applied = True
     elif use_sparse_topk and need_top_k:
@@ -858,6 +861,25 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
     target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
+    if (
+        _DFLASH_USE_HIP_TORCH_VERIFY
+        and envs.SGLANG_DFLASH_FUSED_CHAIN_VERIFY.get()
+        and draft_token_num == 8
+        and target_probs.is_cuda
+        and target_probs.dtype == torch.float32
+        and is_gfx942_supported()
+    ):
+        from sglang.srt.speculative.dflash_chain_fused import verify_chain
+
+        return verify_chain(
+            target_probs,
+            candidates.to(torch.int64).contiguous(),
+            uniform_samples.contiguous(),
+            uniform_samples_for_final_sampling.contiguous(),
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            reference_batch_size=reference_batch_size,
+        )
     draft_probs = torch.zeros_like(target_probs)
 
     (
@@ -889,6 +911,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
             threshold_single=threshold_single,
             threshold_acc=threshold_acc,
+            reference_batch_size=reference_batch_size,
         )
     else:
         tree_speculative_sampling_target_only(

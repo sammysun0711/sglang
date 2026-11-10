@@ -12,11 +12,17 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
+import itertools
 import logging
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -63,9 +69,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
+    should_use_dpa_sp_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -89,12 +96,14 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_v2_utils import (
+    mimo_effective_prefix_lengths,
     mimo_flydsl_target_verify_enabled,
     supports_native_mimo_vectorized_v_cache,
 )
@@ -175,6 +184,477 @@ def _mimo_ep_sp_active(forward_batch: ForwardBatch) -> bool:
         return False
     sizes = get_dp_global_num_tokens()
     return sizes is not None and sum(sizes) >= 2048
+
+
+def _mimo_sp_moe_sizes() -> List[int]:
+    """Token rows per TP rank under SGLANG_ENABLE_DPA_SP: TP rank d * attn_tp + r holds the
+    r-th of attn_tp equal slices of DP group d's (attn_tp-aligned) tokens."""
+    attn_tp = get_attention_tp_size()
+    return [n // attn_tp for n in get_dp_global_num_tokens() for _ in range(attn_tp)]
+
+
+_MIMO_SP_MIN_TOKENS = 2048
+
+
+@functools.lru_cache(maxsize=1)
+def _log_mimo_tp_sp():
+    logger.info("Using MiMo TP prefill sequence parallel (TP8/DP2/EP1, static FP8)")
+
+
+@functools.lru_cache(maxsize=1)
+def _log_mimo_graph_verify_sp():
+    storage = "static FP8" if envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get() else "native MXFP4"
+    logger.info("Using MiMo DFlash8 target graph sequence parallel (TP8/DP2/EP1, %s)", storage)
+
+
+@functools.lru_cache(maxsize=1)
+def _log_mimo_fused_sp_packet():
+    logger.info("Using fused native SP quantization and packet kernels")
+
+
+def _mimo_graph_verify_sp_active(forward_batch: ForwardBatch) -> bool:
+    """Select SP only while warming/capturing a uniform DFlash8 target graph.
+
+    Decode graph construction gives every rank the same TARGET_VERIFY mode and
+    padded token counts, including graphs later replayed with an idle replica.
+    Eager/mixed batches keep the original path; no runtime-local decision may
+    change the collective sequence recorded in a graph.
+    """
+    if (
+        not envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+        or not get_is_capture_mode()
+        or forward_batch.forward_mode != ForwardMode.TARGET_VERIFY
+        or forward_batch.global_forward_mode != ForwardMode.TARGET_VERIFY
+        or forward_batch.can_run_tbo
+        or forward_batch.all_extend_in_batch
+        or forward_batch.spec_algorithm is None
+        or not forward_batch.spec_algorithm.is_dflash()
+        or getattr(forward_batch.spec_info, "draft_token_num", None) != 8
+        or forward_batch.dp_padding_mode is None
+        or not forward_batch.dp_padding_mode.is_max_len()
+    ):
+        return False
+    sizes = get_dp_global_num_tokens()
+    return (
+        sizes is not None
+        and len(sizes) == 2
+        and sizes[0] == sizes[1] == forward_batch.batch_size * 8
+        and sum(sizes) >= _MIMO_SP_MIN_TOKENS
+    )
+
+
+def _mimo_sp_moe_active(forward_batch: Optional[ForwardBatch]) -> bool:
+    """Use the SGLANG_ENABLE_DPA_SP layout for this forward: the same decision on every rank
+    and layer (global token count). Graph verification has a separate opt-in gate.
+    """
+    if forward_batch is None:
+        return False
+    if _mimo_graph_verify_sp_active(forward_batch):
+        _log_mimo_graph_verify_sp()
+        return True
+    # The native expert path is qualified separately for uniform graphs only.
+    if not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get():
+        return False
+    if (
+        not forward_batch.all_extend_in_batch
+        or forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.IDLE)
+        or forward_batch.can_run_tbo
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    sizes = get_dp_global_num_tokens()
+    active = (
+        sizes is not None
+        and len(sizes) == 2
+        and all(n >= 0 and n % 4 == 0 for n in sizes)
+        and sum(sizes) >= _MIMO_SP_MIN_TOKENS
+    )
+    if active:
+        _log_mimo_tp_sp()
+    return active
+
+
+def _mimo_sp_moe_quant(hidden_states: torch.Tensor):
+    """FP8 per-1x128 quantization with AITER's column-major scale storage: the same
+    kernel aiter.fused_moe applies to a BF16 input, so gathering it is lossless."""
+    from aiter.ops.quant import per_group_quant_hip
+
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+    return per_group_quant_hip(
+        hidden_states, quant_dtype=fp8_dtype, group_size=128, transpose_scale=True
+    )
+
+
+def _mimo_sp_moe_gather_scales(scale: torch.Tensor, sizes: List[int]) -> torch.Tensor:
+    """Per-rank column-major [rows, groups] scale blocks -> one column-major [N, groups]."""
+    groups = scale.shape[1]
+    total = sum(sizes)
+    if total == 0:
+        return scale
+    if all(size == sizes[0] for size in sizes):
+        merged = (
+            scale.view(len(sizes), groups, sizes[0])
+            .transpose(0, 1)
+            .reshape(groups, total)
+        )
+    else:
+        blocks, offset = [], 0
+        for size in sizes:
+            blocks.append(scale[offset : offset + size].reshape(groups, size))
+            offset += size
+        merged = torch.cat(blocks, dim=1)
+    merged = merged.view(total, groups)
+    merged._aiter_moe_scale_is_transposed = True
+    return merged
+
+
+def _mimo_sp_attn_enabled() -> bool:
+    """Shared, construction-time eligibility for the TP MoE and attention layouts."""
+    if not should_use_dpa_sp_moe():
+        return False
+    args = get_global_server_args()
+    return (
+        is_gfx942_supported()
+        and (
+            envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+            or envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+        )
+        and envs.SGLANG_FLYPA_MIMO_PREFILL.get()
+        and mimo_flydsl_target_verify_enabled()
+        and (get_moe_runner_backend().is_aiter() or get_moe_runner_backend().is_auto())
+        and args.attention_backend == "aiter"
+        and args.prefill_attention_backend in (None, "aiter")
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        and args.page_size == 64
+        and args.kv_cache_dtype == "bf16"
+        and args.attn_cp_size == 1
+        and args.pp_size == 1
+        and args.moe_dense_tp_size == 1
+        and not args.enable_two_batch_overlap
+    )
+
+
+def _mimo_tp_sp_flash_config(config) -> bool:
+    """Initial TP SP model geometry; other MiMo variants need separate qualification."""
+    expected = {
+        "hidden_size": 4096,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 192,
+        "v_head_dim": 128,
+        "swa_num_attention_heads": 64,
+        "swa_num_key_value_heads": 8,
+        "swa_head_dim": 192,
+        "swa_v_head_dim": 128,
+        "n_routed_experts": 256,
+        "moe_intermediate_size": 2048,
+        "num_experts_per_tok": 8,
+    }
+    return all(getattr(config, key, None) == value for key, value in expected.items())
+
+
+@functools.lru_cache(maxsize=None)
+def _mimo_init_hipblaslt(device):
+    import aiter
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Initialize MiMo HIPBLASLt before graph capture")
+    with torch.cuda.device(device):
+        aiter.hipb_create_extension()
+
+
+def _mimo_full_o_proj(states, weight, quant_method, packed=False):
+    if not packed:
+        return quant_method.apply(SimpleNamespace(weight=weight), states)
+    import aiter
+
+    assert states.dtype == weight.dtype == torch.bfloat16
+    if states.shape[0] == 0:
+        return states.new_empty((0, weight.shape[0]))
+    _mimo_init_hipblaslt(states.device)
+    return aiter.hipb_mm(states, weight.t(), solution_index=-1, bias=None,
+                        out_dtype=torch.bfloat16, bpreshuffle=True)
+
+
+def _mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method, packed=False):
+    """o_proj for this rank's token slice: all-to-all over attention TP
+    gives every rank its token slice of all head groups, then one GEMM with the full weight.
+    """
+    attn_tp = get_attention_tp_size()
+    rows = attn_output.shape[0] // attn_tp
+    assert rows * attn_tp == attn_output.shape[0]
+    source = attn_output.contiguous()
+    received = torch.empty_like(source)
+    group = get_attention_tp_group()
+    if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+        # ROCm 7.2's ProcessGroupNCCL watchdog may query events from a
+        # capturing stream. Use the same direct RCCL interface as the MoE
+        # gather instead of creating ProcessGroup work inside the graph.
+        comm = group.pynccl_comm
+        if comm is None or not comm.available:
+            raise RuntimeError("MiMo graph SP requires the direct RCCL communicator")
+        sends = source.tensor_split(attn_tp)
+        receives = received.tensor_split(attn_tp)
+        with comm.change_state(enable=True):
+            comm.group_start()
+            try:
+                for peer in range(attn_tp):
+                    comm.send(sends[peer], peer)
+                    comm.recv(receives[peer], peer)
+            finally:
+                comm.group_end()
+    else:
+        group.all_to_all_single(received, source)
+    x = received.view(attn_tp, rows, -1).transpose(0, 1).reshape(rows, -1)
+    return _mimo_full_o_proj(x, weight, quant_method, packed)
+
+
+_SP_SWA_PAGE = 64
+
+
+def _mimo_attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
+    """All-gather along dim 0 over attention TP (1-byte dtypes as bytes: no FP8 collectives)."""
+    tensor = tensor.contiguous()
+    data = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
+    out = data.new_empty((get_attention_tp_size() * data.shape[0], *data.shape[1:]))
+    get_attention_tp_group().all_gather_into_tensor(out, data)
+    return out.view(tensor.dtype)
+
+
+@dataclass
+class _MimoSpSwaMetadata:
+    """Per-forward layout of one rank's sliding-window attention under SGLANG_ENABLE_DPA_SP.
+
+    Keys of every request segment in this rank's token slice are packed into page-64
+    SHUFFLE-5D pages: cached keys left of the chunk, keys from earlier slices, then the
+    slice's own keys. kv_src indexes rows of [cached, tails, own, zero] (not materialized).
+    """
+
+    key: Tuple[int, int]
+    q_rows: int
+    tail_rows: int
+    cache_rows: int
+    cache_loc: Optional[torch.Tensor]
+    kv_src: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    kv_indptr: torch.Tensor
+    page_ids: torch.Tensor
+    last_page_lens: torch.Tensor
+    max_q: int
+    max_kv: int
+
+
+def _mimo_sp_swa_metadata(
+    forward_batch: ForwardBatch, window: int, rows: int
+) -> _MimoSpSwaMetadata:
+    key = (window, rows)
+    meta = getattr(forward_batch, "_mimo_sp_swa_metadata", None)
+    if meta is not None and meta.key == key:
+        return meta
+    attn_tp, rank = get_attention_tp_size(), get_attention_tp_rank()
+    lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+    prefixes = mimo_effective_prefix_lengths(forward_batch)
+    if prefixes is None:
+        raise ValueError("MiMo TP SWA SP needs effective prefix lengths")
+    tail = min(window, rows)
+    cache_counts = [min(p, window) if n > 0 else 0 for p, n in zip(prefixes, lens)]
+    cache_ends = list(itertools.accumulate(cache_counts))
+    cache_rows = cache_ends[-1] if cache_ends else 0
+    tail_base = cache_rows
+    own_base = tail_base + attn_tp * tail
+    zero_row = own_base + rows
+    s0, s1 = rank * rows, (rank + 1) * rows
+    kv_src, cu_q, kv_indptr, last_page = [], [0], [0], []
+    max_q = max_kv = 0
+    start = 0
+    for i, (length, prefix) in enumerate(zip(lens, prefixes)):
+        a, b = start, start + length
+        start = b
+        qa, qb = max(a, s0), min(b, s1)
+        if qa >= qb:
+            continue
+        from_batch = min(qa - a, window)
+        from_cache = min(prefix, window - from_batch)
+        parts = []
+        if from_cache:
+            parts.append(torch.arange(cache_ends[i] - from_cache, cache_ends[i]))
+        if from_batch:
+            t = torch.arange(qa - from_batch, qa)
+            sl = t // rows
+            parts.append(tail_base + sl * tail + (t - sl * rows) - (rows - tail))
+        parts.append(torch.arange(own_base + qa - s0, own_base + qb - s0))
+        idx = torch.cat(parts)
+        keys = idx.numel()
+        pages = -(-keys // _SP_SWA_PAGE)
+        pad = pages * _SP_SWA_PAGE - keys
+        if pad:
+            idx = torch.cat([idx, torch.full((pad,), zero_row, dtype=idx.dtype)])
+        kv_src.append(idx)
+        cu_q.append(cu_q[-1] + qb - qa)
+        kv_indptr.append(kv_indptr[-1] + pages)
+        last_page.append(keys - _SP_SWA_PAGE * (pages - 1))
+        max_q, max_kv = max(max_q, qb - qa), max(max_kv, keys)
+
+    device = forward_batch.positions.device
+    cache_loc = None
+    if cache_rows:
+        from sglang.srt.model_executor.forward_context import (
+            get_req_to_token_pool,
+            get_token_to_kv_pool,
+        )
+
+        req_rows = torch.cat(
+            [torch.full((c,), i) for i, c in enumerate(cache_counts) if c]
+        ).to(device, non_blocking=True)
+        positions = torch.cat(
+            [torch.arange(p - c, p) for p, c in zip(prefixes, cache_counts) if c]
+        ).to(device, non_blocking=True)
+        full_loc = get_req_to_token_pool().req_to_token[
+            forward_batch.req_pool_indices[req_rows].long(), positions
+        ]
+        cache_loc = (
+            get_token_to_kv_pool()
+            .translate_loc_from_full_to_swa(full_loc.long())
+            .long()
+        )
+
+    def to_device(values, dtype):
+        return torch.tensor(values, dtype=dtype).to(device, non_blocking=True)
+
+    meta = _MimoSpSwaMetadata(
+        key=key,
+        q_rows=cu_q[-1],
+        tail_rows=tail,
+        cache_rows=cache_rows,
+        cache_loc=cache_loc,
+        kv_src=(torch.cat(kv_src) if kv_src else torch.empty(0, dtype=torch.int64)).to(
+            device, non_blocking=True
+        ),
+        cu_seqlens_q=to_device(cu_q, torch.int32),
+        kv_indptr=to_device(kv_indptr, torch.int32),
+        page_ids=torch.arange(kv_indptr[-1], dtype=torch.int32, device=device),
+        last_page_lens=to_device(last_page, torch.int32),
+        max_q=max_q,
+        max_kv=max_kv,
+    )
+    forward_batch._mimo_sp_swa_metadata = meta
+    return meta
+
+
+@triton.jit
+def _mimo_sp_swa_send_kernel(
+    k_ptr,
+    v_ptr,
+    send_ptr,
+    tail_ptr,
+    k_stride,
+    v_stride,
+    v_scale,
+    rows,
+    tail_start,
+    HEADS: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    DQ: tl.constexpr,
+    DV: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    HAS_V_SCALE: tl.constexpr,
+):
+    """send[r, t] = [K | V] of rank r's KV heads for token t (V scaled); tokens from
+    tail_start on also go to tail[t - tail_start] = [K | V] of all KV heads."""
+    rank = tl.program_id(1)
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)[:, None]
+    ck = tl.arange(0, BLOCK_K)[None, :]
+    cv = tl.arange(0, BLOCK_V)[None, :]
+    k_mask = (t < rows) & (ck < LOCAL_HEADS * DQ)
+    v_mask = (t < rows) & (cv < LOCAL_HEADS * DV)
+    k = tl.load(k_ptr + t * k_stride + rank * LOCAL_HEADS * DQ + ck, mask=k_mask)
+    v = tl.load(v_ptr + t * v_stride + rank * LOCAL_HEADS * DV + cv, mask=v_mask)
+    if HAS_V_SCALE:
+        v = (v.to(tl.float32) * v_scale).to(v.dtype)
+    send = send_ptr + (rank * rows + t) * (LOCAL_HEADS * (DQ + DV))
+    tl.store(send + ck, k, mask=k_mask)
+    tl.store(send + LOCAL_HEADS * DQ + cv, v, mask=v_mask)
+    in_tail = t >= tail_start
+    tail = tail_ptr + (t - tail_start) * (HEADS * (DQ + DV))
+    tl.store(tail + rank * LOCAL_HEADS * DQ + ck, k, mask=k_mask & in_tail)
+    tl.store(tail + HEADS * DQ + rank * LOCAL_HEADS * DV + cv, v, mask=v_mask & in_tail)
+
+
+@triton.jit
+def _mimo_sp_swa_pages_kernel(
+    kv_src_ptr,
+    cached_ptr,
+    tails_ptr,
+    k_ptr,
+    v_ptr,
+    k_pages_ptr,
+    v_pages_ptr,
+    k_stride,
+    v_stride,
+    v_scale,
+    cache_rows,
+    own_base,
+    own_end,
+    HEADS: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    DQ: tl.constexpr,
+    DV: tl.constexpr,
+    PAGE: tl.constexpr,
+    X: tl.constexpr,
+    BLOCK_DQ: tl.constexpr,
+    HAS_V_SCALE: tl.constexpr,
+):
+    """One SHUFFLE-5D page of one KV head from the kv_src rows of [cached, tails, own,
+    zero]: cached is (attn_tp, cache_rows, [K | V] of the rank's heads), tails is
+    (rows, [K | V] of all heads), own rows are read from K and V (V scaled here)."""
+    page = tl.program_id(0)
+    head = tl.program_id(1)
+    i = tl.arange(0, PAGE)[:, None]
+    dk = tl.arange(0, BLOCK_DQ)[None, :]
+    dv = tl.arange(0, DV)[None, :]
+    src = tl.load(kv_src_ptr + page * PAGE + i)
+    in_cache = src < cache_rows
+    in_tail = (src >= cache_rows) & (src < own_base)
+    in_own = (src >= own_base) & (src < own_end)
+    cached = cached_ptr + ((head // LOCAL_HEADS) * cache_rows + src) * LOCAL_HEADS * (
+        DQ + DV
+    )
+    tails = tails_ptr + (src - cache_rows) * HEADS * (DQ + DV)
+    own = src - own_base
+    k_mask = dk < DQ
+    # Zero for the padding row (zero_row).
+    k = tl.load(
+        k_ptr + own * k_stride + head * DQ + dk, mask=in_own & k_mask, other=0.0
+    )
+    v = tl.load(v_ptr + own * v_stride + head * DV + dv, mask=in_own, other=0.0)
+    if HAS_V_SCALE:
+        v = (v.to(tl.float32) * v_scale).to(v.dtype)
+    head_off = head % LOCAL_HEADS
+    k = tl.where(
+        in_cache, tl.load(cached + head_off * DQ + dk, mask=in_cache & k_mask), k
+    )
+    v = tl.where(
+        in_cache,
+        tl.load(cached + LOCAL_HEADS * DQ + head_off * DV + dv, mask=in_cache),
+        v,
+    )
+    k = tl.where(in_tail, tl.load(tails + head * DQ + dk, mask=in_tail & k_mask), k)
+    v = tl.where(in_tail, tl.load(tails + HEADS * DQ + head * DV + dv, mask=in_tail), v)
+    base = page * HEADS + head
+    tl.store(
+        k_pages_ptr + base * DQ * PAGE + dk // X * PAGE * X + i * X + dk % X,
+        k,
+        mask=k_mask,
+    )
+    tl.store(v_pages_ptr + base * DV * PAGE + i // X * DV * X + dv * X + i % X, v)
+
+
+@functools.lru_cache(maxsize=None)
+def _mimo_unit_scale(device: torch.device) -> torch.Tensor:
+    return torch.ones(1, dtype=torch.float32, device=device)
 
 
 def _mimo_needs_v_padding(
@@ -475,6 +955,20 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
+        self._sp_tp_moe = _mimo_sp_attn_enabled()
+        if self._sp_tp_moe and not getattr(
+            self.experts.quant_method, "convert_mxfp4_to_fp8", False
+        ):
+            from sglang.srt.layers.quantization.mxfp4_aiter_a16w4_moe import (
+                Mxfp4AiterA16W4MoEMethod,
+            )
+
+            if not (
+                envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+                and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+                and isinstance(self.experts.quant_method, Mxfp4AiterA16W4MoEMethod)
+            ):
+                raise ValueError("MiMo SP requires static FP8 or the opted-in native MXFP4 graph path")
 
     def get_moe_weights(self):
         return [
@@ -490,6 +984,8 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        if self._sp_tp_moe and _mimo_sp_moe_active(forward_batch):
+            return self.forward_sp(hidden_states)
         if not self._enable_a2a_moe:
             return self.forward_normal(
                 hidden_states,
@@ -498,6 +994,137 @@ class MiMoV2MoE(nn.Module):
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_sp(self, hidden_states) -> torch.Tensor:
+        """TP MoE on attention-TP token shards (SGLANG_ENABLE_DPA_SP).
+
+        Route the local shard, all-gather its FP8 activations, 1x128 scales and top-k over
+        the TP group, run the TP-sharded experts on all tokens, then reduce-scatter the
+        partial sums back to the shard. Same quantized expert input as the all-reduce path.
+        """
+        if not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get():
+            return self.forward_sp_native(hidden_states)
+        router_hidden_states, expert_hidden_states = _mimo_moe_inputs(hidden_states)
+        if router_hidden_states.shape[0] > 0:
+            router_logits = self.gate(router_hidden_states)
+            topk_output = self.topk(router_hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(router_hidden_states.device)
+        if isinstance(expert_hidden_states, tuple):
+            quantized, scale = expert_hidden_states
+            assert getattr(scale, "_aiter_moe_scale_is_transposed", False)
+        elif expert_hidden_states.shape[0] == 0:
+            # Idle shard: no quant launch (an empty grid is an invalid configuration).
+            from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+            rows, hidden = expert_hidden_states.shape
+            quantized = expert_hidden_states.new_empty((rows, hidden), dtype=fp8_dtype)
+            scale = expert_hidden_states.new_empty(
+                (rows, hidden // 128), dtype=torch.float32
+            )
+        else:
+            quantized, scale = _mimo_sp_moe_quant(expert_hidden_states)
+        sizes = _mimo_sp_moe_sizes()
+        if sum(sizes) == 0:
+            return router_hidden_states
+        tp_group = get_tp_group()
+        topk_weights, topk_ids, quantized_bytes, scale = tp_group.all_gatherv(
+            [
+                topk_output.topk_weights.to(torch.float32),
+                topk_output.topk_ids.to(torch.int32),
+                quantized.view(torch.uint8),
+                scale,
+            ],
+            sizes=sizes,
+        )
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=topk_weights.new_empty((0,)),
+        )
+        expert_input = (
+            quantized_bytes.view(quantized.dtype),
+            _mimo_sp_moe_gather_scales(scale, sizes),
+        )
+        final_hidden_states = self.experts(expert_input, topk_output)
+        if all(size == sizes[0] for size in sizes):
+            output = final_hidden_states.new_empty(
+                (sizes[0], final_hidden_states.shape[1])
+            )
+            if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+                with tp_group.pynccl_comm.change_state(enable=True):
+                    tp_group.pynccl_comm.reduce_scatter(output, final_hidden_states)
+            else:
+                tp_group.reduce_scatter_tensor(output, final_hidden_states)
+            return output
+        return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
+
+    def forward_sp_native(self, hidden_states) -> torch.Tensor:
+        """Native MXFP4 graph path: gather BF16 before the existing row quantizer.
+
+        Native A8W4 uses one activation scale per row, unlike FP8 MoE's
+        per-128-column scales. Preserve its exact input contract and let the
+        unchanged native expert implementation quantize the gathered rows.
+        """
+        assert isinstance(hidden_states, torch.Tensor)
+        assert hidden_states.dtype == torch.bfloat16
+        sizes = _mimo_sp_moe_sizes()
+        assert sizes and all(size == sizes[0] for size in sizes)
+        assert hidden_states.shape[0] == sizes[0] > 0
+        topk = self.topk(hidden_states, self.gate(hidden_states))
+        tp_group = get_tp_group()
+        if envs.SGLANG_MIMO_GRAPH_SP_PACKED.get():
+            from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import quantize_rows
+
+            # The native row quantizer is independent of the number of rows.
+            # Gather its bytes and exact FP32 scales before the expert GEMMs.
+            rows, hidden = hidden_states.shape
+            count = topk.topk_weights.shape[1]
+            data_words = hidden // 4
+            words = ((data_words + 1 + 2 * count + 3) // 4) * 4
+            fused_packet = envs.SGLANG_MIMO_FUSED_SP_PACKET.get()
+            if fused_packet:
+                _log_mimo_fused_sp_packet()
+                from sglang.srt.layers.quantization.mimo_native_sp_fusion import (
+                    quantize_pack_native_sp, unpack_native_sp,
+                )
+                packed = quantize_pack_native_sp(hidden_states, topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32))
+            else:
+                quantized, scale = quantize_rows(hidden_states)
+                packed = torch.empty((rows, words), dtype=torch.float32, device=hidden_states.device)
+                packed[:, :data_words].view(torch.uint8).copy_(quantized.view(torch.uint8))
+                packed[:, data_words].copy_(scale)
+                packed[:, data_words + 1:data_words + 1 + count].copy_(topk.topk_weights)
+                packed[:, data_words + 1 + count:data_words + 1 + 2 * count].view(torch.int32).copy_(topk.topk_ids)
+            merged = packed.new_empty((sum(sizes), words))
+            # Float32 is a copy-only transport here; never cast the FP8 bytes
+            # numerically or send them through a reduction.
+            tp_group.all_gather_into_tensor(merged, packed)
+            if fused_packet:
+                values, scales, weights, ids = unpack_native_sp(merged, hidden, count)
+            else:
+                values = merged[:, :data_words].contiguous().view(quantized.dtype)
+                scales = merged[:, data_words].contiguous()
+                weights = merged[:, data_words + 1:data_words + 1 + count].contiguous()
+                ids = merged[:, data_words + 1 + count:data_words + 1 + 2 * count].contiguous().view(torch.int32)
+            gathered = (values, scales)
+        else:
+            weights, ids, gathered = tp_group.all_gatherv(
+                [topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32), hidden_states],
+                sizes=sizes,
+            )
+        partial = self.experts(gathered, StandardTopKOutput(
+            topk_weights=weights,
+            topk_ids=ids,
+            router_logits=weights.new_empty((0,)),
+        ))
+        output = partial.new_empty((sizes[0], partial.shape[1]))
+        comm = tp_group.pynccl_comm
+        if comm is None or not comm.available:
+            raise RuntimeError("MiMo native graph SP requires the direct RCCL communicator")
+        with comm.change_state(enable=True):
+            comm.reduce_scatter(output, partial)
+        return output
 
     def forward_normal(
         self,
@@ -721,21 +1348,16 @@ class MiMoV2Attention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
-
-        # Keep TP weights for decode/verify and small prefill. SP weights are
-        # loaded from the same checkpoint tensors, without weight collectives.
+        # Both SP modes share full-head weights; their MoE/attention dispatch differs.
+        self._ep_sp_swa = envs.SGLANG_ENABLE_MIMO_SWA_SP.get() and _mimo_ep_sp_supported()
         self.qkv_proj_full = None
-        self.o_proj_full = None
         if (
-            envs.SGLANG_ENABLE_MIMO_SWA_SP.get()
-            and _mimo_ep_sp_supported()
+            (_mimo_sp_attn_enabled() or self._ep_sp_swa)
             and sliding_window_size > 0
-            and self.total_num_heads == 64
-            and self.total_num_kv_heads == 8
-            and self.head_dim == 192
-            and self.original_v_head_dim == 128
-            and not self.needs_v_pad
             and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and (num_heads, num_kv_heads, self.head_dim, self.original_v_head_dim)
+            == (64, 8, 192, 128)
+            and not self.needs_v_pad
         ):
             self.qkv_proj_full = QKVParallelLinear(
                 hidden_size,
@@ -749,13 +1371,6 @@ class MiMoV2Attention(nn.Module):
                 tp_size=1,
                 prefix=add_prefix("qkv_proj", prefix),
                 skip_block_quant_check=True,
-            )
-            self.o_proj_full = ReplicatedLinear(
-                self.total_num_heads * self.original_v_head_dim,
-                hidden_size,
-                bias=False,
-                params_dtype=self.o_proj.params_dtype,
-                prefix=add_prefix("o_proj", prefix),
             )
 
         self.rotary_emb = get_rope(
@@ -791,48 +1406,234 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
-
-        self.attention_sink_full = (
-            nn.Parameter(
-                torch.empty(self.total_num_heads, dtype=torch.float32),
-                requires_grad=False,
+        # Full o_proj weight [hidden, heads * v_head_dim] for SGLANG_ENABLE_DPA_SP.
+        self.o_proj_full: Optional[torch.Tensor] = None
+        self.o_proj_full_packed = False
+        self.attention_sink_full: Optional[torch.Tensor] = None
+        if self._ep_sp_swa and self.qkv_proj_full is not None:
+            # Preserve upstream PR43's direct checkpoint loading for EP SWA.
+            self.o_proj_full = ReplicatedLinear(
+                self.total_num_heads * self.original_v_head_dim,
+                hidden_size,
+                bias=False,
+                params_dtype=self.o_proj.params_dtype,
+                prefix=add_prefix("o_proj", prefix),
             )
-            if self.qkv_proj_full is not None and attention_sink_bias
-            else None
-        )
+            if attention_sink_bias:
+                self.attention_sink_full = torch.nn.Parameter(
+                    torch.empty(self.total_num_heads, dtype=torch.float32),
+                    requires_grad=False,
+                )
 
-    def load_sp_weight(self, name, loaded_weight):
-        """Fill the SP copy from the same tensor used by the normal TP loader."""
+    def build_sp_weights(self):
+        """Assemble full-head weights from the attention-TP shards (after load_weights)."""
+        if self._ep_sp_swa:
+            return
+        if (
+            _mimo_sp_attn_enabled() or self.qkv_proj_full is not None
+        ) and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
+            shard = self.o_proj.weight.data
+            self.o_proj_full = (
+                _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
+            )
+            self.o_proj_full_packed = False
+            if (
+                envs.SGLANG_MIMO_SP_PACKED_OPROJ.get()
+                and _mimo_sp_attn_enabled()
+                and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+            ):
+                if self.o_proj_full.dtype != torch.bfloat16 or self.o_proj_full.shape != (4096, 8192):
+                    raise ValueError("Packed MiMo SP projection requires BF16 [4096, 8192] weights")
+                from aiter.ops.shuffle import shuffle_weight
+
+                _mimo_init_hipblaslt(self.o_proj_full.device)
+                # Replace the full-weight layout, keeping the local shard for
+                # ordinary attention. Do not retain a second full-weight copy.
+                self.o_proj_full = shuffle_weight(self.o_proj_full, layout=(16, 16), use_int4=False)
+                self.o_proj_full_packed = True
+                logger.info("Using packed BF16 MiMo SP output projection")
         if self.qkv_proj_full is None:
             return
-        if name == "o_proj.weight":
-            default_weight_loader(self.o_proj_full.weight, loaded_weight)
-        elif name == "attention_sink_bias" and self.attention_sink_full is not None:
-            default_weight_loader(self.attention_sink_full, loaded_weight)
-        elif name.startswith("qkv_proj."):
-            param_name = name.split(".", 1)[1]
-            full = getattr(self.qkv_proj_full, param_name, None)
-            if full is None:
-                return
-            if loaded_weight.shape != full.shape:
-                raise ValueError(
-                    f"MiMo SWA SP needs the full checkpoint tensor for {name}: "
-                    f"expected {tuple(full.shape)}, got {tuple(loaded_weight.shape)}. "
-                    "Disable SGLANG_ENABLE_MIMO_SWA_SP to load TP-only shards."
+        if self.attention_sink_bias is not None:
+            self.attention_sink_full = _mimo_attn_tp_gather(
+                self.attention_sink_bias.data
+            )
+        sizes = (self.q_size, self.k_size, self.v_size)
+        full_params = dict(self.qkv_proj_full.named_parameters())
+        for name, shard in self.qkv_proj.named_parameters():
+            full = full_params[name]
+            if full.shape == shard.shape:
+                full.data.copy_(shard.data)
+                continue
+            rows = shard.shape[0]
+            attn_tp = get_attention_tp_size()
+            parts = [rows * size // sum(sizes) for size in sizes]
+            assert (
+                full.shape == (attn_tp * rows, *shard.shape[1:]) and sum(parts) == rows
+            ), name
+            gathered = _mimo_attn_tp_gather(shard.data).view(
+                attn_tp, rows, *shard.shape[1:]
+            )
+            # Per-rank [q_r | k_r | v_r] blocks -> [Q | K | V].
+            full.data.copy_(
+                torch.cat(
+                    [
+                        block.reshape(attn_tp * part, *shard.shape[1:])
+                        for block, part in zip(gathered.split(parts, dim=1), parts)
+                    ]
                 )
-            shard = getattr(self.qkv_proj, param_name)
-            if full.shape != shard.shape:
-                loaded_weight = _mimo_reorder_fused_qkv(
-                    loaded_weight,
-                    (self.q_size, self.k_size, self.v_size),
-                    get_attention_tp_size(),
-                )
-            default_weight_loader(full, loaded_weight)
-        elif name.startswith(("q_proj.", "k_proj.", "v_proj.")):
-            proj_name, param_name = name.split(".", 1)
-            full = getattr(self.qkv_proj_full, param_name, None)
-            if full is not None:
-                full.weight_loader(full, loaded_weight, proj_name[0])
+            )
+
+    def forward_sp_swa(
+        self,
+        positions: torch.Tensor,
+        hidden_states,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """SWA prefill on this rank's token slice with all heads (SGLANG_ENABLE_DPA_SP)."""
+        from aiter.ops.flydsl import flydsl_paged_attention_swa_bf16
+
+        from sglang.srt.layers.attention.utils import gather_shuffle_5d_to_linear
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        attn_tp, rank = get_attention_tp_size(), get_attention_tp_rank()
+        group = get_attention_tp_group()
+        rows = _mimo_hidden_num_tokens(hidden_states)
+        heads, kv_heads = self.total_num_heads, self.total_num_kv_heads
+        dq, dv = self.head_dim, self.original_v_head_dim
+        local_kv_heads = kv_heads // attn_tp
+        # Same window as the attention-TP kernel call (see run_mimo_flypa_swa_prefill).
+        window = self.attn.sliding_window_size - int(self.attn.tp_k_head_num == 2)
+        meta = _mimo_sp_swa_metadata(forward_batch, window, rows)
+
+        qkv, _ = self.qkv_proj_full(hidden_states)
+        q, k, v = qkv.split([heads * dq, kv_heads * dq, kv_heads * dv], dim=-1)
+        q, k = self.rotary_emb(positions[rank * rows : (rank + 1) * rows], q, k)
+        k = k.reshape(rows, kv_heads * dq)
+        v_scale = 1.0 if self.v_scale is None else self.v_scale
+        row = local_kv_heads * (dq + dv)
+
+        # This rank's KV heads for every token of the DP group -> the head-sharded cache;
+        # the last keys of every slice are kept for the windows of the next slices.
+        send = q.new_empty((attn_tp, rows, row))
+        tail = q.new_empty((meta.tail_rows, kv_heads * (dq + dv)))
+        _mimo_sp_swa_send_kernel[(triton.cdiv(rows, 16), attn_tp)](
+            k,
+            v,
+            send,
+            tail,
+            k.stride(0),
+            v.stride(0),
+            v_scale,
+            rows,
+            rows - meta.tail_rows,
+            HEADS=kv_heads,
+            LOCAL_HEADS=local_kv_heads,
+            DQ=dq,
+            DV=dv,
+            BLOCK_T=16,
+            BLOCK_K=triton.next_power_of_2(local_kv_heads * dq),
+            BLOCK_V=triton.next_power_of_2(local_kv_heads * dv),
+            HAS_V_SCALE=self.v_scale is not None,
+        )
+        received = torch.empty_like(send)
+        group.all_to_all_single(received, send)
+        received = received.view(attn_tp * rows, row)
+        backend = get_attn_backend()
+        pool = backend.token_to_kv_pool
+        pool.set_kv_buffer(
+            self.attn,
+            KVWriteLoc(
+                forward_batch.out_cache_loc,
+                getattr(backend.forward_metadata, "swa_out_cache_loc", None),
+            ),
+            received[:, : local_kv_heads * dq].view(-1, local_kv_heads, dq),
+            received[:, local_kv_heads * dq :].view(-1, local_kv_heads, dv),
+            None,
+            None,
+        )
+
+        # Window halos: cached keys left of each chunk, and the tails of earlier slices.
+        cached = tail  # not read without cached rows
+        if meta.cache_rows:
+            cached = q.new_empty((meta.cache_rows, row))
+            k_cache = pool.get_key_buffer(self.attn.layer_id)
+            gather_shuffle_5d_to_linear[(meta.cache_rows, 1)](
+                k_cache,
+                pool.get_value_buffer(self.attn.layer_id),
+                cached,
+                cached[:, local_kv_heads * dq :],
+                meta.cache_loc,
+                row,
+                row,
+                local_kv_heads,
+                dq,
+                dv,
+                _SP_SWA_PAGE,
+                X=k_cache.shape[-1],
+                HEAD_BLOCK=triton.next_power_of_2(local_kv_heads),
+                KEY_BLOCK_D=triton.next_power_of_2(dq),
+                VALUE_BLOCK_D=triton.next_power_of_2(dv),
+            )
+            cached = _mimo_attn_tp_gather(cached)
+        tails = _mimo_attn_tp_gather(tail)
+        own_base = meta.cache_rows + attn_tp * meta.tail_rows
+        pages = meta.kv_src.shape[0] // _SP_SWA_PAGE
+        # The FlyDSL SWA kernel compiles once per K.shape[0] (an unused constexpr), about
+        # 1.6 s each: power-of-two page buffers keep that to a few variants.
+        alloc = max(128, 1 << max(pages - 1, 0).bit_length())
+        k_pages = q.new_empty((alloc, kv_heads, dq // 8, _SP_SWA_PAGE, 8))
+        v_pages = q.new_empty((alloc, kv_heads, _SP_SWA_PAGE // 8, dv, 8))
+        if pages:
+            _mimo_sp_swa_pages_kernel[(pages, kv_heads)](
+                meta.kv_src,
+                cached,
+                tails,
+                k,
+                v,
+                k_pages,
+                v_pages,
+                k.stride(0),
+                v.stride(0),
+                v_scale,
+                meta.cache_rows,
+                own_base,
+                own_base + rows,
+                HEADS=kv_heads,
+                LOCAL_HEADS=local_kv_heads,
+                DQ=dq,
+                DV=dv,
+                PAGE=_SP_SWA_PAGE,
+                X=8,
+                BLOCK_DQ=triton.next_power_of_2(dq),
+                HAS_V_SCALE=self.v_scale is not None,
+            )
+
+        out = (q.new_zeros if meta.q_rows < rows else q.new_empty)((rows, heads, dv))
+        if meta.q_rows:
+            unit = _mimo_unit_scale(q.device)
+            flydsl_paged_attention_swa_bf16(
+                q.view(rows, heads, dq)[: meta.q_rows],
+                k_pages,
+                v_pages,
+                meta.cu_seqlens_q,
+                meta.kv_indptr,
+                meta.page_ids,
+                meta.max_q,
+                meta.max_kv,
+                window_left=window,
+                kv_last_page_lens=meta.last_page_lens,
+                q_descale=unit,
+                k_descale=unit,
+                v_descale=unit,
+                out=out[: meta.q_rows],
+                sink_ptr=self.attention_sink_full,
+                softmax_scale=self.scaling,
+                stream=torch.cuda.current_stream(q.device),
+            )
+        return _mimo_full_o_proj(out.view(rows, heads * dv), self.o_proj_full,
+                                 self.o_proj.quant_method, getattr(self, "o_proj_full_packed", False))
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -889,12 +1690,15 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        scatter_output: bool = False,
         sp_swa: bool = False,
     ) -> torch.Tensor:
         if sp_swa:
-            from sglang.srt.layers.attention.mimo_sp import run_mimo_sp_swa
+            if self._ep_sp_swa:
+                from sglang.srt.layers.attention.mimo_sp import run_mimo_sp_swa
 
-            return run_mimo_sp_swa(self, positions, hidden_states, forward_batch)
+                return run_mimo_sp_swa(self, positions, hidden_states, forward_batch)
+            return self.forward_sp_swa(positions, hidden_states, forward_batch)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
@@ -917,8 +1721,45 @@ class MiMoV2Attention(nn.Module):
                 ..., : self.original_v_head_dim
             ].reshape(-1, self.num_heads * self.original_v_head_dim)
 
+        if scatter_output:
+            return _mimo_sp_o_proj(
+                attn_output, self.o_proj_full, self.o_proj.quant_method, getattr(self, "o_proj_full_packed", False)
+            )
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_sp_weight(self, name, loaded_weight):
+        """Fill the SP copy from the same tensor used by the normal TP loader."""
+        if not self._ep_sp_swa or self.qkv_proj_full is None:
+            return
+        if name == "o_proj.weight":
+            default_weight_loader(self.o_proj_full.weight, loaded_weight)
+        elif name == "attention_sink_bias" and self.attention_sink_full is not None:
+            default_weight_loader(self.attention_sink_full, loaded_weight)
+        elif name.startswith("qkv_proj."):
+            param_name = name.split(".", 1)[1]
+            full = getattr(self.qkv_proj_full, param_name, None)
+            if full is None:
+                return
+            if loaded_weight.shape != full.shape:
+                raise ValueError(
+                    f"MiMo SWA SP needs the full checkpoint tensor for {name}: "
+                    f"expected {tuple(full.shape)}, got {tuple(loaded_weight.shape)}. "
+                    "Disable SGLANG_ENABLE_MIMO_SWA_SP to load TP-only shards."
+                )
+            shard = getattr(self.qkv_proj, param_name)
+            if full.shape != shard.shape:
+                loaded_weight = _mimo_reorder_fused_qkv(
+                    loaded_weight,
+                    (self.q_size, self.k_size, self.v_size),
+                    get_attention_tp_size(),
+                )
+            default_weight_loader(full, loaded_weight)
+        elif name.startswith(("q_proj.", "k_proj.", "v_proj.")):
+            proj_name, param_name = name.split(".", 1)
+            full = getattr(self.qkv_proj_full, param_name, None)
+            if full is not None:
+                full.weight_loader(full, loaded_weight, proj_name[0])
 
 
 class MiMoV2DecoderLayer(nn.Module):
@@ -1046,7 +1887,23 @@ class MiMoV2DecoderLayer(nn.Module):
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
-
+        # SGLANG_ENABLE_DPA_SP: token-scattered residual and MoE layout for large forward passes.
+        self.layer_communicator_sp = None
+        if _mimo_sp_attn_enabled():
+            self.layer_communicator_sp = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes.init_new(
+                    layer_id=layer_id,
+                    num_layers=config.num_hidden_layers,
+                    is_layer_sparse=self.is_layer_sparse,
+                    is_previous_layer_sparse=is_previous_layer_sparse,
+                    is_next_layer_sparse=is_next_layer_sparse,
+                    sp_tp_moe=True,
+                ),
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            )
         # SWA attention on the token shard in extend batches.
         self.layer_communicator_sp_attn = None
         if self.self_attn.qkv_proj_full is not None:
@@ -1057,6 +1914,7 @@ class MiMoV2DecoderLayer(nn.Module):
                     is_layer_sparse=self.is_layer_sparse,
                     is_previous_layer_sparse=is_previous_layer_sparse,
                     is_next_layer_sparse=is_next_layer_sparse,
+                    sp_tp_moe=self.layer_communicator_sp is not None,
                     sp_attn=True,
                 ),
                 input_layernorm=self.input_layernorm,
@@ -1126,13 +1984,34 @@ class MiMoV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
-        sp_swa = (
-            self.layer_communicator_sp_attn is not None
+        sp_o_proj = sp_swa = False
+        if self.layer_communicator_sp is not None and _mimo_sp_moe_active(
+            forward_batch
+        ):
+            communicator = self.layer_communicator_sp
+            if (
+                self.layer_communicator_sp_attn is not None
+                and self.self_attn.o_proj_full is not None
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and forward_batch.extend_seq_lens_cpu is not None
+                and positions.ndim == 1
+            ):
+                communicator = self.layer_communicator_sp_attn
+                sp_swa = True
+            else:
+                sp_o_proj = (
+                    self.self_attn.o_proj_full is not None
+                    and communicator.layer_scatter_modes.mlp_mode
+                    == ScatterMode.SCATTERED
+                )
+        elif (
+            self.self_attn._ep_sp_swa
+            and self.layer_communicator_sp_attn is not None
             and self.self_attn.o_proj_full is not None
             and _mimo_ep_sp_active(forward_batch)
-        )
-        if sp_swa:
+        ):
             communicator = self.layer_communicator_sp_attn
+            sp_swa = True
         # Self Attention
         hidden_states, residual = (
             communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -1149,15 +2028,23 @@ class MiMoV2DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                scatter_output=sp_o_proj,
                 sp_swa=sp_swa,
             )
 
-        hidden_states, residual = communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format=self._prefill_moe_quant_format(forward_batch),
-        )
+        if sp_o_proj:
+            hidden_states, residual = communicator.prepare_mlp_from_scattered_attn(
+                hidden_states,
+                residual,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
+        else:
+            hidden_states, residual = communicator.prepare_mlp(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
 
         should_allreduce_fusion = (
             communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
@@ -1577,6 +2464,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
 
+        if _mimo_sp_attn_enabled() and not _mimo_tp_sp_flash_config(config):
+            raise ValueError(
+                "MiMo TP prefill SP currently supports the Flash geometry only"
+            )
+
         if not self.config.encoder_only:
             self.model = MiMoV2Model(
                 config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -1599,6 +2491,24 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
+        if envs.SGLANG_DFLASH_REQUEST_OWNER_VERIFY.get():
+            args = get_global_server_args()
+            if not (
+                is_gfx942_supported() and _mimo_tp_sp_flash_config(self.config)
+                and self.config.vocab_size == 152576 and self.logits_processor is not None
+                and args.speculative_algorithm == "DFLASH" and args.speculative_dflash_block_size == 8
+                and args.tp_size == 8 and args.dp_size == 2 and args.attn_cp_size == 1
+                and args.pp_size == 1 and args.enable_dp_attention and args.enable_dp_lm_head
+                and not args.enable_fp32_lm_head and not args.enable_lora
+                and not args.enable_two_batch_overlap and args.kv_cache_dtype == "bf16"
+                and self.logits_processor.use_attn_tp_group
+                and self.logits_processor.do_tensor_parallel_all_gather
+                and not self.logits_processor.final_logit_softcapping
+            ):
+                raise ValueError("Request-owner verification requires the validated gfx942 Flash DFlash8 TP8/DP2 BF16 configuration")
+            self.logits_processor.request_owner_world_size = 4
+            self.logits_processor.request_owner_block_size = 8
+            logger.info("Enabled request-owner target logits: attention TP4, DFlash8, BF16")
         self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)
@@ -2057,6 +2967,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        for layer in getattr(self.model, "layers", ()):
+            attn = getattr(layer, "self_attn", None)
+            if isinstance(attn, MiMoV2Attention):
+                attn.build_sp_weights()
 
     def get_embed_and_head(self):
         assert (

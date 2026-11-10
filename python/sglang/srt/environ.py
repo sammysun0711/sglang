@@ -373,6 +373,7 @@ class Envs:
     # DFLASH's decode clock advances per iteration, while its KV grows by up
     # to one speculative block. Opt in to evaluate reclamation overhead.
     SGLANG_DFLASH_SWA_TOKEN_INTERVAL = EnvBool(False)
+    SGLANG_DFLASH_BATCH_SWA_EVICTION = EnvBool(False)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
@@ -516,12 +517,26 @@ class Envs:
     # sink-free full-attention target verification; SWA/sink layers remain on
     # AITER Gluon.
     SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
+    # Zero lets the retained PA plan choose the query split.
+    SGLANG_FLYDSL_PA_QUERY_SPLITS = EnvInt(0)
     # Optional gfx942 BF16 MiMo full prefill, behind the existing FlyPA guards.
     SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
+    SGLANG_FLYPA_MIMO_PREFILL = EnvBool(False)
     # gfx942 FP8 blockscale linear kernel (e.g. for mimo fp8 qkv projection)
     SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
     # MiMo EP prefill: run SWA on local token shards.
     SGLANG_ENABLE_MIMO_SWA_SP = EnvBool(False)
+    # Opt-in MiMo Flash prefill SP on gfx942, TP8/DP2/EP1 with static converted FP8
+    # experts. Residuals stay on token shards; AITER MoE uses FP8 all-gather and
+    # RCCL reduce-scatter. Attention uses full-weight o_proj and SWA KV/halo exchange.
+    # Only globally agreed plain prefill (including idle replicas) may enter;
+    # decode, speculative verify, mixed batches and CUDA graphs use the original path.
+    SGLANG_ENABLE_DPA_SP = EnvBool(False)
+    # DFlash target graph SP for TP8/DP2 with native MXFP4 experts.
+    SGLANG_MIMO_GRAPH_VERIFY_SP = EnvBool(False)
+    SGLANG_MIMO_GRAPH_SP_PACKED = EnvBool(False)
+    SGLANG_MIMO_FUSED_SP_PACKET = EnvBool(False)
+    SGLANG_MIMO_SP_PACKED_OPROJ = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -678,6 +693,9 @@ class Envs:
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
+    SGLANG_DFLASH_REQUEST_OWNER_VERIFY = EnvBool(False)
+    SGLANG_DFLASH_FUSED_CHAIN_VERIFY = EnvBool(False)
+    SGLANG_DFLASH_PROB_SORT32 = EnvBool(False)
 
     # Deterministic inference
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
@@ -704,6 +722,7 @@ class Envs:
     SGLANG_DFLASH_FUSED_COMPACT_KV = EnvBool(False)
     # Fill the existing CPU length buffers through shared NumPy views.
     SGLANG_DFLASH_FAST_CPU_STAGING = EnvBool(False)
+    SGLANG_DFLASH_GREEDY_CHUNK_SIZE = EnvInt(256)
     # Opt-in grouped PA for MiMo target DFlash SWA verification.
     SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)
     # Keep target graphs enabled while comparing eager and captured DP drafts.

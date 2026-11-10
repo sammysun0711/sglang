@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Prefill-only client benchmark.
 # Default customer_pressure follows the executable arrays in
-# benchmark_sglang_prefill.sh: OSL=1, text prompts, 4 warmups before each case.
+# benchmark_sglang_prefill.sh: OSL=1 and text prompts.
 # Its 4K/8K rows differ from that script's header comments.
 # Set DATASET_PATH to the customer's ShareGPT JSON; when unset, bench_serving
 # uses its standard cached/downloaded ShareGPT dataset. Model/host/port are local.
@@ -13,6 +13,11 @@ set -euo pipefail
 # --flush-cache below does not disable the server's radix cache.
 #
 # DRY_RUN=1 prints commands without contacting the server or creating logs.
+# WARMUP_MODE=representative (default) sends 32 paired requests with varied
+# lengths once before the matrix, outside timing. The standard per-case warmup
+# is then zero. WARMUP_MODE=uniform restores the legacy 4 warmups per case.
+# WARMUP_REQUESTS_OVERRIDE changes the count; 0 disables warmup. Representative
+# warmup covers known first-use variants, not every possible runtime shape.
 # BENCHMARK_PRESET=sweep restores the previous matrix and prompt-count policy.
 # BENCHMARK_PRESET=simple uses 64 measured prompts per input, OSL=1, and
 # concurrency 16/16/12/3/2/2/2/2/2/2 for 4K/8K/16K/32K/64K/128K/256K/512K/768K/1M.
@@ -33,7 +38,12 @@ model="${MODEL:-/models/MiMo-V2.6-Flash-MOPD}"
 host="${HOST:-0.0.0.0}"
 port="${PORT:-30001}"
 dataset_path="${DATASET_PATH:-}"
-default_warmup_requests=4
+warmup_mode="${WARMUP_MODE:-representative}"
+case "${warmup_mode}" in
+  representative) default_warmup_requests=32 ;;
+  uniform) default_warmup_requests=4 ;;
+  *) echo "WARMUP_MODE must be representative or uniform, observed '${warmup_mode}'" >&2; exit 2 ;;
+esac
 declare -A matrix_output_tokens matrix_num_prompts matrix_concurrency
 case "${benchmark_preset}" in
   customer_pressure)
@@ -245,8 +255,9 @@ done
 
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 echo "Dataset: ${dataset_path:-standard ShareGPT cache/download}; tokenize-prompt=${tokenize_prompt}"
+echo "Warmup: ${warmup_mode}; requests=${warmup_requests}"
 if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
-  echo "Client matrix: benchmark_sglang_prefill.sh active arrays; ${warmup_requests} warmups before each case."
+  echo "Client matrix: benchmark_sglang_prefill.sh active arrays."
   echo "Offered request rate is unlimited; each case uses its global concurrency cap."
   echo "Server topology, chunk size, DFlash, quantization and radix-cache mode are configured separately."
 fi
@@ -266,6 +277,22 @@ if [[ "${dry_run}" == "0" ]]; then
   mkdir -p "$LOG_DIR"
 fi
 
+benchmark_warmup_requests="${warmup_requests}"
+if [[ "${warmup_mode}" == "representative" ]]; then
+  benchmark_warmup_requests=0
+  if (( warmup_requests > 0 )); then
+    warmup_cmd=("${PYTHON_BIN}" "${SCRIPT_DIR}/warmup_mimo_prefill.py"
+        --host "${host}" --port "${port}" --requests "${warmup_requests}"
+        --output "${LOG_DIR}/prefill_warmup.json")
+    printf 'Warmup command:'
+    printf ' %q' "${warmup_cmd[@]}"
+    printf '\n'
+    if [[ "${dry_run}" == "0" ]]; then
+      "${warmup_cmd[@]}" 2>&1 | tee "${LOG_DIR}/prefill_warmup.log"
+    fi
+  fi
+fi
+
 test_count=0
 failed_cases=()
 for input_tokens in "${TOKEN_LIST[@]}"; do
@@ -275,7 +302,7 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
-    current_warmup="${warmup_requests}"
+    current_warmup="${benchmark_warmup_requests}"
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Output Token = ${output_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${current_warmup}"

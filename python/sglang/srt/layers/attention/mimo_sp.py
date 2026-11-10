@@ -197,7 +197,7 @@ def _mimo_sp_swa_metadata(
     return meta
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "tail_start"])
 def _mimo_sp_swa_send_kernel(
     k_ptr,
     v_ptr,
@@ -238,7 +238,7 @@ def _mimo_sp_swa_send_kernel(
     tl.store(tail + HEADS * DQ + rank * LOCAL_HEADS * DV + cv, v, mask=v_mask & in_tail)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["cache_rows", "own_base", "own_end"])
 def _mimo_sp_swa_pages_kernel(
     kv_src_ptr,
     cached_ptr,

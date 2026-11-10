@@ -1,6 +1,6 @@
 """Eight-rank PyHIP TP MoE versus AITER experts and RCCL reduce-scatter."""
 
-import tempfile
+import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +20,8 @@ SIZES = (
     (0, 1, 17, 64, 0, 16, 31, 3),
     (3, 31, 16, 0, 64, 17, 1, 0),
     (96, 0, 5, 33, 2, 64, 16, 1),
+    (0,) * RANKS,
+    (16,) * RANKS,
 )
 
 
@@ -77,6 +79,8 @@ def _reference(layer, inputs, sizes, rank):
     from aiter.fused_moe import fused_moe
 
     x, scale, weights, ids = inputs
+    if not sum(sizes):
+        return torch.empty(0, HIDDEN, device=x.device, dtype=torch.bfloat16)
     partial = fused_moe(
         x,
         layer.w13_weight,
@@ -104,7 +108,39 @@ def _reference(layer, inputs, sizes, rank):
     return result[: sizes[rank]].to(torch.bfloat16)
 
 
-def _worker(rank, rendezvous):
+def _check_reduce_scatter_epochs(rank, group, kernel, device, diagnostics):
+    reducer = kernel._SumReduceScatter(group, 96, device)
+    outputs = []
+    for index, sizes in enumerate(SIZES):
+        if rank == 6 and index == 1:
+            # Delay this producer while empty owners can otherwise advance.
+            torch.cuda.synchronize()
+            time.sleep(0.05)
+        tokens = sum(sizes)
+        route = torch.arange(tokens * TOPK, device=device)
+        values = (route // TOPK % 4).float() / 16 + rank + 1 + index * 0.5
+        y = values[:, None].expand(-1, HIDDEN).contiguous().to(torch.bfloat16)
+        inv = route.reshape(tokens, TOPK).int()
+        outputs.append(reducer(y, inv, list(sizes)))
+    torch.cuda.synchronize()
+    failures = []
+    for index, (actual, sizes) in enumerate(zip(outputs, SIZES)):
+        begin = sum(sizes[:rank])
+        token = torch.arange(begin, begin + sizes[rank], device=device)
+        # All additions are exactly representable in BF16 for this fixture.
+        expected = (288 + 32 * index + 4 * (token % 4)).to(torch.bfloat16)
+        expected = expected[:, None].expand(-1, HIDDEN)
+        if not torch.equal(actual, expected):
+            torch.save(
+                dict(actual=actual.cpu(), expected=expected.cpu(), sizes=sizes),
+                Path(diagnostics) / f"ipc-rank{rank}-case{index}.pt",
+            )
+            failures.append(index)
+    assert not failures, f"IPC epoch mismatch on rank {rank}: cases {failures}"
+    assert reducer.epoch == sum(bool(sum(s)) for s in SIZES)
+
+
+def _worker(rank, rendezvous, diagnostics):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -118,8 +154,9 @@ def _worker(rank, rendezvous):
         from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe as kernel
 
         device = torch.device("cuda", rank)
-        layer = _weights(rank, device)
         group = _Group(rank)
+        _check_reduce_scatter_epochs(rank, group, kernel, device, diagnostics)
+        layer = _weights(rank, device)
         fixtures = [_inputs(i, sizes, device) for i, sizes in enumerate(SIZES)]
         # Queue changing shard sizes without host synchronization or barriers
         # between calls. This reuses the same route workspaces, inbox and epochs.
@@ -128,6 +165,7 @@ def _worker(rank, rendezvous):
             for inputs, sizes in zip(fixtures, SIZES)
         ]
         torch.cuda.synchronize()
+        failures = []
         for index, (actual, inputs, sizes) in enumerate(zip(outputs, fixtures, SIZES)):
             expected = _reference(layer, inputs, sizes, rank)
             assert actual.shape == expected.shape == (sizes[rank], HIDDEN)
@@ -143,14 +181,19 @@ def _worker(rank, rendezvous):
                     f"normalized_max={normalized_max.item():.6f}",
                     flush=True,
                 )
-                assert relative_rms < 0.01
-                assert normalized_max < 0.1
-        assert kernel._reduce_scatter.epoch == len(SIZES)
+                if not (relative_rms < 0.01 and normalized_max < 0.1):
+                    torch.save(
+                        dict(actual=actual.cpu(), expected=expected.cpu(), sizes=sizes),
+                        Path(diagnostics) / f"moe-rank{rank}-case{index}.pt",
+                    )
+                    failures.append((index, relative_rms.item(), normalized_max.item()))
+        assert not failures, f"MoE mismatch on rank {rank}: {failures}"
+        assert kernel._reduce_scatter.epoch == sum(bool(sum(s)) for s in SIZES)
     finally:
         dist.destroy_process_group()
 
 
-def test_tp_moe_matches_aiter_and_rccl(monkeypatch):
+def test_tp_moe_matches_aiter_and_rccl(monkeypatch, tmp_path):
     if not torch.version.hip or torch.cuda.device_count() < RANKS:
         pytest.skip("Requires eight gfx942 GPUs on one node")
     if any(
@@ -159,13 +202,12 @@ def test_tp_moe_matches_aiter_and_rccl(monkeypatch):
     ):
         pytest.skip("Requires gfx942")
     monkeypatch.setenv("AITER_FMOE_FP8_BLOCKSCALE_FLYDSL", "0")
-    with tempfile.TemporaryDirectory() as directory:
-        mp.spawn(
-            _worker,
-            args=(str(Path(directory) / "rendezvous"),),
-            nprocs=RANKS,
-            join=True,
-        )
+    mp.spawn(
+        _worker,
+        args=(str(tmp_path / "rendezvous"), str(tmp_path)),
+        nprocs=RANKS,
+        join=True,
+    )
 
 
 if __name__ == "__main__":

@@ -1548,8 +1548,11 @@ def launch_route_scatter(
 #      s rotates by block // 8, so the WGs writing to one destination at a time write adjacent rows.
 #   reduce: wait for this rank's rows' flags, sum the 8 inbox rows in rank order (L2-bypassing loads),
 #      _RS_UNITS units per step.
-# RS never waits on another rank (no deadlock with all WGs resident); a peer is at most one epoch ahead, so
-# the inbox alternates by epoch parity. Destination s's inbox / flag rows are src * size[s] + u.
+# Push never waits on another rank (all WGs are resident). Every consumer,
+# including an empty owner, waits for peer progress so no rank gets more than
+# one epoch ahead; the inbox alternates by parity. Inbox rows use src * size[s]
+# + u, but flags use src * RCAP + u so changing shard sizes cannot alias flags
+# belonging to a different source in an overlapping epoch.
 
 # Fewer pushing WGs congest xGMI less, more WGs sum faster (32K: 64 / 80 / 96 / 112 -> 1035 / 988 / 1036 / 1168 us).
 RS_GRID = 80
@@ -1910,7 +1913,7 @@ def _sum_rs_kernel(
                             for i in range_constexpr(2):
                                 _flag_swap(
                                     flag_rsrc,
-                                    ((RANK * sizes[d] + u) * 4 + q0 + i) * 4,
+                                    ((RANK * RCAP + u) * 4 + q0 + i) * 4,
                                     EPOCH,
                                 )
     _stage_end()
@@ -1921,11 +1924,24 @@ def _sum_rs_kernel(
     inbox = _rsrc(own_base + inbox_off, fx.Int32(0x7FFFFFFF))
     flags = _rsrc(own_base + flags_off, flags_bytes)
     out = _buffer(OUT, own * _ROW)
+    if own == 0:
+        # An empty owner still pushes rows for its peers. Wait for row zero at
+        # a nonempty destination before advancing, otherwise it could lap a
+        # slow consumer and overwrite that consumer's parity buffer.
+        leader = fx.Int32(0)
+        for d in range_constexpr(8):
+            leader = (sizes[d] > 0).select(fx.Int32(d), leader)
+        peer_flags = _rsrc(_pick(leader, peers) + flags_off, flags_bytes)
+        if tid < 32:
+            flag = (((tid >> 2) * RCAP) * 4 + (tid & 3)) * 4
+            while _flag_load(peer_flags, flag) < EPOCH:
+                rocdl.s_sleep(1)
+        _stage_end()
     for u0 in range(block, own, G * _RS_UNITS):
         if tid < 32 * _RS_UNITS:
             uw = u0 + (tid >> 5) * G
             if uw < own:
-                flag = ((((tid >> 2) & 7) * own + uw) * 4 + (tid & 3)) * 4
+                flag = ((((tid >> 2) & 7) * RCAP + uw) * 4 + (tid & 3)) * 4
                 while _flag_load(flags, flag) < EPOCH:
                     rocdl.s_sleep(1)
             # Inbox reads stay after the flags (they bypass the caches: sc0 sc1).
@@ -2296,6 +2312,8 @@ class _SumReduceScatter:
         )
 
     def __call__(self, y, inv, sizes: List[int]) -> torch.Tensor:
+        if not any(sizes):
+            return torch.empty(0, HIDDEN, dtype=torch.bfloat16, device=y.device)
         self.epoch += 1
         rank = self.group.rank_in_group
         offsets = [sum(sizes[:i]) for i in range(RANKS)]
@@ -2340,6 +2358,8 @@ def moe_reduce_scatter(
     and per-rank partial sums; the rank sum is FP32 in rank order with one BF16 rounding.
     """
     global _reduce_scatter
+    if not any(sizes):
+        return torch.empty(0, HIDDEN, dtype=torch.bfloat16, device=x8.device)
     if _reduce_scatter is None:
         _reduce_scatter = _SumReduceScatter(group, max_rows, x8.device)
     assert _reduce_scatter.group is group and _reduce_scatter.max_rows == max_rows

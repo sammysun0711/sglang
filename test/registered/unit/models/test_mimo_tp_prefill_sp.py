@@ -552,5 +552,27 @@ def test_scheduler_uses_existing_all_gather_for_uniform_prefill_flag(
         assert batch.all_extend_in_batch == (enabled and expected)
 
 
+def test_empty_tp_moe_does_not_allocate_or_advance_ipc_epoch():
+    def forbidden(*args, **kwargs):
+        raise AssertionError("An empty call must not route or allocate IPC buffers")
+
+    module = load(
+        "layers/moe/pyhip_fp8_blockscale_moe.py",
+        ["moe_reduce_scatter", "_SumReduceScatter"],
+        HIDDEN=4096,
+        _reduce_scatter=None,
+        _HipIpcBuffer=forbidden,
+        moe_route_rows=forbidden,
+    )
+    x = torch.empty((0, 4096), dtype=torch.bfloat16)
+    output = module.moe_reduce_scatter(None, x, None, None, None, [0] * 8, None, 96)
+    assert output.shape == x.shape and output.dtype == torch.bfloat16
+    assert module._reduce_scatter is None
+    reducer = module._SumReduceScatter.__new__(module._SumReduceScatter)
+    reducer.epoch = 7
+    output = reducer(x, None, [0] * 8)
+    assert output.shape == x.shape and reducer.epoch == 7
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

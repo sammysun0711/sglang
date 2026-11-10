@@ -16,6 +16,7 @@ set -euo pipefail
 # WARMUP_MODE=representative (default) sends 32 paired requests with varied
 # lengths once before the matrix, outside timing. The standard per-case warmup
 # is then zero. WARMUP_MODE=uniform restores the legacy 4 warmups per case.
+# WARMUP_MODE=pr46 uses 16 warmups for customer_pressure 4K and 4 elsewhere.
 # WARMUP_REQUESTS_OVERRIDE changes the count; 0 disables warmup. Representative
 # warmup covers known first-use variants, not every possible runtime shape.
 # BENCHMARK_PRESET=sweep restores the previous matrix and prompt-count policy.
@@ -41,8 +42,8 @@ dataset_path="${DATASET_PATH:-}"
 warmup_mode="${WARMUP_MODE:-representative}"
 case "${warmup_mode}" in
   representative) default_warmup_requests=32 ;;
-  uniform) default_warmup_requests=4 ;;
-  *) echo "WARMUP_MODE must be representative or uniform, observed '${warmup_mode}'" >&2; exit 2 ;;
+  uniform|pr46) default_warmup_requests=4 ;;
+  *) echo "WARMUP_MODE must be representative, uniform, or pr46, observed '${warmup_mode}'" >&2; exit 2 ;;
 esac
 declare -A matrix_output_tokens matrix_num_prompts matrix_concurrency
 case "${benchmark_preset}" in
@@ -256,6 +257,9 @@ done
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 echo "Dataset: ${dataset_path:-standard ShareGPT cache/download}; tokenize-prompt=${tokenize_prompt}"
 echo "Warmup: ${warmup_mode}; requests=${warmup_requests}"
+if [[ "${warmup_mode}" == "pr46" && "${benchmark_preset}" == "customer_pressure" ]]; then
+  echo "PR46 warmup policy: 4K=${WARMUP_REQUESTS_OVERRIDE:-16}, others=${warmup_requests}."
+fi
 if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
   echo "Client matrix: benchmark_sglang_prefill.sh active arrays."
   echo "Offered request rate is unlimited; each case uses its global concurrency cap."
@@ -303,6 +307,12 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
     current_warmup="${benchmark_warmup_requests}"
+    if [[ "${warmup_mode}" == "pr46" &&
+          "${benchmark_preset}" == "customer_pressure" &&
+          "${input_tokens}" == "4096" &&
+          -z "${WARMUP_REQUESTS_OVERRIDE:-}" ]]; then
+      current_warmup=16
+    fi
     echo -e "\n============================================================"
     echo "Testing: Input Token = ${input_tokens}, Output Token = ${output_tokens}, Concurrency = ${concurrency} | Run 1"
     echo "Measured prompts = ${num_prompts}, warmups = ${current_warmup}"

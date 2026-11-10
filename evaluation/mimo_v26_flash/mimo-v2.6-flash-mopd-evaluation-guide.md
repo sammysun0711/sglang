@@ -142,11 +142,15 @@ LOG_DIR=./logs/mimo_v26_flash_dp2_tp8_ep8_dpa_prefill \
 ```
 
 The client keeps `TOKENIZE_PROMPT=0` by default and uses the preset's input
-lengths, concurrency, and request counts. The 4K point runs 16 concurrent warmup
-requests to exercise larger prefill batches; other points run four. Set
-`WARMUP_REQUESTS_OVERRIDE` to override these counts. Each point flushes the cache
-before measurement. The client reports TTFT and input token throughput for the
-whole server.
+lengths, concurrency, and request counts. `WARMUP_MODE=representative` (default)
+sends 32 requests in varied-length pairs once before the matrix, followed by
+zero additional warmups in each timed client. `WARMUP_MODE=pr46` selects 16
+concurrent uniform warmups at the 4K point and four at other points.
+`WARMUP_MODE=uniform` uses four at every point. `WARMUP_REQUESTS_OVERRIDE`
+overrides the selected mode's count; zero disables warmup. Each point flushes
+the cache before measurement. The client reports TTFT and input token
+throughput for the whole server. Compare warmup modes using separate empty
+kernel-cache directories and distinguish compiler calls from cache loads.
 
 For **accuracy tests**, stop the performance server and rerun the launch command
 with **`PERFORMANCE_MODE=0`** to enable real expert routing. Set `ENABLE_DFLASH=0`

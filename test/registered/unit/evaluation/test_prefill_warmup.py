@@ -155,6 +155,25 @@ class PrefillWarmupTest(unittest.TestCase):
         report = json.loads((self.logs / "prefill_warmup.json").read_text())
         self.assertEqual(report["status"], "failed")
 
+    def test_pr46_warmup_policy_and_explicit_overrides(self):
+        for override, expected in (
+            (None, ["16", "4"]),
+            ("3", ["3", "3"]),
+            ("0", ["0", "0"]),
+        ):
+            with self.subTest(override=override):
+                self.calls.unlink(missing_ok=True)
+                options = dict(WARMUP_MODE="pr46", BENCHMARK_PRESET="customer_pressure")
+                if override is not None:
+                    options["WARMUP_REQUESTS_OVERRIDE"] = override
+                result, calls = self.invoke(**options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(
+                    [c[c.index("--warmup-requests") + 1] for c in calls], expected
+                )
+                self.assertFalse(self.server.events)
+
     def test_invalid_matrix_does_not_start_warmup(self):
         result, calls = self.invoke(TOKEN_LIST_OVERRIDE="invalid")
         self.assertNotEqual(result.returncode, 0)

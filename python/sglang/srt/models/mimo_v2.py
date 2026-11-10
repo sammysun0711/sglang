@@ -729,6 +729,10 @@ class MiMoV2MoE(nn.Module):
 
     def _use_pyhip_moe(self, sizes: List[int]) -> bool:
         """Select the supported PyHIP TP MoE path after weight post-processing."""
+        # The fused reduction maps every TP rank's buffer through HIP IPC.
+        # A TP group spanning nodes must retain the AITER/RCCL fallback.
+        if get_global_server_args().nnodes != 1:
+            return False
         from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
 
         if self._pyhip_moe is None:

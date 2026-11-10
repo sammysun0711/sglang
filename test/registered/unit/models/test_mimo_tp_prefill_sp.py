@@ -441,8 +441,9 @@ def test_shared_swa_entry_point_keeps_tp_and_ep_execution_distinct(ep):
 
 
 @pytest.mark.parametrize("supported", [False, True])
+@pytest.mark.parametrize("nnodes", [1, 2])
 def test_tp_moe_selection_preserves_layer_and_workspace_fallbacks(
-    monkeypatch, supported
+    monkeypatch, supported, nnodes
 ):
     checks = []
     package = types.ModuleType("sglang.srt.layers.moe")
@@ -468,6 +469,7 @@ def test_tp_moe_selection_preserves_layer_and_workspace_fallbacks(
     )
     scope = dict(
         get_tp_group=lambda: SimpleNamespace(world_size=8),
+        get_global_server_args=lambda: SimpleNamespace(nnodes=nnodes),
         _mimo_sp_moe_max_rows=lambda: 4096,
     )
     exec(
@@ -485,7 +487,10 @@ def test_tp_moe_selection_preserves_layer_and_workspace_fallbacks(
         experts=SimpleNamespace(w13_weight=SimpleNamespace(shape=(256,))),
     )
     assert not scope["_use_pyhip_moe"](layer, [8192] * 8)
-    assert scope["_use_pyhip_moe"](layer, [4096] * 8) == supported
+    assert scope["_use_pyhip_moe"](layer, [4096] * 8) == (supported and nnodes == 1)
+    if nnodes != 1:
+        assert not checks
+        return
     assert checks.count("layer") == 1
     assert checks.count("workspace") == (2 if supported else 0)
 

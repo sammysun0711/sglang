@@ -9,6 +9,10 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "evaluation/run_benchmark_mimo_pro_prefill.sh"
 HELPER = ROOT / "evaluation/warmup_mimo_prefill.py"

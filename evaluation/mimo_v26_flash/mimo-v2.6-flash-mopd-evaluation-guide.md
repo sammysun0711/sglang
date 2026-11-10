@@ -162,6 +162,15 @@ TP8/DP2/EP1 and MORI/EP configurations. The implementation selects the path
 from the topology and backend. The TP path also shards residuals and MoE
 inputs; the EP path retains MORI expert dispatch/combine. Both launchers
 enable the flag by default; set it to `0` to disable their SP path.
+For eligible TP SP layers, full-attention output projection and the PyHIP
+FP8 MoE are selected internally. Unsupported MoE layouts or workspace sizes
+retain the AITER/reduce-scatter fallback; no separate ablation flags are required.
+
+The measured EP8 comparison recorded five shared-GEMM compilations during 4K
+timing with 16, 32, and 128 uniform warmup requests. The representative sequence
+recorded no timed FlyDSL compilation or initialization across 4K–1M, so it remains
+the default. These are single-trial warmup-coverage results, not a guarantee for
+unseen shapes or a model-speed improvement at every context length.
 
 ## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 

@@ -15,8 +15,12 @@ from sglang.srt.entrypoints.mimo_prefill_warmup import (
 
 
 def request(base_url, route, timeout, payload=None):
+    from sglang.bench_serving import get_auth_headers
+
     data = None if payload is None else json.dumps(payload).encode()
-    headers = {} if data is None else {"Content-Type": "application/json"}
+    headers = get_auth_headers()
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(base_url + route, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
@@ -45,14 +49,24 @@ def run(args):
         )
         base_url = f"http://{host}:{args.port}"
         info = request(base_url, "/server_info", args.timeout)
-        context = info.get("context_length")
-        if not isinstance(context, int) or context < 2:
-            raise ValueError("server_info must report context_length >= 2")
+        input_limit = info.get("max_req_input_len")
+        if input_limit is not None:
+            if type(input_limit) is not int or input_limit < 1:
+                raise ValueError("server_info must report max_req_input_len >= 1")
+            # representative_batches reserves one output token from context.
+            context = input_limit + 1
+        else:
+            context = info.get("context_length")
+            if type(context) is not int or context < 2:
+                raise ValueError(
+                    "server_info must report max_req_input_len or context_length >= 2"
+                )
         report["server"] = {
             key: info.get(key)
             for key in (
                 "model_path",
                 "context_length",
+                "max_req_input_len",
                 "tp_size",
                 "dp_size",
                 "ep_size",

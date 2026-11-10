@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from sglang.srt.entrypoints import mimo_prefill_warmup as warmup
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
@@ -47,7 +48,7 @@ class FakeManager:
             raise RuntimeError("Failure after first yield")
 
 
-class StartupWarmupTest(unittest.IsolatedAsyncioTestCase):
+class StartupWarmupTest(CustomTestCase, unittest.IsolatedAsyncioTestCase):
     async def test_flag_and_model_gate(self):
         with patch.object(warmup, "_warmup_once", new_callable=AsyncMock) as run:
             # Unset and explicit zero must return before touching model metadata.

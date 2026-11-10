@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
@@ -31,10 +32,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if not self.check_auth():
+            return
         self.server.events.append(("info", None))
-        self.reply({"context_length": self.server.context_length})
+        self.reply(
+            {
+                "context_length": self.server.context_length,
+                "max_req_input_len": self.server.max_req_input_len,
+            }
+        )
 
     def do_POST(self):
+        if not self.check_auth():
+            return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         lengths = [len(ids) for ids in body["input_ids"]]
         self.server.events.append(("generate", lengths))
@@ -51,19 +61,30 @@ class Handler(BaseHTTPRequestHandler):
             ]
         )
 
+    def check_auth(self):
+        actual = self.headers.get("Authorization")
+        self.server.auth_headers.append((self.path, actual))
+        if actual != self.server.expected_auth:
+            self.send_error(401)
+            return False
+        return True
 
-class PrefillWarmupTest(unittest.TestCase):
+
+class PrefillWarmupTest(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        cls.server = cls.thread = None
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.thread.join()
+        if cls.thread is not None and cls.thread.is_alive():
+            cls.server.shutdown()
+            cls.thread.join()
+        if cls.server is not None:
+            cls.server.server_close()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -74,6 +95,9 @@ class PrefillWarmupTest(unittest.TestCase):
         self.server.events = []
         self.server.fail = False
         self.server.context_length = 1048576
+        self.server.max_req_input_len = None
+        self.server.auth_headers = []
+        self.server.expected_auth = None
         self.python = self.directory / "record-python"
         self.python.write_text(
             "#!/usr/bin/env python3\n"
@@ -100,6 +124,8 @@ class PrefillWarmupTest(unittest.TestCase):
             WARMUP_MODE="representative",
         )
         env.pop("WARMUP_REQUESTS_OVERRIDE", None)
+        env.pop("OPENAI_API_KEY", None)
+        env.pop("API_KEY", None)
         env.update(overrides)
         result = subprocess.run(
             ["bash", str(SCRIPT)], env=env, text=True, capture_output=True
@@ -193,6 +219,41 @@ class PrefillWarmupTest(unittest.TestCase):
             lengths for event, lengths in self.server.events if event == "generate"
         ]
         self.assertEqual(batches, [[127, 127], [127]])
+
+    def test_authentication_matches_benchmark_for_both_routes(self):
+        for values, header in (
+            (
+                {"OPENAI_API_KEY": "test-openai-key", "API_KEY": "test-api-key"},
+                "Bearer test-openai-key",
+            ),
+            ({"API_KEY": "test-api-key"}, "test-api-key"),
+        ):
+            with self.subTest(values=values):
+                self.server.expected_auth = header
+                self.server.auth_headers = []
+                result, _ = self.invoke(WARMUP_REQUESTS_OVERRIDE="2", **values)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.server.auth_headers,
+                    [("/server_info", header), ("/generate", header)],
+                )
+
+    def test_effective_input_limit_overrides_optional_context(self):
+        for context in (None, 1048576):
+            with self.subTest(context=context):
+                self.server.context_length = context
+                self.server.max_req_input_len = 63
+                self.server.events = []
+                result, _ = self.invoke(WARMUP_REQUESTS_OVERRIDE="3")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [
+                        lengths
+                        for event, lengths in self.server.events
+                        if event == "generate"
+                    ],
+                    [[63, 63], [63]],
+                )
 
 
 if __name__ == "__main__":

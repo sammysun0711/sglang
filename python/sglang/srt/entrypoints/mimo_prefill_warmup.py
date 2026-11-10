@@ -10,17 +10,17 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Balanced pairs cover the measured MiMo FP8 GEMM tile-order/reduction modes.
-# Two asymmetric pairs also cover short SWA shards while the other DP group
-# keeps TP SP active. Reverse them so both DP groups initialize that variant.
+# Asymmetric pairs cover short SWA shards while the other DP group keeps SP
+# active. The final pairs cross the 16K chunk boundary to exercise cached halos.
 # Coverage is specific to the measured DP2 workload, not arbitrary topologies.
 INPUT_LENGTH_PAIRS = (
     (128, 128),
-    (257, 257),
+    (257, 6656),
     (64, 6656),
     (6656, 6656),
     (2049, 2049),
     (6656, 64),
-    (4095, 4095),
+    (6656, 257),
     (10240, 10240),
     (6145, 6145),
     (8191, 8191),
@@ -28,9 +28,82 @@ INPUT_LENGTH_PAIRS = (
     (14784, 14784),
     (15744, 15744),
     (15873, 15873),
-    (16383, 16383),
-    (16384, 16384),
+    (16385, 20480),
+    (20480, 16385),
 )
+
+
+def warmup_mimo_prefill_memory_kernels(args, model_config, pool, max_batch):
+    """Compile allocation signatures without executing kernels or touching KV.
+
+    The representative requests exercise model shapes, but their two-request
+    batches cannot cover every allocator batch bucket used by serving traffic.
+    Warm these small dtype/batch families separately in each scheduler process.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_MIMO_SWA_SP.get():
+        return
+    from sglang.srt.configs.model_config import MIMO_V2_MODEL_ARCHS
+
+    if (
+        not any(
+            a in MIMO_V2_MODEL_ARCHS
+            for a in (model_config.hf_config.architectures or [])
+        )
+        or args.disaggregation_mode == "decode"
+        or args.page_size != 64
+        or args.kv_cache_dtype != "bf16"
+    ):
+        return
+    import torch
+
+    table = pool.req_to_token
+    if torch.version.hip is None or table.device.type != "cuda":
+        return
+    if "gfx942" not in torch.cuda.get_device_properties(table.device).gcnArchName:
+        return
+    from sglang.srt.mem_cache.triton_ops.allocator import alloc_extend_kernel
+    from sglang.srt.speculative.triton_ops.cache_locs import assign_req_to_token_pool
+
+    count = 0
+    with torch.cuda.device(table.device):
+        for exponent in range((max(1, max_batch) - 1).bit_length() + 1):
+            batch_upper = 1 << exponent
+            for length_dtype in (torch.int32, torch.int64):
+                for last_dtype in (torch.int32, torch.int64):
+                    compiled = alloc_extend_kernel.warmup(
+                        length_dtype,
+                        length_dtype,
+                        last_dtype,
+                        torch.int64,
+                        torch.int64,
+                        batch_upper,
+                        args.page_size,
+                        grid=(1,),
+                    )
+                    # Materialize Triton's lazy launcher/module handles too.
+                    # Retrieving run does not invoke it or execute a GPU kernel.
+                    _ = compiled.run
+                    count += 1
+                if args.speculative_algorithm == "DFLASH":
+                    compiled = assign_req_to_token_pool.warmup(
+                        torch.int64,
+                        table,
+                        length_dtype,
+                        length_dtype,
+                        torch.int64,
+                        table.shape[1],
+                        batch_upper,
+                        grid=(1,),
+                    )
+                    _ = compiled.run
+                    count += 1
+    logger.info(
+        "MiMo prefill memory warmup: initialized %d signatures through batch %d",
+        count,
+        1 << (max(1, max_batch) - 1).bit_length(),
+    )
 
 
 def representative_batches(requests, context):

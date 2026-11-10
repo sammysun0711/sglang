@@ -1,12 +1,16 @@
 """CPU checks for gated, once-per-server representative prefill warmup."""
 
 import asyncio
+import contextlib
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+import torch
 
 from sglang.srt.entrypoints import mimo_prefill_warmup as warmup
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -118,6 +122,95 @@ class StartupWarmupTest(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                     await warmup._warmup_once(FakeManager(fail=failure), path)
                 with self.assertRaisesRegex(RuntimeError, "another worker"):
                     await warmup._warmup_once(FakeManager(), path)
+
+
+class MemoryWarmupTest(CustomTestCase):
+    def test_compiles_batch_and_dtype_families_without_launching(self):
+        calls, initialized = [], []
+
+        class Compiled:
+            @property
+            def run(self):
+                initialized.append(True)
+
+                def launch(*args, **kwargs):
+                    raise AssertionError("Memory warmup must not execute kernels")
+
+                return launch
+
+        class Kernel:
+            def __init__(self, name):
+                self.name = name
+
+            def warmup(self, *args, **kwargs):
+                calls.append((self.name, args, kwargs))
+                return Compiled()
+
+        args = SimpleNamespace(
+            page_size=64,
+            kv_cache_dtype="bf16",
+            disaggregation_mode="null",
+            speculative_algorithm="DFLASH",
+        )
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
+        )
+        table = SimpleNamespace(device=SimpleNamespace(type="cuda"), shape=(9, 32768))
+        pool = SimpleNamespace(req_to_token=table)
+        modules = {
+            "sglang.srt.configs.model_config": SimpleNamespace(
+                MIMO_V2_MODEL_ARCHS=("MiMoV2ForCausalLM",)
+            ),
+            "sglang.srt.mem_cache.triton_ops.allocator": SimpleNamespace(
+                alloc_extend_kernel=Kernel("alloc")
+            ),
+            "sglang.srt.speculative.triton_ops.cache_locs": SimpleNamespace(
+                assign_req_to_token_pool=Kernel("assign")
+            ),
+        }
+        with (
+            patch.dict(os.environ, SGLANG_ENABLE_MIMO_SWA_SP="1"),
+            patch.dict(sys.modules, modules),
+            patch.object(torch.version, "hip", "7.2"),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(gcnArchName="gfx942"),
+            ),
+            patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()),
+        ):
+            warmup.warmup_mimo_prefill_memory_kernels(args, config, pool, 5)
+        allocation = [arguments for name, arguments, _ in calls if name == "alloc"]
+        assignment = [arguments for name, arguments, _ in calls if name == "assign"]
+        self.assertEqual({a[-2] for a in allocation}, {1, 2, 4, 8})
+        self.assertEqual({a[-1] for a in assignment}, {1, 2, 4, 8})
+        self.assertEqual(
+            {(a[0], a[2]) for a in allocation},
+            {
+                (a, b)
+                for a in (torch.int32, torch.int64)
+                for b in (torch.int32, torch.int64)
+            },
+        )
+        self.assertTrue(all(a[1] is table and a[-2] == 32768 for a in assignment))
+        self.assertTrue(all(options == {"grid": (1,)} for _, _, options in calls))
+        self.assertEqual(len(initialized), len(calls))
+        self.assertIs(pool.req_to_token, table)
+
+    def test_memory_warmup_is_gated_before_gpu_access(self):
+        with patch.dict(os.environ, SGLANG_ENABLE_MIMO_SWA_SP="0"):
+            warmup.warmup_mimo_prefill_memory_kernels(None, None, None, 5)
+        args = SimpleNamespace(
+            disaggregation_mode="decode", page_size=64, kv_cache_dtype="bf16"
+        )
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
+        )
+        with patch.dict(os.environ, SGLANG_ENABLE_MIMO_SWA_SP="1"):
+            warmup.warmup_mimo_prefill_memory_kernels(args, config, None, 5)
+            args.disaggregation_mode = "null"
+            config.hf_config.architectures = ["LlamaForCausalLM"]
+            warmup.warmup_mimo_prefill_memory_kernels(args, config, None, 5)
 
 
 if __name__ == "__main__":

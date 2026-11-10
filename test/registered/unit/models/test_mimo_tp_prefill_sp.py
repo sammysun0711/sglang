@@ -144,7 +144,9 @@ def test_topology_contract(tp, dp, attn_tp, ep, a2a, enabled, expected):
     fn = load(
         "layers/moe/utils.py",
         ["should_use_dpa_sp_moe"],
-        envs=SimpleNamespace(SGLANG_ENABLE_DPA_SP=SimpleNamespace(get=lambda: enabled)),
+        envs=SimpleNamespace(
+            SGLANG_ENABLE_MIMO_SWA_SP=SimpleNamespace(get=lambda: enabled)
+        ),
         is_dp_attention_enabled=lambda: True,
         get_tensor_model_parallel_world_size=lambda: tp,
         get_attention_dp_size=lambda: dp,
@@ -154,6 +156,64 @@ def test_topology_contract(tp, dp, attn_tp, ep, a2a, enabled, expected):
         should_use_flashinfer_cutlass_moe_fp4_allgather=lambda: False,
     ).should_use_dpa_sp_moe
     assert fn() == expected
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("ep,a2a", [(1, "none"), (8, "mori")])
+def test_shared_sp_flag_selects_only_the_supported_backend(enabled, ep, a2a):
+    flags = SimpleNamespace(
+        SGLANG_ENABLE_MIMO_SWA_SP=SimpleNamespace(get=lambda: enabled),
+        SGLANG_AITER_KV_CACHE_LAYOUT=SimpleNamespace(get=lambda: "vectorized_5d"),
+    )
+    backend = SimpleNamespace(
+        is_none=lambda: a2a == "none", is_mori=lambda: a2a == "mori"
+    )
+    tp = load(
+        "layers/moe/utils.py",
+        ["should_use_dpa_sp_moe"],
+        envs=flags,
+        is_dp_attention_enabled=lambda: True,
+        get_tensor_model_parallel_world_size=lambda: 8,
+        get_attention_dp_size=lambda: 2,
+        get_attention_tp_size=lambda: 4,
+        get_moe_expert_parallel_world_size=lambda: ep,
+        get_moe_a2a_backend=lambda: backend,
+        should_use_flashinfer_cutlass_moe_fp4_allgather=lambda: False,
+    ).should_use_dpa_sp_moe
+    ep_supported = load(
+        "models/mimo_v2.py",
+        ["_mimo_ep_sp_supported"],
+        get_global_server_args=lambda: SimpleNamespace(
+            enable_two_batch_overlap=False,
+            attention_backend="aiter",
+            page_size=64,
+            kv_cache_dtype="bf16",
+            attn_cp_size=1,
+        ),
+        is_gfx942_supported=lambda: True,
+        is_dp_attention_enabled=lambda: True,
+        get_attention_tp_size=lambda: 4,
+        enable_moe_dense_fully_dp=lambda: True,
+        get_moe_a2a_backend=lambda: backend,
+        envs=flags,
+    )._mimo_ep_sp_supported
+    tree = ast.parse((SRC / "models/mimo_v2.py").read_text())
+    assignment = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "_ep_sp_swa"
+            for t in node.targets
+        )
+    )
+    attention = SimpleNamespace()
+    exec(
+        compile(ast.Module(body=[assignment], type_ignores=[]), "ep-selection", "exec"),
+        dict(self=attention, envs=flags, _mimo_ep_sp_supported=ep_supported),
+    )
+    assert tp() == (enabled and ep == 1)
+    assert attention._ep_sp_swa == (enabled and ep == 8)
 
 
 @pytest.mark.parametrize(
@@ -380,7 +440,9 @@ def test_scheduler_uses_existing_all_gather_for_uniform_prefill_flag(
         ForwardMode=Mode,
         _ENABLE_METRICS_DP_ATTENTION=False,
         get_tp_group=lambda: SimpleNamespace(active_ranks_cpu=torch.ones(8)),
-        envs=SimpleNamespace(SGLANG_ENABLE_DPA_SP=SimpleNamespace(get=lambda: enabled)),
+        envs=SimpleNamespace(
+            SGLANG_ENABLE_MIMO_SWA_SP=SimpleNamespace(get=lambda: enabled)
+        ),
     )
     info = module.MLPSyncBatchInfo(
         dp_size=2,

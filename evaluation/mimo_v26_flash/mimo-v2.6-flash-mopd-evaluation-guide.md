@@ -157,6 +157,12 @@ with **`PERFORMANCE_MODE=0`** to enable real expert routing. Set `ENABLE_DFLASH=
 for target-only accuracy or `ENABLE_DFLASH=1` for DFlash accuracy, then follow
 the GSM8K evaluation steps in section 8.
 
+`SGLANG_ENABLE_MIMO_SWA_SP` is the shared SP enable flag for both supported
+TP8/DP2/EP1 and MORI/EP configurations. The implementation selects the path
+from the topology and backend. The TP path also shards residuals and MoE
+inputs; the EP path retains MORI expert dispatch/combine. Both launchers
+enable the flag by default; set it to `0` to disable their SP path.
+
 ## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 
 The standalone fake-prefill launcher defines the Flash baseline settings:

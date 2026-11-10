@@ -118,7 +118,7 @@ class MLPSyncBatchInfo:
         # Perform only one Device-to-Host (D2H) memory copy
         # Reuse the existing metadata transfer/collective for a rank-consistent SP
         # decision. is_extend_in_batch alone also includes TARGET_VERIFY and MIXED.
-        sp_enabled = envs.SGLANG_ENABLE_DPA_SP.get()
+        sp_enabled = envs.SGLANG_ENABLE_MIMO_SWA_SP.get()
         metadata_columns = 6 if sp_enabled else 2
         cpu_data = tp0_info[:, :metadata_columns].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()

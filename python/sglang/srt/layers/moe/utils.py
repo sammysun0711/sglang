@@ -433,11 +433,11 @@ def should_use_dp_reduce_scatterv():
 
 
 def should_use_dpa_sp_moe():
-    """Sequence-parallel TP MoE under DP attention (SGLANG_ENABLE_DPA_SP, models that opt in):
+    """Sequence-parallel TP MoE under DP attention (SGLANG_ENABLE_MIMO_SWA_SP, models that opt in):
     MoE layers run on attention-TP token shards; the MoE all-gathers its FP8 input over the
     TP group and reduce-scatters its output instead of the dp_gather/all-reduce pair."""
     return (
-        envs.SGLANG_ENABLE_DPA_SP.get()
+        envs.SGLANG_ENABLE_MIMO_SWA_SP.get()
         and is_dp_attention_enabled()
         and get_tensor_model_parallel_world_size() == 8
         and get_attention_dp_size() == 2

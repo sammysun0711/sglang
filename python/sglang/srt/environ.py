@@ -521,14 +521,13 @@ class Envs:
     SGLANG_FLYPA_MIMO_PREFILL = EnvBool(False)
     # gfx942 FP8 blockscale linear kernel (e.g. for mimo fp8 qkv projection)
     SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM = EnvBool(False)
-    # MiMo EP prefill: run SWA on local token shards.
-    SGLANG_ENABLE_MIMO_SWA_SP = EnvBool(False)
-    # Opt-in MiMo Flash prefill SP on gfx942, TP8/DP2/EP1 with static converted FP8
+    # MiMo prefill SP: select the supported TP or EP path from topology/backend.
+    # EP/MORI runs SWA on local token shards. TP8/DP2/EP1 uses static converted FP8
     # experts. Residuals stay on token shards; AITER MoE uses FP8 all-gather and
     # RCCL reduce-scatter. Attention uses full-weight o_proj and SWA KV/halo exchange.
-    # Only globally agreed plain prefill (including idle replicas) may enter;
-    # decode, speculative verify, mixed batches and CUDA graphs use the original path.
-    SGLANG_ENABLE_DPA_SP = EnvBool(False)
+    # The TP path requires globally agreed plain prefill, including idle replicas.
+    # Decode, speculative verify, mixed batches and CUDA graphs keep the original path.
+    SGLANG_ENABLE_MIMO_SWA_SP = EnvBool(False)
     # Ablation: retain TP MoE/SWA SP while selecting the full-attention projection strategy.
     SGLANG_MIMO_TP_SP_FULL_OPROJ = EnvBool(True)
     SGLANG_MIMO_PREFILL_PYHIP_MOE = EnvBool(False)

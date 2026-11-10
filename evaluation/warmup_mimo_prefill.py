@@ -65,14 +65,14 @@ def run(args):
         }
         for payload in representative_batches(args.requests, context):
             count = len(payload["input_ids"])
-            length = len(payload["input_ids"][0])
+            lengths = [len(ids) for ids in payload["input_ids"]]
             started = time.time()
             outputs = request(base_url, "/generate", args.timeout, payload)
             validate_warmup_response(outputs, payload)
             report["completed"] += count
             report["batches"].append(
                 {
-                    "input_tokens": length,
+                    "input_tokens": lengths,
                     "requests": count,
                     "started": started,
                     "finished": time.time(),

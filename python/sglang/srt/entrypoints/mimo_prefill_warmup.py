@@ -9,26 +9,27 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Two requests per length exercise the two DP workers. These cover the measured
-# MiMo FP8 GEMM tile-order and split-reduction variants; they do not guarantee
-# compilation-free serving for arbitrary models, chunk sizes, or topologies.
-INPUT_LENGTHS = (
-    128,
-    257,
-    513,
-    6656,
-    2049,
-    3073,
-    4095,
-    10240,
-    6145,
-    8191,
-    12288,
-    14784,
-    15744,
-    15873,
-    16383,
-    16384,
+# Balanced pairs cover the measured MiMo FP8 GEMM tile-order/reduction modes.
+# Two asymmetric pairs also cover short SWA shards while the other DP group
+# keeps TP SP active. Reverse them so both DP groups initialize that variant.
+# Coverage is specific to the measured DP2 workload, not arbitrary topologies.
+INPUT_LENGTH_PAIRS = (
+    (128, 128),
+    (257, 257),
+    (64, 6656),
+    (6656, 6656),
+    (2049, 2049),
+    (6656, 64),
+    (4095, 4095),
+    (10240, 10240),
+    (6145, 6145),
+    (8191, 8191),
+    (12288, 12288),
+    (14784, 14784),
+    (15744, 15744),
+    (15873, 15873),
+    (16383, 16383),
+    (16384, 16384),
 )
 
 
@@ -37,9 +38,9 @@ def representative_batches(requests, context):
         raise ValueError("requests must be non-negative and context must be >= 2")
     for index in range((requests + 1) // 2):
         count = min(2, requests - index * 2)
-        length = min(INPUT_LENGTHS[index % len(INPUT_LENGTHS)], context - 1)
+        lengths = INPUT_LENGTH_PAIRS[index % len(INPUT_LENGTH_PAIRS)][:count]
         yield {
-            "input_ids": [[100] * length for _ in range(count)],
+            "input_ids": [[100] * min(length, context - 1) for length in lengths],
             "sampling_params": {
                 "temperature": 0.0,
                 "top_p": 1.0,
@@ -95,9 +96,9 @@ async def _run_representative_prefill(tokenizer_manager):
             pass
         validate_warmup_response(outputs, payload)
         logger.info(
-            "MiMo representative startup warmup: %d/32 requests, input length %d",
+            "MiMo representative startup warmup: %d/32 requests, input lengths %s",
             (index + 1) * 2,
-            len(payload["input_ids"][0]),
+            [len(ids) for ids in payload["input_ids"]],
         )
     result = await tokenizer_manager.flush_cache()
     if not result.success:

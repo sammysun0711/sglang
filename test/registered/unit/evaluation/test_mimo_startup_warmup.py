@@ -72,8 +72,8 @@ class StartupWarmupTest(unittest.IsolatedAsyncioTestCase):
         await warmup._run_representative_prefill(manager)
         self.assertEqual(len(manager.requests), 16)
         self.assertEqual(
-            [len(req.input_ids[0]) for req in manager.requests],
-            list(warmup.INPUT_LENGTHS),
+            [tuple(len(ids) for ids in req.input_ids) for req in manager.requests],
+            list(warmup.INPUT_LENGTH_PAIRS),
         )
         self.assertEqual(sum(len(req.input_ids) for req in manager.requests), 32)
         self.assertEqual(manager.flush_cache.await_count, 17)

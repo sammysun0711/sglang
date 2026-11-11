@@ -297,15 +297,21 @@ class Mxfp4AiterEpA8W4MoEMethod:
                 "SGLANG_MORI_DISPATCH_DTYPE=fp8 (default) or bf16."
             )
 
-        capacity = x.shape[0]
+        true_capacity = x.shape[0]
         mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
+        compute_capacity = true_capacity
         if mori_max > 0:
-            capacity = min(capacity, mori_max)
-        rows, est = _mori_token_bounds(capacity, total_recv)
+            compute_capacity = min(true_capacity, mori_max)
+        rows, est = _mori_token_bounds(compute_capacity, total_recv)
 
-        # Sized by the capacity (as AITER's moe_buf) so MORI combine, which reads
-        # rows [0, total_recv), never leaves the buffer; only ``rows`` are computed.
-        out = torch.empty((capacity, x.shape[1]), dtype=torch.bfloat16, device=x.device)
+        # IMPORTANT: Allocate `out` to the true MORI receive-buffer capacity so the
+        # MORI combine stage (which may read rows [0, total_recv)) never indexes
+        # beyond the buffer. Only the first `rows` are actually computed below.
+        out = torch.empty(
+            (true_capacity, x.shape[1]),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
         if rows > 0:
             topk_ids = topk_ids[:rows].to(torch.int32)
             topk_weights = topk_weights[:rows].to(torch.float32)

@@ -10,8 +10,8 @@ set -euo pipefail
 # Local MoE shape: model_dim=4096, inter_dim=2048, expert=32, topk=8.
 # The EP1/TP8 adaptive CSV has different shapes and must not be reused here.
 # Set SGLANG_MXFP4_TO_FP8_128BLOCK=1 for static FP8 blockscale conversion.
-# MORI normal + SDMA=0 uses IntraNode. MANUAL is the untuned decode baseline;
-# AUTO requires an explicitly supplied decode JSON, not the prefill tuning file.
+# MORI normal + SDMA=0 with BF16 dispatch/combine defaults to tuned IntraNode AUTO.
+# MORI_EP_LAUNCH_CONFIG_MODE=MANUAL restores the untuned decode baseline.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EVALUATION_DIR="$(dirname -- "${SCRIPT_DIR}")"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -136,11 +136,17 @@ export SGLANG_SIMULATE_ACC_LEN=3.5
 export SGLANG_SIMULATE_ACC_METHOD=match-expected
 
 export MORI_MODE="${MORI_MODE:-normal}"
-export MORI_EP_LAUNCH_CONFIG_MODE="${MORI_EP_LAUNCH_CONFIG_MODE:-MANUAL}"
 export MORI_SHMEM_MODE="${MORI_SHMEM_MODE:-ISOLATION}"
 export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-0}"
 export SGLANG_MORI_DISPATCH_DTYPE="${SGLANG_MORI_DISPATCH_DTYPE:-${mori_dispatch_dtype_default}}"
 export SGLANG_MORI_COMBINE_DTYPE="${SGLANG_MORI_COMBINE_DTYPE:-bf16}"
+# These configs cover normal/BF16 only; alternate kernels/dtypes retain MANUAL.
+mori_launch_config_default=MANUAL
+if [[ "${MORI_MODE}" == "normal" && "${MORI_ENABLE_SDMA}" == "0" &&
+      "${SGLANG_MORI_DISPATCH_DTYPE}" == "bf16" && "${SGLANG_MORI_COMBINE_DTYPE}" == "bf16" ]]; then
+  mori_launch_config_default=AUTO
+fi
+export MORI_EP_LAUNCH_CONFIG_MODE="${MORI_EP_LAUNCH_CONFIG_MODE:-${mori_launch_config_default}}"
 unset MORI_DISABLE_P2P
 case "${MORI_MODE}" in
   normal|low_latency|auto) ;;
@@ -149,8 +155,44 @@ esac
 case "${MORI_EP_LAUNCH_CONFIG_MODE}" in
   MANUAL) ;;
   AUTO)
-    if [[ -z "${MORI_EP_TUNING_CONFIG:-}" || ! -r "${MORI_EP_TUNING_CONFIG}" ]]; then
-      echo "MORI AUTO requires MORI_EP_TUNING_CONFIG pointing to a readable decode JSON" >&2
+    if [[ "${mori_launch_config_default}" != "AUTO" ]]; then
+      echo "Bundled MORI AUTO configs require normal, SDMA=0, and BF16 dispatch/combine; use MANUAL for other configurations" >&2
+      exit 2
+    fi
+    # Official MORI v1.2.4, commit f39fa765e897c95995957d0518908cc982a88fc2:
+    # Tune with MORI_EP_LAUNCH_CONFIG_MODE=MANUAL, MORI_ENABLE_SDMA=0,
+    # MORI_SHMEM_MODE=ISOLATION, and MORI_EP_TUNING_CONFIG unset.
+    # tools/batch_intranode_tuning.sh --world-size 8 --tokens-list <M> \
+    #   --hidden-dims 4096 --dtype bf16 --combine-dtype bf16 --zero-copy 0 \
+    #   --quant-type none --scale-dim 0 --num-experts-per-rank 32 \
+    #   --num-experts-per-token 8 --kernel-type IntraNode --routing random \
+    #   --shmem-mode ISOLATION --tuning-scope full --config-output <out>/official.json --timeout 7200
+    # Each phase file merges unchanged rules/measurements from 12 official runs:
+    # M=24,48,80,192,304,416,480,512,520,544,576,600; single-DP BS=M/2
+    # with DFlash block8 / attention TP4. No hand-selected launch parameters.
+    # MORI_EP_TUNING_CONFIG overrides BOTH phases with one file. Unset it so
+    # MORI loads distinct dispatch/combine configs via its native filenames.
+    if [[ -n "${MORI_EP_TUNING_CONFIG:-}" ]]; then
+      echo "Ignoring MORI_EP_TUNING_CONFIG=${MORI_EP_TUNING_CONFIG}; using the bundled decode phase configs"
+    fi
+    unset MORI_EP_TUNING_CONFIG
+    mori_decode_config_prefix="${SCRIPT_DIR}/gfx942_mi300x_mimo_v26_flash_ep8_bf16_mori_decode"
+    for phase in dispatch combine; do
+      if [[ ! -r "${mori_decode_config_prefix}_${phase}.json" ]]; then
+        echo "MORI ${phase} config is not readable: ${mori_decode_config_prefix}_${phase}.json" >&2
+        exit 2
+      fi
+    done
+    # Locate the pip-installed package with the server's Python interpreter;
+    # no MORI source checkout or GPU runtime import is needed.
+    mori_package_tuning_dir="$("${PYTHON_BIN}" - <<'PY'
+from importlib.metadata import distribution
+
+print(distribution("amd_mori").locate_file("mori/ops/tuning_configs"))
+PY
+)"
+    if [[ ! -d "${mori_package_tuning_dir}" ]]; then
+      echo "MORI tuning directory is missing: ${mori_package_tuning_dir} (expected amd_mori==1.2.4)" >&2
       exit 2
     fi
     ;;
@@ -279,6 +321,11 @@ echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; compact draft t
 echo "Simulated acceptance: expected bonus-inclusive length=${SGLANG_SIMULATE_ACC_LEN}, method=${SGLANG_SIMULATE_ACC_METHOD} (throughput only)"
 echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
 echo "MORI: mode=${MORI_MODE}, sdma=${MORI_ENABLE_SDMA}, launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tuning-config=${MORI_EP_TUNING_CONFIG:-unset} (AUTO only), dispatch=${SGLANG_MORI_DISPATCH_DTYPE}, combine=${SGLANG_MORI_COMBINE_DTYPE}, capacity/rank=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}"
+if [[ "${MORI_EP_LAUNCH_CONFIG_MODE}" == "AUTO" ]]; then
+  for phase in dispatch combine; do
+    echo "MORI ${phase} config: ${mori_decode_config_prefix}_${phase}.json -> ${mori_package_tuning_dir}/gfx942_mi300x_IntraNode_ep8_${phase}.json"
+  done
+fi
 echo "Expert routing: fake (throughput only)"
 echo "Decode: preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, log-interval=${DECODE_LOG_INTERVAL}, watchdog=${WATCHDOG_TIMEOUT}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}"
 echo "Quick Reduce: disabled; mixed-router=${SGLANG_MIMO_MIXED_ROUTER}; custom all-reduce=${custom_all_reduce_status}; radix cache=${radix_cache_status}; tbo=${ENABLE_TWO_BATCH_OVERLAP}"
@@ -335,6 +382,16 @@ printf ' %q' "${server_cmd[@]}"
 printf '\n'
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
+fi
+
+# Replace the installed package's same-name defaults in this Python environment.
+# Keep MORI's native destination names: they distinguish the two BF16 phases.
+# Copy on every AUTO launch; MANUAL and DRY_RUN do not modify the package.
+if [[ "${MORI_EP_LAUNCH_CONFIG_MODE}" == "AUTO" ]]; then
+  for phase in dispatch combine; do
+    cp -- "${mori_decode_config_prefix}_${phase}.json" \
+      "${mori_package_tuning_dir}/gfx942_mi300x_IntraNode_ep8_${phase}.json"
+  done
 fi
 
 mkdir -p -- "${LOG_DIR}"

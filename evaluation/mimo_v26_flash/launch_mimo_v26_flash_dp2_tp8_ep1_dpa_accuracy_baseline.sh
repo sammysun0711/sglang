@@ -57,6 +57,7 @@ export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
 # DPA divides both limits by DP2: 16K prefill and 48 requests/group.
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.75}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-1048576}"
 CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -113,7 +114,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
   --max-prefill-tokens 1048576 --context-length 1048576
-  --mem-fraction-static "${MEM_FRACTION_STATIC:-0.75}"
+  --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO:-0.03}"
   --disable-radix-cache
   --cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}"

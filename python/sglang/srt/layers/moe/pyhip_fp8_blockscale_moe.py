@@ -53,6 +53,7 @@ from sglang.srt.layers.quantization.pyhip_fp8_blockscale_gemm import (
     _wait,
     flydsl_disk_cache,
 )
+from sglang.srt.utils import is_gfx942_supported
 
 logger = logging.getLogger(__name__)
 
@@ -2178,7 +2179,7 @@ def supports_layer(layer, tp_size: int) -> bool:
         return False
     experts = w13.shape[0]
     return (
-        "gfx942" in torch.cuda.get_device_properties(w13.device).gcnArchName
+        is_gfx942_supported()
         and tp_size == RANKS
         and experts <= SORT_THREADS
         and cfg.top_k == TOPK

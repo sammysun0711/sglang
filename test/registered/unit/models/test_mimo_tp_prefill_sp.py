@@ -78,8 +78,8 @@ def test_moe_collective_decision_is_identical_on_idle_and_active_replicas(
     modes, sizes, expected
 ):
     fn = load(
-        "models/mimo_v2.py",
-        ["_mimo_sp_moe_active"],
+        "layers/moe/mimo_sp.py",
+        ["mimo_tp_sp_active"],
         ForwardMode=Mode,
         torch=SimpleNamespace(
             cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)
@@ -87,7 +87,7 @@ def test_moe_collective_decision_is_identical_on_idle_and_active_replicas(
         get_dp_global_num_tokens=lambda: sizes,
         _MIMO_SP_MIN_TOKENS=2048,
         _log_mimo_tp_sp=lambda: None,
-    )._mimo_sp_moe_active
+    ).mimo_tp_sp_active
     decisions = [
         fn(
             SimpleNamespace(
@@ -114,8 +114,8 @@ def test_moe_collective_decision_is_identical_on_idle_and_active_replicas(
 )
 def test_stale_prefill_flag_cannot_enable_decode_capture_or_tbo(mode, capturing, tbo):
     fn = load(
-        "models/mimo_v2.py",
-        ["_mimo_sp_moe_active"],
+        "layers/moe/mimo_sp.py",
+        ["mimo_tp_sp_active"],
         ForwardMode=Mode,
         torch=SimpleNamespace(
             cuda=SimpleNamespace(is_current_stream_capturing=lambda: capturing)
@@ -123,7 +123,7 @@ def test_stale_prefill_flag_cannot_enable_decode_capture_or_tbo(mode, capturing,
         get_dp_global_num_tokens=lambda: [16384, 16384],
         _MIMO_SP_MIN_TOKENS=2048,
         _log_mimo_tp_sp=lambda: None,
-    )._mimo_sp_moe_active
+    ).mimo_tp_sp_active
     assert not fn(
         SimpleNamespace(forward_mode=mode, all_extend_in_batch=True, can_run_tbo=tbo)
     )
@@ -258,8 +258,8 @@ def test_unsupported_runtime_keeps_original_layout(changed, value):
     if changed:
         settings[changed] = value
     fn = load(
-        "models/mimo_v2.py",
-        ["_mimo_sp_attn_enabled"],
+        "layers/moe/mimo_sp.py",
+        ["mimo_tp_sp_enabled"],
         should_use_dpa_sp_moe=lambda: True,
         get_global_server_args=lambda: SimpleNamespace(**settings),
         is_gfx942_supported=lambda: settings["gfx942"],
@@ -276,7 +276,7 @@ def test_unsupported_runtime_keeps_original_layout(changed, value):
                 get=lambda: settings["layout"]
             ),
         ),
-    )._mimo_sp_attn_enabled
+    ).mimo_tp_sp_enabled
     assert fn() == (changed is None)
 
 
@@ -286,7 +286,7 @@ def test_unsupported_runtime_keeps_original_layout(changed, value):
 @pytest.mark.parametrize("groups", [1, 32])
 def test_fp8_column_major_scales_preserve_rank_and_token_order(sizes, groups):
     fn = load(
-        "models/mimo_v2.py", ["_mimo_sp_moe_gather_scales"]
+        "layers/moe/mimo_sp.py", ["_mimo_sp_moe_gather_scales"]
     )._mimo_sp_moe_gather_scales
     logical = [
         torch.arange(n * groups, dtype=torch.float32).view(n, groups) + r * 10000
@@ -453,41 +453,19 @@ def test_tp_moe_selection_preserves_layer_and_workspace_fallbacks(
         or max(sizes) <= cap,
     )
     monkeypatch.setitem(sys.modules, package.__name__, package)
-    tree = ast.parse((SRC / "models/mimo_v2.py").read_text())
-    cls = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MiMoV2MoE"
-    )
-    method = next(
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_use_pyhip_moe"
-    )
-    future = ast.ImportFrom(
-        module="__future__", names=[ast.alias(name="annotations")], level=0
-    )
-    scope = dict(
+    module = load(
+        "layers/moe/mimo_sp.py",
+        ["_use_pyhip_moe"],
         get_tp_group=lambda: SimpleNamespace(world_size=8),
         get_global_server_args=lambda: SimpleNamespace(nnodes=nnodes),
         _mimo_sp_moe_max_rows=lambda: 4096,
-    )
-    exec(
-        compile(
-            ast.fix_missing_locations(
-                ast.Module(body=[future, method], type_ignores=[])
-            ),
-            "moe-selection",
-            "exec",
-        ),
-        scope,
     )
     layer = SimpleNamespace(
         _pyhip_moe=None,
         experts=SimpleNamespace(w13_weight=SimpleNamespace(shape=(256,))),
     )
-    assert not scope["_use_pyhip_moe"](layer, [8192] * 8)
-    assert scope["_use_pyhip_moe"](layer, [4096] * 8) == (supported and nnodes == 1)
+    assert not module._use_pyhip_moe(layer, [8192] * 8)
+    assert module._use_pyhip_moe(layer, [4096] * 8) == (supported and nnodes == 1)
     if nnodes != 1:
         assert not checks
         return
@@ -572,6 +550,161 @@ def test_empty_tp_moe_does_not_allocate_or_advance_ipc_epoch():
     reducer.epoch = 7
     output = reducer(x, None, [0] * 8)
     assert output.shape == x.shape and reducer.epoch == 7
+
+
+@pytest.mark.parametrize("ep", [False, True])
+def test_full_attention_and_ep_skip_tp_weight_reassembly(monkeypatch, ep):
+    def forbidden(*args):
+        raise AssertionError("Full attention and EP must not gather TP SWA weights")
+
+    package = types.ModuleType("sglang.srt.layers.attention.mimo_sp")
+    package._mimo_attn_tp_gather = forbidden
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    cls = load("models/mimo_v2.py", ["MiMoV2Attention"], nn=torch.nn).MiMoV2Attention
+    existing = object() if ep else None
+    layer = SimpleNamespace(
+        _ep_sp_swa=ep,
+        qkv_proj_full=object() if ep else None,
+        o_proj_full=existing,
+    )
+    cls.build_sp_weights(layer)
+    assert layer.o_proj_full is existing
+
+
+@pytest.mark.parametrize("rows,columns", [(3712, 2), (29, 32)])
+def test_tp_swa_weight_assembly_preserves_projection_and_qkv_order(
+    monkeypatch, rows, columns
+):
+    class Unquantized:
+        pass
+
+    tp = 4
+
+    def gather(value):
+        return torch.cat([value + rank * 100000 for rank in range(tp)])
+
+    package = types.ModuleType("sglang.srt.layers.attention.mimo_sp")
+    package._mimo_attn_tp_gather = gather
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    module = load(
+        "models/mimo_v2.py",
+        ["MiMoV2Attention", "_mimo_reorder_fused_qkv"],
+        nn=torch.nn,
+        UnquantizedLinearMethod=Unquantized,
+        get_attention_tp_size=lambda: tp,
+    )
+    shard = torch.arange(rows * columns, dtype=torch.float32).view(rows, columns)
+    full = torch.empty(tp * rows, columns)
+    projection = torch.arange(12, dtype=torch.float32).view(3, 4)
+    layer = SimpleNamespace(
+        _ep_sp_swa=False,
+        qkv_proj=SimpleNamespace(named_parameters=lambda: [("weight", shard)]),
+        qkv_proj_full=SimpleNamespace(named_parameters=lambda: [("weight", full)]),
+        o_proj=SimpleNamespace(weight=projection, quant_method=Unquantized()),
+        attention_sink_bias=None,
+        q_size=3072,
+        k_size=384,
+        v_size=256,
+    )
+    module.MiMoV2Attention.build_sp_weights(layer)
+    parts = [rows * size // 3712 for size in (3072, 384, 256)]
+    rank_parts = [(shard + rank * 100000).split(parts) for rank in range(tp)]
+    expected = torch.cat([torch.cat(group) for group in zip(*rank_parts)])
+    torch.testing.assert_close(full, expected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        layer.o_proj_full,
+        torch.cat([projection + rank * 100000 for rank in range(tp)], dim=1),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("mode", ["tp_full", "tp_swa", "ep_swa"])
+def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
+    calls = []
+    swa = mode != "tp_full"
+    local_rows = 4 if swa else 2
+
+    def reduce_scatter(output, value):
+        calls.append(("reduce_scatter", "attn_tp"))
+        output.copy_((4 * value)[:local_rows])
+
+    communication = load(
+        "layers/communicator.py",
+        ["ScatterMode", "CommunicateWithAllReduceAndLayerNormFn"],
+        Enum=enum.Enum,
+        attn_tp_reduce_scatter_tensor=reduce_scatter,
+    )
+
+    def communicator(name):
+        def prepare_attn(x, residual, batch, **kwargs):
+            calls.append((name, "attn"))
+            if name == "swa":
+                return x[:local_rows], residual[:local_rows]
+            return x, residual
+
+        def prepare_mlp(x, residual, batch, **kwargs):
+            calls.append((name, "mlp"))
+            if name == "swa":
+                return x, residual
+            return communication.CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual(
+                x,
+                residual,
+                batch,
+                lambda value, skip: (value + skip, skip),
+                SimpleNamespace(attn_tp_size=4, attn_tp_rank=0),
+                residual_input_mode=communication.ScatterMode.TP_ATTN_FULL,
+            )
+
+        return SimpleNamespace(
+            prepare_attn_and_capture_last_layer_outputs=prepare_attn,
+            prepare_mlp=prepare_mlp,
+            should_fuse_mlp_allreduce_with_next_layer=lambda batch: False,
+            should_use_reduce_scatter=lambda batch: False,
+            postprocess_layer=lambda x, residual, batch: (x, residual),
+        )
+
+    class Attention:
+        _ep_sp_swa = mode == "ep_swa"
+        o_proj_full = object() if swa else None
+
+        def __call__(self, positions, hidden_states, forward_batch, sp_swa):
+            assert sp_swa == swa
+            return hidden_states + 1
+
+    def moe(x, batch, fused, reduce_scatter):
+        assert x.shape[0] == local_rows
+        return x + 2
+
+    cls = load(
+        "models/mimo_v2.py",
+        ["MiMoV2DecoderLayer"],
+        nn=torch.nn,
+        ForwardMode=Mode,
+        mimo_tp_sp_active=lambda batch: True,
+        _mimo_ep_sp_active=lambda batch: True,
+        _mimo_hidden_num_tokens=lambda x: x.shape[0],
+    ).MiMoV2DecoderLayer
+    layer = SimpleNamespace(
+        layer_communicator=communicator("normal"),
+        layer_communicator_sp=None if mode == "ep_swa" else communicator("tp"),
+        layer_communicator_sp_attn=communicator("swa") if swa else None,
+        self_attn=Attention(),
+        _fused_rms_qkv_quant_format="",
+        _prefill_moe_quant_format=lambda batch: "",
+        mlp=moe,
+    )
+    x = torch.arange(32, dtype=torch.float32).view(8, 4)
+    residual = torch.zeros_like(x)
+    batch = SimpleNamespace(forward_mode=Mode.EXTEND, extend_seq_lens_cpu=[8])
+    output, _ = cls.forward(layer, torch.arange(8), x, batch, residual)
+    selected = "swa" if swa else "tp"
+    expected_calls = [(selected, "attn"), (selected, "mlp")]
+    if not swa:
+        expected_calls.append(("reduce_scatter", "attn_tp"))
+    assert calls == expected_calls
+    expected = x[:local_rows] + 3 if swa else 4 * (x[:local_rows] + 1) + 2
+    torch.testing.assert_close(output, expected)
 
 
 if __name__ == "__main__":

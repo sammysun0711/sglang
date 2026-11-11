@@ -142,15 +142,19 @@ LOG_DIR=./logs/mimo_v26_flash_dp2_tp8_ep8_dpa_prefill \
 ```
 
 The client keeps `TOKENIZE_PROMPT=0` by default and uses the preset's input
-lengths, concurrency, and request counts. `WARMUP_MODE=representative` (default)
-sends 32 requests in varied-length pairs once before the matrix, followed by
-zero additional warmups in each timed client. `WARMUP_MODE=pr46` selects 16
-concurrent uniform warmups at the 4K point and four at other points.
-`WARMUP_MODE=uniform` uses four at every point. `WARMUP_REQUESTS_OVERRIDE`
-overrides the selected mode's count; zero disables warmup. Each point flushes
-the cache before measurement. The client reports TTFT and input token
-throughput for the whole server. Compare warmup modes using separate empty
-kernel-cache directories and distinguish compiler calls from cache loads.
+lengths, concurrency, and request counts. Client warmup defaults to 16 uniform
+requests for the `customer_pressure` 4K point and four elsewhere.
+`WARMUP_REQUESTS_OVERRIDE` overrides this count; zero disables client warmup.
+Each point flushes the cache before measurement. The client reports TTFT and
+input-token throughput for the whole server. There is no warmup-mode selector;
+set `WARMUP_REQUESTS_OVERRIDE=4` to use four client requests at every point.
+
+With `SGLANG_ENABLE_MIMO_SWA_SP=1`, the server executes the 32 representative
+prefill requests once before HTTP readiness, shared across tokenizer workers.
+Unset or `0` skips this sequence. To reproduce the earlier startup-only warmup 
+protocol, use `WARMUP_REQUESTS_OVERRIDE=0`. `--skip-server-warmup` controls the 
+generic smoke request independently of this SP-gated representative warmup. 
+Record warmup counts and distinguish compiler calls from cache loads in performance results.
 
 For **accuracy tests**, stop the performance server and rerun the launch command
 with **`PERFORMANCE_MODE=0`** to enable real expert routing. Set `ENABLE_DFLASH=0`
@@ -162,15 +166,10 @@ TP8/DP2/EP1 and MORI/EP configurations. The implementation selects the path
 from the topology and backend. The TP path also shards residuals and MoE
 inputs; the EP path retains MORI expert dispatch/combine. Both launchers
 enable the flag by default; set it to `0` to disable their SP path.
-For eligible TP SP layers, full-attention output projection and the PyHIP
-FP8 MoE are selected internally. Unsupported MoE layouts or workspace sizes
-retain the AITER/reduce-scatter fallback; no separate ablation flags are required.
-
-The measured EP8 comparison recorded five shared-GEMM compilations during 4K
-timing with 16, 32, and 128 uniform warmup requests. The representative sequence
-recorded no timed FlyDSL compilation or initialization across 4K–1M, so it remains
-the default. These are single-trial warmup-coverage results, not a guarantee for
-unseen shapes or a model-speed improvement at every context length.
+Eligible TP SP layers select the PyHIP FP8 MoE internally. Unsupported MoE
+layouts or workspace sizes retain the AITER/reduce-scatter fallback. Full
+attention uses the ordinary output projection and communicator reduction;
+SWA retains its full-head projection.
 
 ## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 

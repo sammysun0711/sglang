@@ -13,12 +13,10 @@ set -euo pipefail
 # --flush-cache below does not disable the server's radix cache.
 #
 # DRY_RUN=1 prints commands without contacting the server or creating logs.
-# WARMUP_MODE=representative (default) sends 32 paired requests with varied
-# lengths once before the matrix, outside timing. The standard per-case warmup
-# is then zero. WARMUP_MODE=uniform restores the legacy 4 warmups per case.
-# WARMUP_MODE=pr46 uses 16 warmups for customer_pressure 4K and 4 elsewhere.
-# WARMUP_REQUESTS_OVERRIDE changes the count; 0 disables warmup. Representative
-# warmup covers known first-use variants, not every possible runtime shape.
+# Client warmup defaults to 16 requests for customer_pressure 4K and 4 elsewhere.
+# WARMUP_REQUESTS_OVERRIDE changes the client count; 0 disables client warmup.
+# The 32 representative prefill requests run during server startup when
+# SGLANG_ENABLE_MIMO_SWA_SP=1; this client does not repeat that sequence.
 # BENCHMARK_PRESET=sweep restores the previous matrix and prompt-count policy.
 # BENCHMARK_PRESET=simple uses 64 measured prompts per input, OSL=1, and
 # concurrency 16/16/12/3/2/2/2/2/2/2 for 4K/8K/16K/32K/64K/128K/256K/512K/768K/1M.
@@ -39,12 +37,6 @@ model="${MODEL:-/models/MiMo-V2.6-Flash-MOPD}"
 host="${HOST:-0.0.0.0}"
 port="${PORT:-30001}"
 dataset_path="${DATASET_PATH:-}"
-warmup_mode="${WARMUP_MODE:-representative}"
-case "${warmup_mode}" in
-  representative) default_warmup_requests=32 ;;
-  uniform|pr46) default_warmup_requests=4 ;;
-  *) echo "WARMUP_MODE must be representative, uniform, or pr46, observed '${warmup_mode}'" >&2; exit 2 ;;
-esac
 declare -A matrix_output_tokens matrix_num_prompts matrix_concurrency
 case "${benchmark_preset}" in
   customer_pressure)
@@ -132,7 +124,7 @@ output_tokens=1
 small_input_concurrency_list="${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_small_concurrency}}}"
 short_concurrency_list="${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_short_concurrency}}"
 long_concurrency_list="${LONG_CONCURRENCY_LIST_OVERRIDE:-${default_long_concurrency}}"
-warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-${default_warmup_requests}}"
+warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
 tokenize_prompt="${TOKENIZE_PROMPT:-0}"
 small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-${default_small_num_prompts}}"
 prompt_waves="${PROMPT_WAVES:-4}"
@@ -256,9 +248,9 @@ done
 
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 echo "Dataset: ${dataset_path:-standard ShareGPT cache/download}; tokenize-prompt=${tokenize_prompt}"
-echo "Warmup: ${warmup_mode}; requests=${warmup_requests}"
-if [[ "${warmup_mode}" == "pr46" && "${benchmark_preset}" == "customer_pressure" ]]; then
-  echo "PR46 warmup policy: 4K=${WARMUP_REQUESTS_OVERRIDE:-16}, others=${warmup_requests}."
+echo "Client warmup requests: ${warmup_requests}"
+if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
+  echo "Client warmup policy: 4K=${WARMUP_REQUESTS_OVERRIDE:-16}, others=${warmup_requests}."
 fi
 if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
   echo "Client matrix: benchmark_sglang_prefill.sh active arrays."
@@ -281,22 +273,6 @@ if [[ "${dry_run}" == "0" ]]; then
   mkdir -p "$LOG_DIR"
 fi
 
-benchmark_warmup_requests="${warmup_requests}"
-if [[ "${warmup_mode}" == "representative" ]]; then
-  benchmark_warmup_requests=0
-  if (( warmup_requests > 0 )); then
-    warmup_cmd=("${PYTHON_BIN}" "${SCRIPT_DIR}/warmup_mimo_prefill.py"
-        --host "${host}" --port "${port}" --requests "${warmup_requests}"
-        --output "${LOG_DIR}/prefill_warmup.json")
-    printf 'Warmup command:'
-    printf ' %q' "${warmup_cmd[@]}"
-    printf '\n'
-    if [[ "${dry_run}" == "0" ]]; then
-      "${warmup_cmd[@]}" 2>&1 | tee "${LOG_DIR}/prefill_warmup.log"
-    fi
-  fi
-fi
-
 test_count=0
 failed_cases=()
 for input_tokens in "${TOKEN_LIST[@]}"; do
@@ -306,9 +282,8 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
   read -r -a concurrency_list <<< "$(concurrency_spec_for_input "${input_tokens}")"
   for concurrency in "${concurrency_list[@]}"; do
     num_prompts="$(num_prompts_for_input "${input_tokens}" "${concurrency}")"
-    current_warmup="${benchmark_warmup_requests}"
-    if [[ "${warmup_mode}" == "pr46" &&
-          "${benchmark_preset}" == "customer_pressure" &&
+    current_warmup="${warmup_requests}"
+    if [[ "${benchmark_preset}" == "customer_pressure" &&
           "${input_tokens}" == "4096" &&
           -z "${WARMUP_REQUESTS_OVERRIDE:-}" ]]; then
       current_warmup=16

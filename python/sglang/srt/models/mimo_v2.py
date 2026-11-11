@@ -12,9 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
 import logging
-from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -65,10 +63,15 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
-    should_use_dpa_sp_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.mimo_sp import (
+    mimo_tp_sp_active,
+    mimo_tp_sp_enabled,
+    run_mimo_tp_sp_moe,
+)
+from sglang.srt.layers.moe.mimo_sp import split_mimo_moe_inputs as _mimo_moe_inputs
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -142,14 +145,6 @@ def _mimo_hidden_num_tokens(hidden_states) -> int:
     return states.shape[0]
 
 
-def _mimo_moe_inputs(hidden_states):
-    """Split fused MiMo MLP input into router BF16 and FMoE activation."""
-    if isinstance(hidden_states, tuple) and len(hidden_states) == 3:
-        normalized, quantized, scale = hidden_states
-        return normalized, (quantized, scale)
-    return hidden_states, hidden_states
-
-
 def _mimo_ep_sp_supported() -> bool:
     args = get_global_server_args()
     return (
@@ -180,117 +175,6 @@ def _mimo_ep_sp_active(forward_batch: ForwardBatch) -> bool:
     return sizes is not None and sum(sizes) >= 2048
 
 
-def _mimo_sp_moe_sizes() -> List[int]:
-    """Token rows per TP rank under SGLANG_ENABLE_MIMO_SWA_SP: TP rank d * attn_tp + r holds the
-    r-th of attn_tp equal slices of DP group d's (attn_tp-aligned) tokens."""
-    attn_tp = get_attention_tp_size()
-    return [n // attn_tp for n in get_dp_global_num_tokens() for _ in range(attn_tp)]
-
-
-_MIMO_SP_MIN_TOKENS = 2048
-
-
-def _mimo_sp_moe_max_rows() -> int:
-    """Rows per rank of the PyHIP fused reduce-scatter buffer: one prefill chunk's shard
-    (chunked_prefill_size is per DP group), at most 8192 (1 GiB). Larger shards fall back.
-    """
-    chunk = get_global_server_args().chunked_prefill_size
-    rows = -(-chunk // get_attention_tp_size()) if chunk and chunk > 0 else 8192
-    return min(8192, -(-rows // 1024) * 1024)
-
-
-@functools.lru_cache(maxsize=1)
-def _log_mimo_tp_sp():
-    logger.info("Using MiMo TP prefill sequence parallel (TP8/DP2/EP1, static FP8)")
-
-
-@functools.lru_cache(maxsize=1)
-def _log_mimo_prefill_pyhip_moe():
-    logger.info("Using PR40 PyHIP FP8 prefill MoE with fused reduce-scatter")
-
-
-def _mimo_sp_moe_active(forward_batch: Optional[ForwardBatch]) -> bool:
-    """Use the SGLANG_ENABLE_MIMO_SWA_SP layout for this forward: the same decision on every rank
-    and layer (global token count); small passes and graph capture keep the all-reduce path.
-    """
-    if (
-        forward_batch is None
-        or not forward_batch.all_extend_in_batch
-        or forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.IDLE)
-        or forward_batch.can_run_tbo
-        or torch.cuda.is_current_stream_capturing()
-    ):
-        return False
-    sizes = get_dp_global_num_tokens()
-    active = (
-        sizes is not None
-        and len(sizes) == 2
-        and all(n >= 0 and n % 4 == 0 for n in sizes)
-        and sum(sizes) >= _MIMO_SP_MIN_TOKENS
-    )
-    if active:
-        _log_mimo_tp_sp()
-    return active
-
-
-def _mimo_sp_moe_quant(hidden_states: torch.Tensor):
-    """FP8 per-1x128 quantization with AITER's column-major scale storage: the same
-    kernel aiter.fused_moe applies to a BF16 input, so gathering it is lossless."""
-    from aiter.ops.quant import per_group_quant_hip
-
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-
-    return per_group_quant_hip(
-        hidden_states, quant_dtype=fp8_dtype, group_size=128, transpose_scale=True
-    )
-
-
-def _mimo_sp_moe_gather_scales(scale: torch.Tensor, sizes: List[int]) -> torch.Tensor:
-    """Per-rank column-major [rows, groups] scale blocks -> one column-major [N, groups]."""
-    groups = scale.shape[1]
-    total = sum(sizes)
-    if total == 0:
-        return scale
-    if all(size == sizes[0] for size in sizes):
-        merged = (
-            scale.view(len(sizes), groups, sizes[0])
-            .transpose(0, 1)
-            .reshape(groups, total)
-        )
-    else:
-        blocks, offset = [], 0
-        for size in sizes:
-            blocks.append(scale[offset : offset + size].reshape(groups, size))
-            offset += size
-        merged = torch.cat(blocks, dim=1)
-    merged = merged.view(total, groups)
-    merged._aiter_moe_scale_is_transposed = True
-    return merged
-
-
-def _mimo_sp_attn_enabled() -> bool:
-    """Shared, construction-time eligibility for the TP MoE and attention layouts."""
-    if not should_use_dpa_sp_moe():
-        return False
-    args = get_global_server_args()
-    return (
-        is_gfx942_supported()
-        and envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
-        and envs.SGLANG_FLYPA_MIMO_PREFILL.get()
-        and mimo_flydsl_target_verify_enabled()
-        and (get_moe_runner_backend().is_aiter() or get_moe_runner_backend().is_auto())
-        and args.attention_backend == "aiter"
-        and args.prefill_attention_backend in (None, "aiter")
-        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
-        and args.page_size == 64
-        and args.kv_cache_dtype == "bf16"
-        and args.attn_cp_size == 1
-        and args.pp_size == 1
-        and args.moe_dense_tp_size == 1
-        and not args.enable_two_batch_overlap
-    )
-
-
 def _mimo_tp_sp_flash_config(config) -> bool:
     """Initial TP SP model geometry; other MiMo variants need separate qualification."""
     expected = {
@@ -308,19 +192,6 @@ def _mimo_tp_sp_flash_config(config) -> bool:
         "num_experts_per_tok": 8,
     }
     return all(getattr(config, key, None) == value for key, value in expected.items())
-
-
-def _mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method):
-    """o_proj for this rank's token slice: all-to-all over attention TP
-    gives every rank its token slice of all head groups, then one GEMM with the full weight.
-    """
-    attn_tp = get_attention_tp_size()
-    rows = attn_output.shape[0] // attn_tp
-    assert rows * attn_tp == attn_output.shape[0]
-    received = torch.empty_like(attn_output)
-    get_attention_tp_group().all_to_all_single(received, attn_output.contiguous())
-    x = received.view(attn_tp, rows, -1).transpose(0, 1).reshape(rows, -1)
-    return quant_method.apply(SimpleNamespace(weight=weight), x)
 
 
 def _mimo_needs_v_padding(
@@ -621,7 +492,7 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
-        self._sp_tp_moe = _mimo_sp_attn_enabled()
+        self._sp_tp_moe = mimo_tp_sp_enabled()
         self._pyhip_moe: Optional[bool] = None
         if self._sp_tp_moe and not getattr(
             self.experts.quant_method, "convert_mxfp4_to_fp8", False
@@ -642,8 +513,8 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if self._sp_tp_moe and _mimo_sp_moe_active(forward_batch):
-            return self.forward_sp(hidden_states)
+        if self._sp_tp_moe and mimo_tp_sp_active(forward_batch):
+            return run_mimo_tp_sp_moe(self, hidden_states)
         if not self._enable_a2a_moe:
             return self.forward_normal(
                 hidden_states,
@@ -652,99 +523,6 @@ class MiMoV2MoE(nn.Module):
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
-
-    def forward_sp(self, hidden_states) -> torch.Tensor:
-        """TP MoE on attention-TP token shards (SGLANG_ENABLE_MIMO_SWA_SP).
-
-        Route the local shard, all-gather its FP8 activations, 1x128 scales and top-k over
-        the TP group, run the TP-sharded experts on all tokens, then reduce-scatter the
-        partial sums back to the shard. Same quantized expert input as the all-reduce path.
-        """
-        router_hidden_states, expert_hidden_states = _mimo_moe_inputs(hidden_states)
-        if router_hidden_states.shape[0] > 0:
-            router_logits = self.gate(router_hidden_states)
-            topk_output = self.topk(router_hidden_states, router_logits)
-        else:
-            topk_output = self.topk.empty_topk_output(router_hidden_states.device)
-        if isinstance(expert_hidden_states, tuple):
-            quantized, scale = expert_hidden_states
-            assert getattr(scale, "_aiter_moe_scale_is_transposed", False)
-        elif expert_hidden_states.shape[0] == 0:
-            # Idle shard: no quant launch (an empty grid is an invalid configuration).
-            from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-
-            rows, hidden = expert_hidden_states.shape
-            quantized = expert_hidden_states.new_empty((rows, hidden), dtype=fp8_dtype)
-            scale = expert_hidden_states.new_empty(
-                (rows, hidden // 128), dtype=torch.float32
-            )
-        else:
-            quantized, scale = _mimo_sp_moe_quant(expert_hidden_states)
-        sizes = _mimo_sp_moe_sizes()
-        if sum(sizes) == 0:
-            return router_hidden_states
-        tp_group = get_tp_group()
-        topk_weights, topk_ids, quantized_bytes, scale = tp_group.all_gatherv(
-            [
-                topk_output.topk_weights.to(torch.float32),
-                topk_output.topk_ids.to(torch.int32),
-                quantized.view(torch.uint8),
-                scale,
-            ],
-            sizes=sizes,
-        )
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=topk_weights.new_empty((0,)),
-        )
-        expert_input = (
-            quantized_bytes.view(quantized.dtype),
-            _mimo_sp_moe_gather_scales(scale, sizes),
-        )
-        if self._use_pyhip_moe(sizes):
-            _log_mimo_prefill_pyhip_moe()
-            from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
-
-            x8, x_scale = expert_input
-            tokens, hidden = x8.shape
-            return pyhip_fp8_blockscale_moe.moe_reduce_scatter(
-                self.experts,
-                x8,
-                torch.as_strided(x_scale, (hidden // 128, tokens), (tokens, 1)),
-                topk_weights,
-                topk_ids,
-                sizes,
-                tp_group,
-                _mimo_sp_moe_max_rows(),
-            )
-        final_hidden_states = self.experts(expert_input, topk_output)
-        if all(size == sizes[0] for size in sizes):
-            output = final_hidden_states.new_empty(
-                (sizes[0], final_hidden_states.shape[1])
-            )
-            tp_group.reduce_scatter_tensor(output, final_hidden_states)
-            return output
-        return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
-
-    def _use_pyhip_moe(self, sizes: List[int]) -> bool:
-        """Select the supported PyHIP TP MoE path after weight post-processing."""
-        # The fused reduction maps every TP rank's buffer through HIP IPC.
-        # A TP group spanning nodes must retain the AITER/RCCL fallback.
-        if get_global_server_args().nnodes != 1:
-            return False
-        from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
-
-        if self._pyhip_moe is None:
-            self._pyhip_moe = pyhip_fp8_blockscale_moe.supports_layer(
-                self.experts, get_tp_group().world_size
-            )
-        if not self._pyhip_moe:
-            return False
-
-        return pyhip_fp8_blockscale_moe.fits(
-            sizes, self.experts.w13_weight.shape[0], _mimo_sp_moe_max_rows()
-        )
 
     def forward_normal(
         self,
@@ -974,7 +752,7 @@ class MiMoV2Attention(nn.Module):
         )
         self.qkv_proj_full = None
         if (
-            (_mimo_sp_attn_enabled() or self._ep_sp_swa)
+            (mimo_tp_sp_enabled() or self._ep_sp_swa)
             and sliding_window_size > 0
             and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
             and (num_heads, num_kv_heads, self.head_dim, self.original_v_head_dim)
@@ -1028,7 +806,7 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
-        # Full o_proj weight [hidden, heads * v_head_dim] for SGLANG_ENABLE_MIMO_SWA_SP.
+        # Full-head SWA output-projection and sink weights.
         self.o_proj_full: Optional[torch.Tensor] = None
         self.attention_sink_full: Optional[torch.Tensor] = None
         if self._ep_sp_swa and self.qkv_proj_full is not None:
@@ -1050,17 +828,13 @@ class MiMoV2Attention(nn.Module):
         """Assemble full-head weights from the attention-TP shards (after load_weights)."""
         from sglang.srt.layers.attention.mimo_sp import _mimo_attn_tp_gather
 
-        if self._ep_sp_swa:
+        if self._ep_sp_swa or self.qkv_proj_full is None:
             return
-        if (_mimo_sp_attn_enabled() or self.qkv_proj_full is not None) and isinstance(
-            self.o_proj.quant_method, UnquantizedLinearMethod
-        ):
+        if isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
             shard = self.o_proj.weight.data
             self.o_proj_full = (
                 _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
             )
-        if self.qkv_proj_full is None:
-            return
         if self.attention_sink_bias is not None:
             self.attention_sink_full = _mimo_attn_tp_gather(
                 self.attention_sink_bias.data
@@ -1072,24 +846,10 @@ class MiMoV2Attention(nn.Module):
             if full.shape == shard.shape:
                 full.data.copy_(shard.data)
                 continue
-            rows = shard.shape[0]
             attn_tp = get_attention_tp_size()
-            parts = [rows * size // sum(sizes) for size in sizes]
-            assert (
-                full.shape == (attn_tp * rows, *shard.shape[1:]) and sum(parts) == rows
-            ), name
-            gathered = _mimo_attn_tp_gather(shard.data).view(
-                attn_tp, rows, *shard.shape[1:]
-            )
-            # Per-rank [q_r | k_r | v_r] blocks -> [Q | K | V].
-            full.data.copy_(
-                torch.cat(
-                    [
-                        block.reshape(attn_tp * part, *shard.shape[1:])
-                        for block, part in zip(gathered.split(parts, dim=1), parts)
-                    ]
-                )
-            )
+            assert full.shape == (attn_tp * shard.shape[0], *shard.shape[1:]), name
+            gathered = _mimo_attn_tp_gather(shard.data)
+            full.data.copy_(_mimo_reorder_fused_qkv(gathered, sizes, attn_tp))
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -1146,7 +906,6 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        scatter_output: bool = False,
         sp_swa: bool = False,
     ) -> torch.Tensor:
         if sp_swa:
@@ -1175,10 +934,6 @@ class MiMoV2Attention(nn.Module):
                 ..., : self.original_v_head_dim
             ].reshape(-1, self.num_heads * self.original_v_head_dim)
 
-        if scatter_output:
-            return _mimo_sp_o_proj(
-                attn_output, self.o_proj_full, self.o_proj.quant_method
-            )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1343,7 +1098,7 @@ class MiMoV2DecoderLayer(nn.Module):
         )
         # SGLANG_ENABLE_MIMO_SWA_SP: token-scattered residual and MoE layout for large forward passes.
         self.layer_communicator_sp = None
-        if _mimo_sp_attn_enabled():
+        if mimo_tp_sp_enabled():
             self.layer_communicator_sp = LayerCommunicator(
                 layer_scatter_modes=LayerScatterModes.init_new(
                     layer_id=layer_id,
@@ -1438,10 +1193,8 @@ class MiMoV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
-        sp_o_proj = sp_swa = False
-        if self.layer_communicator_sp is not None and _mimo_sp_moe_active(
-            forward_batch
-        ):
+        sp_swa = False
+        if self.layer_communicator_sp is not None and mimo_tp_sp_active(forward_batch):
             communicator = self.layer_communicator_sp
             if (
                 self.layer_communicator_sp_attn is not None
@@ -1452,12 +1205,6 @@ class MiMoV2DecoderLayer(nn.Module):
             ):
                 communicator = self.layer_communicator_sp_attn
                 sp_swa = True
-            else:
-                sp_o_proj = (
-                    self.self_attn.o_proj_full is not None
-                    and communicator.layer_scatter_modes.mlp_mode
-                    == ScatterMode.SCATTERED
-                )
         elif (
             self.self_attn._ep_sp_swa
             and self.layer_communicator_sp_attn is not None
@@ -1482,23 +1229,15 @@ class MiMoV2DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-                scatter_output=sp_o_proj,
                 sp_swa=sp_swa,
             )
 
-        if sp_o_proj:
-            hidden_states, residual = communicator.prepare_mlp_from_scattered_attn(
-                hidden_states,
-                residual,
-                quant_format=self._prefill_moe_quant_format(forward_batch),
-            )
-        else:
-            hidden_states, residual = communicator.prepare_mlp(
-                hidden_states,
-                residual,
-                forward_batch,
-                quant_format=self._prefill_moe_quant_format(forward_batch),
-            )
+        hidden_states, residual = communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format=self._prefill_moe_quant_format(forward_batch),
+        )
 
         should_allreduce_fusion = (
             communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
@@ -1918,7 +1657,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
 
-        if _mimo_sp_attn_enabled() and not _mimo_tp_sp_flash_config(config):
+        if mimo_tp_sp_enabled() and not _mimo_tp_sp_flash_config(config):
             raise ValueError(
                 "MiMo TP prefill SP currently supports the Flash geometry only"
             )

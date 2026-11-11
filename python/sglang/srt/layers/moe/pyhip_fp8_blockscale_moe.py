@@ -1,11 +1,4 @@
 # SPDX-License-Identifier: MIT
-# Ported from luocheng25/pyhip at 7f3706caa7a697e2b1489fc24b43756571075fbf:
-# src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_942/{kernels,moe}.py (the I = 256 "direct" path:
-# gate_up and down_direct). The top-k sum fused with the reduce-scatter
-# (_sum_rs_kernel) is the FlyDSL form of PyHIP's benchmarks/moe_fp8_blockscale/probes/sum_rs.hip;
-# the route sort replaces aiter's moe_sorting and PyHIP's tiles / inverse kernels (same rows).
-# Only Torch and FlyDSL are required; importing this module does not load the PyHIP package.
-# Upstream license follows.
 # The MIT License (MIT)
 # Copyright © 2026 <copyright holders>
 #
@@ -15,34 +8,11 @@
 #
 # THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-"""gfx942 FP8 block-scale TP MoE (prefill, I = 256 per rank) with a fused top-k sum + reduce-scatter.
+"""gfx942 FP8 TP prefill MoE with fused top-k sum and reduce-scatter.
 
-Kernels (gate_up and down reuse pyhip_fp8_blockscale_gemm's 8-wave staged pipeline: 16x16x32 MFMA,
-16 KiB LDS slots, dword LDS-DMA, 1x128 / 128x128 block scales retired two blocks late). Rows are in
-aiter's moe_sorting order (experts padded to 64 rows, padding rows carry token id T), produced by the route
-sort with the compact tiles of one expert: 256 rows, plus one 64-192-row tail per expert. Rows of
-a tile past its row count are masked; their 64-row bands (gate_up) / waves (down) issue no MFMAs.
-
-gate_up (_gate_up_body), per (M-block, 128 intermediate columns jt):
-    X rows are gathered: lane l of `table` holds the byte offset of DMA row 128 (l >> 5) + 2 q + 8 ((l & 31) >> 1)
-    + (l & 1); every buffer_load_dword ... lds v_readlane's its two rows. The W tile is [gate 128 jt .. + 127 |
-    up I + 128 jt .. + 127] (P1 = gate, P2 = up), so wave (wm, wn) holds gate (N-blocks 0-3) and up (4-7) of
-    the same 64 columns and C1 / C2 use the gate / up weight scale. Epilogue: SiLU(gate) * up, row maxima
-    over the 128-column group (two waves, exchanged in LDS), FP8 E4M3FNUZ requant ->
-    A2 [R, I] (sorted rows; staged in LDS so every store writes whole 128-byte rows) and
-    A2S [I / 128, R] = amax / 240 * route weight.
-down (_down_direct_body, K = I = 256): 4-wave CTAs, each wave keeps 64 A2 rows (whole K) in registers while
-    W2 streams through a 2-slot LDS ring in 64-row chunks; MFMA A rows are permuted so each lane's outputs are 8
-    consecutive columns, partials retire during the next M-block's MFMAs, and even/odd 32-column units are
-    stored back to back (full 128-byte lines). The route weight rides in A2S, so Y rows are already weighted.
-    Y [R, H] in sorted order; padding rows are not written.
-route sort (count, scan, scatter): sorted rows, compact tiles and inv[t, k] = sorted row of route (t, k).
-
-Grids cover the worst-case block count; blocks past the device-side valid count exit, the rest run in
-XCD-chunked order (block b runs on XCD b % 8, which gets a contiguous run of M-blocks, i.e. of experts).
-
-_sum_rs_kernel (sequence-parallel layout, 8 ranks): the top-k sum of every token's route rows,
-summed over the ranks and scattered to the token's owner rank in one kernel (HIP IPC symmetric buffers).
+Ported from luocheng25/pyhip at 7f3706caa7a697e2b1489fc24b43756571075fbf:
+- src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_942/{kernels,moe}.py
+- benchmarks/moe_fp8_blockscale/probes/sum_rs.hip (adapted fused reduction)
 """
 
 import ctypes

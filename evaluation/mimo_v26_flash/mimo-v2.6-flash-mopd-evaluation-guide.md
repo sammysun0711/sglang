@@ -82,6 +82,15 @@ pip install amd_mori==1.2.4
 
 The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
 
+The TP8/DP2/EP1 baseline launcher includes the prefill settings: shared SP
+enabled through `SGLANG_ENABLE_MIMO_SWA_SP=1`, dense TP1, eight Hugging Face
+tokenizer workers, disabled tokenizer batch decode, and a 100-pass prefill
+delayer. Requested memory defaults to `0.75`, including with DFlash enabled.
+Use `TOKENIZER_WORKER_NUM`, `TOKENIZER_BACKEND`, `MEM_FRACTION_STATIC` and
+`PREFILL_DELAYER_MAX_DELAY_PASSES` to override these values, or
+`ENABLE_PREFILL_DELAYER=0` to disable the delayer. No Fastokens overlay is
+required. Additional CLI arguments take precedence over launcher defaults.
+
 ### Launch TBO-off server
 
 ```bash
@@ -151,7 +160,8 @@ set `WARMUP_REQUESTS_OVERRIDE=4` to use four client requests at every point.
 
 With `SGLANG_ENABLE_MIMO_SWA_SP=1`, the server executes the 32 representative
 prefill requests once before HTTP readiness, shared across tokenizer workers.
-Unset or `0` skips this sequence. To reproduce the earlier startup-only warmup 
+Both launchers enable the flag by default; set it to `0` to skip this sequence.
+To reproduce the earlier startup-only warmup
 protocol, use `WARMUP_REQUESTS_OVERRIDE=0`. `--skip-server-warmup` controls the 
 generic smoke request independently of this SP-gated representative warmup. 
 Record warmup counts and distinguish compiler calls from cache loads in performance results.

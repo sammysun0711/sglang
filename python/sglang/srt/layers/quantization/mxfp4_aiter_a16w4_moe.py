@@ -1,157 +1,109 @@
-"""MXFP4 expert backend running AITER's a16w4 (bf16 activation x MXFP4 weight) MoE.
+"""MXFP4 expert backend running fp8-activation x MXFP4-weight (A8W4) MoE on gfx942.
 
 ``Fp8Config`` selects this for FP4-expert checkpoints under
-``--moe-runner-backend aiter``. The checkpoint's separated ``[gate; up]`` w13
-rows are preshuffled and consumed with ``GateMode.SEPARATED``.
+``--moe-runner-backend aiter``. The kernels are the FlyDSL A8W4 MoE of
+``pyhip.contrib.flydsl.a8w4`` (one package for TP and EP; per batch size it runs the
+fastest kernel of its tuned table). One method serves every layout:
+
+  * TP (``--ep-size 1``): each rank holds all experts and a slice of inter_dim;
+  * EP, ``--moe-a2a-backend none``: every rank sees all tokens with *global* top-k
+    ids and computes its local experts ``[ep_rank * E, ep_rank * E + E)``;
+  * EP, ``--moe-a2a-backend mori``: the capacity-sized MORI receive buffer (only the
+    first ``total_recv`` rows valid, a device count; fp8 with one f32 scale per
+    (token, 128) block, or bf16) goes to ``a8w4_moe_dyn`` (no host sync, CUDA-graph
+    safe) and its output to MORI combine.
+
+The output is this rank's partial sum; the MoE all-reduce / MORI combine reduces
+it. The checkpoint's separated ``[gate; up]`` w13 rows are preshuffled
+(``shuffle_mxfp4``) and rewritten by ``prepare_weights`` (fast fp4 decode form
+shared by all kernels), replacing the layer's weight storage.
+
+Activations (every kernel family): ``silu``, or ``situv2``
+(``beta * tanh(g / beta) * sigmoid(g) * lb * tanh(u / lb)`` with ``situ_beta`` /
+``situ_linear_beta`` from the runner config and an optional clamp ``g <= L``,
+``|u| <= L`` from ``swiglu_limit`` / ``gemm1_clamp_limit``).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 from torch.nn import Module
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-from .flydsl_moe_tp_w4a8_gfx942.a8w4_moe_tuned import tuned_moe
-from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm1 import a8w4_gemm1, prep_w1_fast
-from .flydsl_moe_tp_w4a8_gfx942.test_a8w4_gemm2 import a8w4_gemm2, prep_w2_fast
-from aiter.fused_moe import moe_sorting
-from aiter import ActivationType, QuantType, dtypes
+# The EP prep kernel of ``a8w4_moe_dyn`` takes < 65536 rows per call (24-bit token
+# ids, all sort workgroups resident); larger MORI receive buffers run in chunks.
+A8W4_DYN_MAX_TOKENS = 32768
 
-# Fast fp4 decode of gemm1 / gemm2 (bit-exact vs 0). 1: W nibbles reordered
-# and -0 -> +0 (drops the interleave / sign perms). 2: additionally stores the
-# per-group scale delta vs the channel max and zeroes flushed groups (one
-# v_perm LUT); W2's scale buffer then carries its channel max codes. W / scales
-# are rewritten in place, so the aiter-runner path in ``apply`` needs 0.
-A8W4_FAST_DEC = 2
 
-# block_m -> (gemm1 kwargs, gemm2 kwargs). Both stages share the sorting block_m.
-#  32: gemm1 pipelined (prefetch) + XCD swizzle; gemm2 skips all-padding sub-blocks.
-#  64: same block_m as the tuned CSV; gemm1 dyn_m (32/64 rows per block at runtime),
-#      gemm2 dyn_rows.
-A8W4_E2E_CFGS = {
-    32: (
-        dict(tile_n=128, b_cache_mod=1, xcd_swizzle=1),
-        dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0, dyn_rows=True),
-    ),
-    64: (
-        dict(tile_n=128, b_cache_mod=1, xcd_swizzle=1, dyn_m=True),
-        dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0, dyn_rows=True),
-    ),
-}
+def _expert_layout(layer: Module) -> Tuple[int, int]:
+    """(first global expert id of this rank, global expert count). TP: (0, E)."""
+    return layer.moe_ep_rank * layer.num_local_experts, layer.num_experts
 
-def a8w4_fused_moe(
-    hidden_states, weights, topk_weights, topk_ids, *, block_m=32, fuse_quant=False
-):
-    """SiLU SEPARATED A8W4 MoE: sort -> fp8 row-quant(x) -> gemm1 (gate+up+SiLU,
-    bf16 by sorted row) -> fp8 row-quant(inter) -> gemm2 (down + weighted atomic
-    scatter into the zeroed moe_buf). Returns bf16 [tokens, model_dim].
 
-    ``fuse_quant``: gemm1 quantizes in its epilogue (``q8s``: fp8 by sorted row,
-    one f32 scale per (row, 128 cols)) and gemm2 takes the per-128-K-group A
-    scales; drops the second row-quant kernel and the bf16 round trip."""
-    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import quantize_rows
+def _check_kernel_shape(shape: Tuple[int, int, int, int, int]) -> None:
+    """Fail at load time on (hidden, intermediate per partition, local experts,
+    experts, top-k) the A8W4 kernels cannot run."""
+    from pyhip.contrib.flydsl.a8w4 import dyn_config, supported
 
-    g1_cfg, g2_cfg = A8W4_E2E_CFGS[block_m]
-    g1_cfg = dict(g1_cfg, fast_dec=weights.get("w1_fast_dec", 0))
-    g2_cfg = dict(g2_cfg, fast_dec=weights.get("w2_fast_dec", 0))
-    E, model_dim, _ = weights["w2"].shape
-    inter_dim = weights["w1"].shape[1] // 2
-
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-        moe_sorting(topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_m)[:5]
-    )
-    x_fp8, x_scale = quantize_rows(hidden_states)
-    sorted_size = sorted_expert_ids.numel() * block_m
-    if fuse_quant:
-        assert g1_cfg["tile_n"] == 128, "q8s scale groups = gemm1 tile_n = 128"
-        groups = inter_dim // 128
-        buf = torch.empty(
-            sorted_size * (inter_dim + groups * 4),
-            dtype=torch.uint8,
-            device=hidden_states.device,
+    if get_moe_a2a_backend().is_mori():
+        dyn_config(shape, 1)  # raises: the MORI path needs the EP kernels
+    elif not supported(dict(kind="tp2k", block_m=64, g1_bcm=1, g2="base"), shape):
+        raise ValueError(
+            "A8W4 MoE needs hidden_size % 512 == 0 and intermediate size per "
+            f"partition % 256 == 0, got (hidden, inter, E_local, E, topk) = {shape}."
         )
-        a8w4_gemm1(
-            x_fp8,
-            x_scale,
-            weights["w1"],
-            weights["w1_scale"],
-            weights["w1_exp"],
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            buf,
-            num_experts=E,
-            tile_m=block_m,
-            epilog="q8s",
-            inter_dim=inter_dim,
-            topk=topk_ids.shape[1],
-            **g1_cfg,
-        )
-        nd = sorted_size * inter_dim
-        a2_fp8 = buf[:nd].view(torch.float8_e4m3fnuz).view(sorted_size, inter_dim)
-        a2_scale = buf[nd:].view(torch.float32).view(sorted_size, groups)
-        a8w4_gemm2(
-            a2_fp8,
-            a2_scale,
-            weights["w2"],
-            weights["w2_scale"],
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            num_experts=E,
-            tile_m=block_m,
-            a_group=128,
-            **g2_cfg,
-        )
-        return moe_buf
-    inter = torch.empty(
-        (sorted_size, inter_dim),
-        dtype=dtypes.bf16,
-        device=hidden_states.device,
+
+
+def _mori_token_bounds(capacity: int, total_recv: torch.Tensor) -> Tuple[int, int]:
+    """Return (rows to process, estimated valid rows) for a MORI receive buffer.
+
+    Eager mode reads the device count (one device-to-host synchronization per MoE
+    layer). Capture processes the full capacity because the device count cannot be
+    read on the host; the kernels read it and ignore the invalid suffix.
+
+    During capture, DP token metadata only supplies a performance estimate for
+    config / grid selection, not a received-row upper bound. When only local DP
+    metadata is available, extrapolate assuming equal token counts across DPs.
+    Other DPs may replay different batch sizes, so this estimate can be low; the
+    GEMM workgroups stride over the actual tiles to preserve correctness.
+    """
+    if total_recv.numel() == 0:
+        return 0, 1
+    if not torch.cuda.is_current_stream_capturing():
+        n = min(capacity, int(total_recv.reshape(-1)[0].item()))
+        return n, max(1, n)
+
+    from sglang.srt.layers.dp_attention import (
+        get_attention_dp_size,
+        get_dp_global_num_tokens,
+        is_dp_attention_enabled,
     )
-    a8w4_gemm1(
-        x_fp8,
-        x_scale,
-        weights["w1"],
-        weights["w1_scale"],
-        weights["w1_exp"],
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        inter,
-        num_experts=E,
-        tile_m=block_m,
-        **g1_cfg,
-    )
-    a2_fp8, a2_scale = quantize_rows(inter, num_valid_ids)
-    a8w4_gemm2(
-        a2_fp8,
-        a2_scale,
-        weights["w2"],
-        weights["w2_scale"],
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_buf,
-        num_experts=E,
-        tile_m=block_m,
-        **g2_cfg,
-    )
-    return moe_buf
+
+    if not is_dp_attention_enabled():
+        return capacity, capacity
+    try:
+        gnt = [int(n) for n in get_dp_global_num_tokens()]
+    except (AttributeError, TypeError):
+        return capacity, capacity
+    if not gnt:
+        return capacity, capacity
+    dp_size = get_attention_dp_size()
+    est = sum(gnt) if len(gnt) == dp_size else dp_size * max(gnt)
+    return capacity, max(1, min(capacity, est))
+
 
 class Mxfp4AiterA16W4MoEMethod:
-    """MXFP4 (E8M0 scales) MoE via aiter fused_moe with bf16 activations."""
+    """MXFP4 (E8M0 scales) MoE on gfx942: fp8 activations x MXFP4 weights."""
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -171,6 +123,15 @@ class Mxfp4AiterA16W4MoEMethod:
             raise NotImplementedError(
                 "Mxfp4AiterA16W4MoEMethod does not support MoE GEMM biases."
             )
+        _check_kernel_shape(
+            (
+                hidden_size,
+                intermediate_size_per_partition,
+                num_experts,
+                layer.num_experts,
+                layer.top_k,
+            )
+        )
         # shuffle_scale_a16w4 passes fp32 scales through untouched, so keep E8M0.
         self._fp8.create_weights(
             layer,
@@ -185,21 +146,56 @@ class Mxfp4AiterA16W4MoEMethod:
     def create_moe_runner(
         self, layer: Module, moe_runner_config: MoeRunnerConfig
     ) -> None:
-        # The native A16W4/A8W4 SiLU epilogue does not apply an activation
-        # clamp. A positive swiglu_limit can also override our separated
-        # weight layout in the shared runner. Reject either config spelling
-        # before runner setup rather than silently changing the model.
-        if any(
-            limit is not None and limit != 0
-            for limit in (
-                moe_runner_config.swiglu_limit,
-                moe_runner_config.gemm1_clamp_limit,
-            )
-        ):
+        cfg = moe_runner_config
+        # Either spelling of the gate/up clamp limit (gpt-oss: gemm1_clamp_limit).
+        clamp = cfg.gemm1_clamp_limit or cfg.swiglu_limit
+        if cfg.activation not in ("silu", "situv2") or not cfg.is_gated:
             raise ValueError(
-                "Native MXFP4 A16W4/A8W4 does not support activation clamps; "
-                "swiglu_limit and gemm1_clamp_limit must be unset or 0."
+                "A8W4 MoE only supports gated silu or situv2 experts, got "
+                f"activation={cfg.activation!r}, is_gated={cfg.is_gated}."
             )
+        if cfg.activation == "silu":
+            # The A8W4 SiLU epilogue does not apply an activation clamp. Reject
+            # either config spelling before runner setup rather than silently
+            # changing the model.
+            if clamp:
+                raise ValueError(
+                    "Native MXFP4 A16W4/A8W4 does not support activation clamps; "
+                    "swiglu_limit and gemm1_clamp_limit must be unset or 0."
+                )
+            act_kwargs = dict(act="silu")
+        else:
+            beta, linear_beta = cfg.situ_beta, cfg.situ_linear_beta
+            limit = float(clamp) if clamp else float("inf")  # unset / 0: no clamp
+            if not (
+                beta is not None
+                and beta > 0
+                and linear_beta is not None
+                and linear_beta > 0
+                and limit > 0
+            ):
+                raise ValueError(
+                    "A8W4 situv2 needs situ_beta > 0, situ_linear_beta > 0 and a "
+                    f"clamp limit that is unset or > 0, got {beta}, {linear_beta}, "
+                    f"{clamp}."
+                )
+            situ = dict(
+                situ_beta=float(beta),
+                situ_linear_beta=float(linear_beta),
+                swiglu_limit=limit,
+            )
+            act_kwargs = dict(act="situv2", situ=situ)
+        if cfg.apply_router_weight_on_input:
+            raise ValueError("A8W4 MoE does not support apply_router_weight_on_input.")
+        if cfg.num_fused_shared_experts:
+            raise ValueError("A8W4 MoE does not support fused shared experts.")
+        a2a = get_moe_a2a_backend()
+        if not (a2a.is_none() or a2a.is_mori()):
+            raise ValueError(
+                "A8W4 MoE supports --moe-a2a-backend none (global top-k ids on every "
+                f"rank) or mori, got {a2a.value}."
+            )
+        self._act_kwargs = act_kwargs
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 
@@ -212,68 +208,46 @@ class Mxfp4AiterA16W4MoEMethod:
         return requested_method
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+        from pyhip.contrib.flydsl.a8w4 import prepare_weights, shuffle_mxfp4
 
-        num_experts = layer.w13_weight.shape[0]
         fp4_dtype = torch.float4_e2m1fn_x2
+        # aiter's a16w4 preshuffle (keeps the [gate; up] row order), then the fast
+        # fp4 decode form used by every A8W4 kernel (bit-exact): nibbles reordered,
+        # per-group scale deltas vs the channel max, W2's channel max codes
+        # appended to its scales (``w2_exp`` is a view of them).
+        weights = prepare_weights(
+            *shuffle_mxfp4(
+                layer.w13_weight.data.view(fp4_dtype),
+                layer.w13_weight_scale_inv.data,
+                layer.w2_weight.data.view(fp4_dtype),
+                layer.w2_weight_scale_inv.data,
+            )
+        )
 
-        # gate_up=False keeps the [gate; up] row order that GateMode.SEPARATED reads.
-        layer.w13_weight.data = shuffle_weight_a16w4(
-            layer.w13_weight.data.view(fp4_dtype), 16, False
-        )
-        layer.w2_weight.data = shuffle_weight_a16w4(
-            layer.w2_weight.data.view(fp4_dtype), 16, False
-        )
-        w13_scale = layer.w13_weight_scale_inv.data
-        w2_scale = layer.w2_weight_scale_inv.data
+        # Swap the layer storage to the rewritten bytes so the originals are freed.
+        layer.w13_weight.data = weights["w1"].view(fp4_dtype)
+        layer.w2_weight.data = weights["w2"].view(fp4_dtype)
         layer.w13_weight_scale_inv = torch.nn.Parameter(
-            shuffle_scale_a16w4(
-                w13_scale.view(-1, w13_scale.shape[-1]), num_experts, False
-            ),
-            requires_grad=False,
+            weights["w1_scale"], requires_grad=False
         )
         layer.w2_weight_scale_inv = torch.nn.Parameter(
-            shuffle_scale_a16w4(
-                w2_scale.view(-1, w2_scale.shape[-1]), num_experts, False
-            ),
-            requires_grad=False,
+            weights["w2_scale"], requires_grad=False
         )
-
-        # aiter fused_moe reads these off w1/w2 to pick the preshuffled
-        # SEPARATED a16w4 kernels; the .data swap above drops them.
         for weight in (layer.w13_weight, layer.w2_weight):
             weight.is_shuffled = True
             weight.gate_up_interleave = False
+        layer.a8w4_weights = weights
 
-        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import channel_exponents
-        w1_u8 = layer.w13_weight.data.view(torch.uint8)
-        w2_u8 = layer.w2_weight.data.view(torch.uint8)
-        w1_scale_u8 = layer.w13_weight_scale_inv.data.view(torch.uint8).contiguous().view(-1)
-        w2_scale_u8 = layer.w2_weight_scale_inv.data.view(torch.uint8).contiguous().view(-1)
-        w1_exp = channel_exponents(w1_u8, w1_scale_u8)  # from the original scales
-
-        fast_dec = A8W4_FAST_DEC
-        if fast_dec:
-            # Swap the layer storage to the rewritten bytes so the originals are freed.
-            w1_u8, w1_scale_u8 = prep_w1_fast(w1_u8, w1_scale_u8, w1_exp, fast_dec)
-            w2_u8, w2_scale_u8 = prep_w2_fast(w2_u8, w2_scale_u8, fast_dec)
-            layer.w13_weight.data = w1_u8.view(fp4_dtype)
-            layer.w2_weight.data = w2_u8.view(fp4_dtype)
-            layer.w13_weight_scale_inv = torch.nn.Parameter(w1_scale_u8, requires_grad=False)
-            layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale_u8, requires_grad=False)
-
-        layer.all_weights = dict(
-            w1=w1_u8,
-            w2=w2_u8,
-            w1_scale=w1_scale_u8,
-            w2_scale=w2_scale_u8,
-            w1_exp=w1_exp,
-            w1_fast_dec=fast_dec,
-            w2_fast_dec=fast_dec,
+        # MORI picks its dispatch dtype from the reported weight dtype: fp8 makes it
+        # dispatch blockwise fp8, consumed directly by the kernels, instead of the
+        # MXFP4 default (SGLANG_MORI_DISPATCH_DTYPE still overrides; bf16 also works).
+        dispatch_weight_dtype = (
+            torch.float8_e4m3fnuz
+            if get_moe_a2a_backend().is_mori()
+            else layer.w13_weight.dtype
         )
-
         layer.dispatcher.set_quant_config(
-            {"weight_dtype": layer.w13_weight.dtype, "use_mxfp8": False}
+            {"weight_dtype": dispatch_weight_dtype, "use_mxfp8": False}
         )
 
     def apply(
@@ -281,38 +255,100 @@ class Mxfp4AiterA16W4MoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-        if 1:
-            from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-            from sglang.srt.layers.moe.topk import TopKOutputChecker            
-            topk_output = dispatch_output.topk_output
-            hidden_states = dispatch_output.hidden_states
-            if layer.all_weights["w1_fast_dec"] == 2:
-                # per-batch-size best of 2-kernel / fused single-kernel variants
-                # (flydsl_moe_tp_w4a8_gfx942/configs/a8w4_moe_tuned.txt; untuned
-                # shapes fall back to the 2-kernel bm64 config)
-                output = tuned_moe(hidden_states, layer.all_weights,
-                                   topk_output.topk_weights, topk_output.topk_ids)
-            else:
-                output = a8w4_fused_moe(hidden_states, layer.all_weights,
-                                        topk_output.topk_weights, topk_output.topk_ids,
-                                        block_m=64, fuse_quant=True)
-            return StandardCombineInput(hidden_states=output)
+        if hasattr(dispatch_output, "origin_topk_ids"):  # MORI dispatch output
+            return self._apply_mori(layer, dispatch_output)
 
-        from aiter.ops.flydsl.moe_common import GateMode
+        from pyhip.contrib.flydsl.a8w4 import a8w4_moe
 
-        from sglang.srt.layers.moe.moe_runner.aiter import (
-            AiterMoeQuantInfo,
-            AiterQuantType,
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
         )
 
-        quant_info = AiterMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            quant_type=AiterQuantType.PER_1X32,
-            w13_scale=layer.w13_weight_scale_inv,
-            w2_scale=layer.w2_weight_scale_inv,
-            expert_mask=layer.dispatcher.expert_mask_gpu,
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
-            fused_moe_kwargs={"gate_mode": GateMode.SEPARATED.value},
+        if getattr(dispatch_output, "hidden_states_scale", None) is not None:
+            raise NotImplementedError(
+                "A8W4 MoE quantizes bf16 activations itself; prequantized MoE "
+                "input is not supported."
+            )
+        x = dispatch_output.hidden_states
+        if x.shape[0] == 0:
+            return StandardCombineInput(hidden_states=x)
+        topk_output = dispatch_output.topk_output
+        # TP: all experts local (offset 0); EP: global ids, this rank's experts.
+        expert_offset, num_experts = _expert_layout(layer)
+        out = a8w4_moe(
+            x.contiguous(),
+            layer.a8w4_weights,
+            topk_output.topk_weights.to(torch.float32).contiguous(),
+            topk_output.topk_ids.to(torch.int32).contiguous(),
+            expert_offset=expert_offset,
+            num_experts=num_experts,
+            **self._act_kwargs,
         )
-        return self.runner.run(dispatch_output, quant_info)
+        return StandardCombineInput(hidden_states=out)
+
+    def _apply_mori(self, layer: Module, dispatch_output) -> CombineInput:
+        from pyhip.contrib.flydsl.a8w4 import a8w4_moe_dyn
+
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+        from sglang.srt.layers.moe.token_dispatcher.moriep import (
+            MoriEPLLCombineInput,
+            MoriEPNormalCombineInput,
+        )
+
+        x = dispatch_output.hidden_states
+        x_scale = dispatch_output.hidden_states_scale
+        # [1] int32 on device: the valid rows of the receive buffer
+        total_recv = dispatch_output.num_recv_tokens_per_expert
+        if x.dtype == torch.float8_e4m3fnuz:
+            if x_scale is None or x_scale.dtype != torch.float32:
+                raise ValueError("A8W4 MoE: fp8 MORI dispatch needs f32 scales.")
+        elif x.dtype == torch.bfloat16:
+            x_scale = None
+        else:
+            raise NotImplementedError(
+                f"A8W4 MoE: unsupported MORI dispatch dtype {x.dtype}; use "
+                "SGLANG_MORI_DISPATCH_DTYPE=fp8 (this method's default) or bf16."
+            )
+
+        capacity = x.shape[0]
+        mori_max = envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.get()
+        rows, est = _mori_token_bounds(
+            min(capacity, mori_max) if mori_max > 0 else capacity, total_recv
+        )
+        # The output keeps the receive-buffer capacity: MORI combine reads rows
+        # [0, total_recv). Only the first ``rows`` are computed.
+        out = torch.empty((capacity, x.shape[1]), dtype=torch.bfloat16, device=x.device)
+        expert_offset, num_experts = _expert_layout(layer)
+        topk_ids = dispatch_output.topk_ids[:rows].to(torch.int32)
+        topk_weights = dispatch_output.topk_weights[:rows].to(torch.float32)
+        for s in range(0, rows, A8W4_DYN_MAX_TOKENS):
+            e = min(s + A8W4_DYN_MAX_TOKENS, rows)
+            m_valid = (
+                total_recv
+                if s == 0
+                else (total_recv - s).clamp(min=0, max=e - s).to(torch.int32)
+            )
+            a8w4_moe_dyn(
+                x[s:e],
+                layer.a8w4_weights,
+                topk_weights[s:e].contiguous(),
+                topk_ids[s:e].contiguous(),
+                m_valid,
+                x_scale=x_scale[s:e] if x_scale is not None else None,
+                expert_offset=expert_offset,
+                num_experts=num_experts,
+                est_tokens=max(1, min(e - s, est - s)),
+                out=out[s:e],
+                **self._act_kwargs,
+            )
+
+        combine_cls = (
+            MoriEPNormalCombineInput
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+            else MoriEPLLCombineInput
+        )
+        return combine_cls(
+            hidden_states=out,
+            topk_ids=dispatch_output.origin_topk_ids,
+            topk_weights=dispatch_output.origin_topk_weights,
+        )

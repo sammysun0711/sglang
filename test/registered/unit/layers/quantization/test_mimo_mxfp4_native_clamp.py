@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.quantization import mxfp4_aiter_a16w4_moe as module
+from sglang.srt.layers.quantization import mxfp4_aiter_a8w4_moe as module
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-b-test-cpu")

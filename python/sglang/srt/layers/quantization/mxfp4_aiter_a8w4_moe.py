@@ -44,6 +44,10 @@ if TYPE_CHECKING:
 # ids, all sort workgroups resident); larger MORI receive buffers run in chunks.
 A8W4_DYN_MAX_TOKENS = 32768
 
+# Largest per-DP token count seen while capturing CUDA graphs (decode graphs are
+# captured from the largest batch down, so the first capture sets it).
+_capture_max_local_tokens = 0
+
 
 def _expert_layout(layer: Module) -> Tuple[int, int]:
     """(first global expert id of this rank, global expert count). TP: (0, E)."""
@@ -68,15 +72,18 @@ def _mori_token_bounds(capacity: int, total_recv: torch.Tensor) -> Tuple[int, in
     """Return (rows to process, estimated valid rows) for a MORI receive buffer.
 
     Eager mode reads the device count (one device-to-host synchronization per MoE
-    layer). Capture processes the full capacity because the device count cannot be
-    read on the host; the kernels read it and ignore the invalid suffix.
+    layer).
 
-    During capture, DP token metadata only supplies a performance estimate for
-    config / grid selection, not a received-row upper bound. When only local DP
-    metadata is available, extrapolate assuming equal token counts across DPs.
-    Other DPs may replay different batch sizes, so this estimate can be low; the
-    GEMM workgroups stride over the actual tiles to preserve correctness.
+    Capture can't read it, so it bounds the received rows: a rank receives each
+    token at most once, and a CUDA graph only replays when every attention-DP group
+    decodes with a captured batch (``can_cuda_graph`` is the min over DP). With the
+    DP token list gathered (``require_mlp_tp_gather``) every group replays the same
+    padded batch: ``dp_size * max``. Otherwise (MORI + dp-lm-head + dense TP 1) the
+    list holds only the local group and each group picks its own captured batch:
+    local tokens + (dp_size - 1) x the largest captured per-DP token count. Without
+    DP attention there is no metadata: the full capacity.
     """
+    global _capture_max_local_tokens
     if total_recv.numel() == 0:
         return 0, 1
     if not torch.cuda.is_current_stream_capturing():
@@ -98,8 +105,15 @@ def _mori_token_bounds(capacity: int, total_recv: torch.Tensor) -> Tuple[int, in
     if not gnt:
         return capacity, capacity
     dp_size = get_attention_dp_size()
-    est = sum(gnt) if len(gnt) == dp_size else dp_size * max(gnt)
-    return capacity, max(1, min(capacity, est))
+    if len(gnt) == dp_size:
+        bound, est = dp_size * max(gnt), sum(gnt)
+    else:
+        local = max(gnt)
+        _capture_max_local_tokens = max(_capture_max_local_tokens, local)
+        bound = local + (dp_size - 1) * _capture_max_local_tokens
+        est = dp_size * local
+    bound = min(capacity, bound)
+    return bound, max(1, min(bound, est))
 
 
 class Mxfp4AiterA8W4MoEMethod:
@@ -132,14 +146,12 @@ class Mxfp4AiterA8W4MoEMethod:
                 layer.top_k,
             )
         )
-        # shuffle_scale_a16w4 passes fp32 scales through untouched, so keep E8M0.
         self._fp8.create_weights(
             layer,
             num_experts,
             hidden_size,
             intermediate_size_per_partition,
             params_dtype,
-            fp4_scale_dtype=torch.float8_e8m0fnu,
             **extra_weight_attrs,
         )
 
@@ -160,7 +172,7 @@ class Mxfp4AiterA8W4MoEMethod:
             # changing the model.
             if clamp:
                 raise ValueError(
-                    "Native MXFP4 A16W4/A8W4 does not support activation clamps; "
+                    "A8W4 MoE with SiLU does not support activation clamps; "
                     "swiglu_limit and gemm1_clamp_limit must be unset or 0."
                 )
             act_kwargs = dict(act="silu")
@@ -316,7 +328,8 @@ class Mxfp4AiterA8W4MoEMethod:
             min(capacity, mori_max) if mori_max > 0 else capacity, total_recv
         )
         # The output keeps the receive-buffer capacity: MORI combine reads rows
-        # [0, total_recv). Only the first ``rows`` are computed.
+        # [0, total_recv). Only the first ``rows`` are computed (beyond a too small
+        # SGLANG_MORI_MOE_MAX_INPUT_TOKENS the rows are undefined).
         out = torch.empty((capacity, x.shape[1]), dtype=torch.bfloat16, device=x.device)
         expert_offset, num_experts = _expert_layout(layer)
         topk_ids = dispatch_output.topk_ids[:rows].to(torch.int32)

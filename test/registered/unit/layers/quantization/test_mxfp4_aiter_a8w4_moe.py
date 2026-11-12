@@ -1,4 +1,4 @@
-"""Unit tests for srt/layers/quantization/mxfp4_aiter_a16w4_moe.py: the gfx942 A8W4
+"""Unit tests for srt/layers/quantization/mxfp4_aiter_a8w4_moe.py: the gfx942 A8W4
 MoE of pyhip.contrib.flydsl.a8w4 under TP, EP with global top-k ids and EP on a
 MORI receive buffer, with SiLU or SiTUv2 experts."""
 
@@ -147,7 +147,7 @@ def _make_layer(ckpt, rank=0, ep_size=1, a2a=MoeA2ABackend.NONE, **runner_config
     """A loaded FusedMoE-like layer, after create_moe_runner (``runner_config``:
     MoeRunnerConfig fields) and process_weights_after_loading."""
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.quantization import mxfp4_aiter_a16w4_moe as mod
+    from sglang.srt.layers.quantization import mxfp4_aiter_a8w4_moe as mod
 
     layer = torch.nn.Module()
     for name, t in (
@@ -195,7 +195,7 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
             raise unittest.SkipTest(
                 "A8W4 FlyDSL MoE kernels require gfx942 (MI300/MI325)"
             )
-        from sglang.srt.layers.quantization import mxfp4_aiter_a16w4_moe as mod
+        from sglang.srt.layers.quantization import mxfp4_aiter_a8w4_moe as mod
 
         cls.mod = mod
         torch.manual_seed(0)
@@ -228,7 +228,6 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
             EP_HIDDEN,
             EP_INTER,
             torch.bfloat16,
-            fp4_scale_dtype=torch.float8_e8m0fnu,
         )
         with self.assertRaises(ValueError):  # hidden_size % 512
             method.create_weights(layer, E_LOCAL, 1000, EP_INTER, torch.bfloat16)
@@ -421,8 +420,8 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
             )
 
     def test_mori_cuda_graph_replay(self):
-        """One capture serves any device-side receive count (no host sync), also
-        counts above the DP-metadata estimate the grids are sized for."""
+        """One capture serves any device-side receive count up to the capture-time
+        bound (no host sync), also counts above the DP-metadata estimate."""
         from sglang.srt.layers.moe.token_dispatcher.moriep import (
             MoriEPNormalDispatchOutput,
         )
@@ -435,9 +434,9 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
         dispatch_output = self._mori_dispatch(
             MoriEPNormalDispatchOutput, xq, xs, ti, tw, count
         )
-        # 4 attention-DP ranks, only the local token count (16) known: the
-        # capture-time estimate is 64 valid rows.
-        with patch.multiple(
+        # 4 attention-DP ranks, only the local token count known: 16 now, 24 the
+        # largest captured -> rows bound 16 + 3 * 24 = 88, estimate 64.
+        with patch.object(self.mod, "_capture_max_local_tokens", 24), patch.multiple(
             "sglang.srt.layers.dp_attention",
             is_dp_attention_enabled=MagicMock(return_value=True),
             get_attention_dp_size=MagicMock(return_value=4),
@@ -451,7 +450,8 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 graph_out = method.apply(layer, dispatch_output).hidden_states
-        for valid in (64, 1, 400, 0, 512):
+        self.assertEqual(tuple(graph_out.shape), (capacity, self.ep.hidden))
+        for valid in (64, 1, 88, 0, 70):
             with self.subTest(valid=valid):
                 x2, tw2, ti2 = self.ep.mori_recv(rank, capacity, seed=10 + valid)
                 xq2, xs2, x_ref = _mori_fp8(x2)
@@ -519,10 +519,10 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
             self.assertLess(_cos_diff(ref, out), COS_TOL)
 
 
-class TestMxfp4AiterA16W4MoERunnerConfig(CustomTestCase):
+class TestMxfp4AiterA8W4MoERunnerConfig(CustomTestCase):
     def test_create_moe_runner(self):
         from sglang.srt.layers.moe import MoeRunnerConfig
-        from sglang.srt.layers.quantization import mxfp4_aiter_a16w4_moe as mod
+        from sglang.srt.layers.quantization import mxfp4_aiter_a8w4_moe as mod
 
         method = mod.Mxfp4AiterA8W4MoEMethod(MagicMock(), prefix="experts")
         with patch.object(mod, "MoeRunner") as runner:
@@ -549,7 +549,7 @@ class TestMxfp4AiterA16W4MoERunnerConfig(CustomTestCase):
 
     def test_create_moe_runner_situv2(self):
         from sglang.srt.layers.moe import MoeRunnerConfig
-        from sglang.srt.layers.quantization import mxfp4_aiter_a16w4_moe as mod
+        from sglang.srt.layers.quantization import mxfp4_aiter_a8w4_moe as mod
 
         method = mod.Mxfp4AiterA8W4MoEMethod(MagicMock(), prefix="experts")
         betas = dict(situ_beta=4.0, situ_linear_beta=25.0)
@@ -585,6 +585,35 @@ class TestMxfp4AiterA16W4MoERunnerConfig(CustomTestCase):
                     method.create_moe_runner(
                         torch.nn.Module(), MoeRunnerConfig(activation="situv2", **bad)
                     )
+
+    def test_mori_token_bounds(self):
+        """Eager: the device count. Capture: gathered DP list -> dp * max; local
+        list -> local + (dp - 1) * largest captured local; no DP attention ->
+        capacity."""
+        from sglang.srt.layers.quantization import mxfp4_aiter_a8w4_moe as mod
+
+        total = torch.tensor([37], dtype=torch.int32)
+        self.assertEqual(mod._mori_token_bounds(4096, total), (37, 37))
+        self.assertEqual(mod._mori_token_bounds(16, total), (16, 16))
+
+        def capture(gnt, dp=2, capacity=4096, dp_attn=True):
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ), patch.multiple(
+                "sglang.srt.layers.dp_attention",
+                is_dp_attention_enabled=MagicMock(return_value=dp_attn),
+                get_attention_dp_size=MagicMock(return_value=dp),
+                get_dp_global_num_tokens=MagicMock(return_value=gnt),
+            ):
+                return mod._mori_token_bounds(capacity, total)
+
+        with patch.object(mod, "_capture_max_local_tokens", 0):
+            self.assertEqual(capture([96, 40]), (192, 136))
+            self.assertEqual(capture([768]), (1536, 1536))  # largest captured first
+            self.assertEqual(capture([8]), (776, 16))  # other DP may replay 768
+            self.assertEqual(mod._capture_max_local_tokens, 768)
+            self.assertEqual(capture([768], capacity=1000), (1000, 1000))
+            self.assertEqual(capture([8], dp_attn=False), (4096, 4096))
 
 
 if __name__ == "__main__":

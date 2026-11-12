@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1130" viewBox="0 0 1200 1130"
+     font-family="Noto Sans CJK SC, Microsoft YaHei, PingFang SC, sans-serif" font-size="14">
+  <defs>
+    <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#fde2e1"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#e57373" stroke-width="3"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="1130" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="600" y="38" text-anchor="middle" font-size="22" font-weight="bold">
+    A8W4 MoE + MORI：CUDA graph 录制时用接收行数上限代替整个容量
+  </text>
+  <text x="600" y="62" text-anchor="middle" fill="#555">
+    MiMo-V2.6-Flash，DP2 × 注意力 TP4 × EP8，DFlash 每请求 8 token，decode graph 最大 bs = 96
+  </text>
+
+  <!-- ① receive buffer -->
+  <text x="40" y="100" font-size="17" font-weight="bold">① MORI 接收 buffer：每卡 8 × 16384 = 131072 行，按 A8W4_DYN_MAX_TOKENS = 32768 分成 4 块</text>
+  <g>
+    <rect x="60" y="130" width="270" height="40" fill="#eeeeee" stroke="#999"/>
+    <rect x="330" y="130" width="270" height="40" fill="#eeeeee" stroke="#999"/>
+    <rect x="600" y="130" width="270" height="40" fill="#eeeeee" stroke="#999"/>
+    <rect x="870" y="130" width="270" height="40" fill="#eeeeee" stroke="#999"/>
+    <rect x="60" y="130" width="14" height="40" fill="#43a047"/>
+    <text x="195" y="124" text-anchor="middle" fill="#555">块 0：行 0–32767</text>
+    <text x="465" y="124" text-anchor="middle" fill="#555">块 1</text>
+    <text x="735" y="124" text-anchor="middle" fill="#555">块 2</text>
+    <text x="1005" y="124" text-anchor="middle" fill="#555">块 3</text>
+    <line x1="74" y1="125" x2="74" y2="200" stroke="#2e7d32" stroke-dasharray="4,3"/>
+    <text x="80" y="195" fill="#2e7d32">有效行 total_recv：decode 时 ≤ 1536 行（占容量 1.2%），只存在于 GPU 上</text>
+    <text x="600" y="155" text-anchor="middle" fill="#777">其余全是空行，但录制 graph 时 host 不知道 total_recv</text>
+  </g>
+
+  <!-- ② before -->
+  <text x="40" y="245" font-size="17" font-weight="bold" fill="#c62828">② 修改前：录制时 rows = 容量 → 每个 MoE 层调用 4 次 a8w4_moe_dyn（每次 3 个 kernel）</text>
+  <text x="60" y="300" font-weight="bold">每个 MoE 层</text>
+  <rect x="200" y="275" width="519.6" height="44" fill="#ffb74d" stroke="#e65100"/>
+  <text x="460" y="294" text-anchor="middle">块 0：prep + gemm1 + gemm2 = 173 µs</text>
+  <text x="460" y="312" text-anchor="middle" font-size="12" fill="#5d4037">按 32768 行开 buffer（排序 / 中间结果 ≈ 0.54 GB），grid 更大</text>
+  <rect x="719.6" y="275" width="46.8" height="44" fill="url(#hatch)" stroke="#c62828"/>
+  <rect x="766.4" y="275" width="46.8" height="44" fill="url(#hatch)" stroke="#c62828"/>
+  <rect x="813.2" y="275" width="46.8" height="44" fill="url(#hatch)" stroke="#c62828"/>
+  <text x="743" y="302" text-anchor="middle" font-size="12" font-weight="bold">块1</text>
+  <text x="790" y="302" text-anchor="middle" font-size="12" font-weight="bold">块2</text>
+  <text x="837" y="302" text-anchor="middle" font-size="12" font-weight="bold">块3</text>
+  <text x="875" y="302" font-weight="bold" fill="#c62828">合计 ≈ 220 µs</text>
+  <line x1="790" y1="322" x2="790" y2="345" stroke="#c62828" marker-end="url(#arrow)"/>
+  <text x="560" y="365" fill="#c62828">空块：m_valid = 0，没有有效行，但 prep / gemm1 / gemm2 仍会发射，每块 15.6 µs，3 块 ≈ 47 µs</text>
+
+  <!-- ③ after -->
+  <text x="40" y="410" font-size="17" font-weight="bold" fill="#2e7d32">③ 修改后：录制时 rows = 上限 1536 → 每个 MoE 层只调用 1 次</text>
+  <text x="60" y="465" font-weight="bold">每个 MoE 层</text>
+  <rect x="200" y="440" width="456.9" height="44" fill="#81c784" stroke="#2e7d32"/>
+  <text x="428" y="459" text-anchor="middle">prep + gemm1 + gemm2 = 152 µs</text>
+  <text x="428" y="477" text-anchor="middle" font-size="12" fill="#1b5e20">按 1536 行开 buffer（排序 / 中间结果 ≈ 27 MB）</text>
+  <text x="875" y="467" font-weight="bold" fill="#2e7d32">合计 ≈ 152 µs</text>
+  <!-- saved brace -->
+  <path d="M657,495 v10 h203 v-10" fill="none" stroke="#1565c0" stroke-width="2"/>
+  <text x="758" y="525" text-anchor="middle" fill="#1565c0" font-weight="bold">每层省 ≈ 68 µs</text>
+  <text x="758" y="543" text-anchor="middle" fill="#1565c0" font-size="12">= 3 个空块 47 µs + 块 0 变小 21 µs</text>
+  <line x1="200" y1="270" x2="200" y2="490" stroke="#999" stroke-dasharray="3,3"/>
+  <text x="200" y="560" text-anchor="middle" font-size="11" fill="#777">0</text>
+  <text x="530" y="560" text-anchor="middle" font-size="11" fill="#777">（横轴：时间，1 µs = 3 px）</text>
+
+  <!-- ④ per decode step -->
+  <text x="40" y="600" font-size="17" font-weight="bold">④ 每步 decode：MiMo-V2.6-Flash 共 48 层，其中 47 层是 MoE</text>
+  <text x="60" y="645" font-weight="bold" fill="#c62828">修改前</text>
+  <rect x="200" y="625" width="610.5" height="34" fill="#ffb74d" stroke="#e65100"/>
+  <rect x="810.5" y="625" width="165" height="34" fill="url(#hatch)" stroke="#c62828"/>
+  <text x="505" y="647" text-anchor="middle">块 0：47 × 173 µs = 8.1 ms</text>
+  <text x="893" y="647" text-anchor="middle" font-size="12" font-weight="bold">空块 2.2 ms</text>
+  <text x="985" y="647" font-weight="bold" fill="#c62828">10.3 ms</text>
+  <text x="60" y="700" font-weight="bold" fill="#2e7d32">修改后</text>
+  <rect x="200" y="680" width="537" height="34" fill="#81c784" stroke="#2e7d32"/>
+  <text x="468" y="702" text-anchor="middle">47 × 152 µs = 7.2 ms</text>
+  <text x="745" y="702" font-weight="bold" fill="#2e7d32">7.2 ms</text>
+  <path d="M737,720 v10 h238.5 v-10" fill="none" stroke="#1565c0" stroke-width="2"/>
+  <text x="856" y="752" text-anchor="middle" fill="#1565c0" font-weight="bold">每步 decode 省 ≈ 3.2 ms</text>
+  <text x="856" y="770" text-anchor="middle" fill="#1565c0" font-size="12">（空块 2.2 ms + 块 0 变小 1.0 ms）</text>
+  <text x="200" y="770" font-size="12" fill="#777">（横轴：1 ms = 75 px）</text>
+
+  <!-- ⑤ why the bound is safe -->
+  <text x="40" y="815" font-size="17" font-weight="bold">⑤ 为什么录制时用 1536 作上限是安全的</text>
+  <rect x="60" y="835" width="300" height="80" rx="8" fill="#e3f2fd" stroke="#1565c0"/>
+  <text x="210" y="860" text-anchor="middle" font-weight="bold">DP0（本组，GPU 0–3）</text>
+  <text x="210" y="882" text-anchor="middle" font-size="13">回放 bs = 96 的 graph</text>
+  <text x="210" y="902" text-anchor="middle" font-size="13">→ 96 × 8 = 768 token（列表里只有本组）</text>
+  <rect x="60" y="930" width="300" height="80" rx="8" fill="#e3f2fd" stroke="#1565c0"/>
+  <text x="210" y="955" text-anchor="middle" font-weight="bold">DP1（另一组，GPU 4–7）</text>
+  <text x="210" y="977" text-anchor="middle" font-size="13">可能回放任意已录制的 bs ≤ 96</text>
+  <text x="210" y="997" text-anchor="middle" font-size="13">→ 最多 768 token</text>
+  <line x1="360" y1="875" x2="430" y2="915" stroke="#333" marker-end="url(#arrow)"/>
+  <line x1="360" y1="970" x2="430" y2="930" stroke="#333" marker-end="url(#arrow)"/>
+  <rect x="435" y="890" width="250" height="60" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="560" y="915" text-anchor="middle" font-weight="bold">本卡最多收到</text>
+  <text x="560" y="937" text-anchor="middle">768 + (2 − 1) × 768 = 1536 行</text>
+  <g font-size="13">
+    <text x="710" y="850">• MORI 对同一张卡去重：每个 token 最多发到这张卡一次，</text>
+    <text x="722" y="868">所以接收行数 ≤ 本步所有 DP 的 token 总数</text>
+    <text x="710" y="893">• 只有所有 DP 都在 decode 且都用已录制的 bs 时才走 graph</text>
+    <text x="722" y="911">（can_cuda_graph 取各 DP 的最小值），所以对方 ≤ 最大 bs</text>
+    <text x="710" y="936">• graph 从最大 bs 开始录制：第一次录制就记下最大单 DP</text>
+    <text x="722" y="954">token 数 768（_capture_max_local_tokens）</text>
+    <text x="710" y="979">• 上限 = 本组 token 数 + (dp − 1) × 768；eager（prefill 等）</text>
+    <text x="722" y="997">直接读 GPU 上的 total_recv，行数精确</text>
+  </g>
+
+  <!-- footnote -->
+  <text x="40" y="1050" font-size="12" fill="#777">时间来自单卡 MI325X 上的 CUDA graph 微基准（a8w4_moe_dyn，fp8 输入，m_valid = 256，est = 512；空块 m_valid = 0）。</text>
+  <text x="40" y="1068" font-size="12" fill="#777">每步收益 = 每层差值 × 47 个 MoE 层的估算，实际值随 batch 大小、路由和 kernel 重叠情况变化，需在服务器上实测确认。</text>
+  <text x="40" y="1086" font-size="12" fill="#777">输出 buffer 仍按 MORI 容量分配（MORI combine 读前 total_recv 行），上表只比较 MoE 计算和中间 buffer。</text>
+</svg>

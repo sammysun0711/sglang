@@ -5,7 +5,7 @@
 ```bash
 docker run -it --name mimo-v26-flash-opt-gfx942 --ipc=host --network=host --privileged --security-opt seccomp=unconfined \
 --cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE --device=/dev/kfd --device=/dev/dri --device=/dev/mem  -v $HOME:/root/workspace  \
--v /data/models:/models  rocm/sgl-dev:v0.5.11-rocm720-mi30x-20260510
+-v /data/models:/models  lmsysorg/sglang:v0.5.21-rocm724-mi30x
 ```
 
 ## 2. Environment setup

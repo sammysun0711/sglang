@@ -102,7 +102,7 @@ def _mori_token_bounds(capacity: int, total_recv: torch.Tensor) -> Tuple[int, in
     return capacity, max(1, min(capacity, est))
 
 
-class Mxfp4AiterA16W4MoEMethod:
+class Mxfp4AiterA8W4MoEMethod:
     """MXFP4 (E8M0 scales) MoE on gfx942: fp8 activations x MXFP4 weights."""
 
     def __init__(self, fp8_method, prefix: str):
@@ -121,7 +121,7 @@ class Mxfp4AiterA16W4MoEMethod:
     ):
         if with_bias:
             raise NotImplementedError(
-                "Mxfp4AiterA16W4MoEMethod does not support MoE GEMM biases."
+                "Mxfp4AiterA8W4MoEMethod does not support MoE GEMM biases."
             )
         _check_kernel_shape(
             (

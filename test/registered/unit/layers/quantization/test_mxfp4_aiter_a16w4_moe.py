@@ -164,7 +164,7 @@ def _make_layer(ckpt, rank=0, ep_size=1, a2a=MoeA2ABackend.NONE, **runner_config
     layer.num_experts = ckpt.experts * ep_size
     layer.top_k = ckpt.topk
     layer.dispatcher = MagicMock()
-    method = mod.Mxfp4AiterA16W4MoEMethod(MagicMock(), prefix="experts")
+    method = mod.Mxfp4AiterA8W4MoEMethod(MagicMock(), prefix="experts")
     with patch.object(mod, "get_moe_a2a_backend", return_value=a2a), patch.object(
         mod, "MoeRunner"
     ):
@@ -188,7 +188,7 @@ def _standard_dispatch(x, topk_weights, topk_ids):
     )
 
 
-class TestMxfp4AiterA16W4MoEMethod(CustomTestCase):
+class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not _is_gfx942():
@@ -218,7 +218,7 @@ class TestMxfp4AiterA16W4MoEMethod(CustomTestCase):
 
     def test_create_weights_checks_kernel_shape(self):
         fp8_method = MagicMock()
-        method = self.mod.Mxfp4AiterA16W4MoEMethod(fp8_method, prefix="experts")
+        method = self.mod.Mxfp4AiterA8W4MoEMethod(fp8_method, prefix="experts")
         layer = torch.nn.Module()
         layer.num_experts, layer.top_k = EP * E_LOCAL, EP_TOPK
         method.create_weights(layer, E_LOCAL, EP_HIDDEN, EP_INTER, torch.bfloat16)
@@ -524,7 +524,7 @@ class TestMxfp4AiterA16W4MoERunnerConfig(CustomTestCase):
         from sglang.srt.layers.moe import MoeRunnerConfig
         from sglang.srt.layers.quantization import mxfp4_aiter_a16w4_moe as mod
 
-        method = mod.Mxfp4AiterA16W4MoEMethod(MagicMock(), prefix="experts")
+        method = mod.Mxfp4AiterA8W4MoEMethod(MagicMock(), prefix="experts")
         with patch.object(mod, "MoeRunner") as runner:
             for a2a in (MoeA2ABackend.NONE, MoeA2ABackend.MORI):
                 with patch.object(mod, "get_moe_a2a_backend", return_value=a2a):
@@ -551,7 +551,7 @@ class TestMxfp4AiterA16W4MoERunnerConfig(CustomTestCase):
         from sglang.srt.layers.moe import MoeRunnerConfig
         from sglang.srt.layers.quantization import mxfp4_aiter_a16w4_moe as mod
 
-        method = mod.Mxfp4AiterA16W4MoEMethod(MagicMock(), prefix="experts")
+        method = mod.Mxfp4AiterA8W4MoEMethod(MagicMock(), prefix="experts")
         betas = dict(situ_beta=4.0, situ_linear_beta=25.0)
         inf = float("inf")
         with patch.object(mod, "MoeRunner"):

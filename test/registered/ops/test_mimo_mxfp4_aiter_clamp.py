@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutp
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.layers.quantization.mxfp4_aiter_a16w4_moe import (
-    Mxfp4AiterA16W4MoEMethod,
+    Mxfp4AiterA8W4MoEMethod,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -118,7 +118,7 @@ def test_native_adapter_unclamped_eager_and_graph(monkeypatch, tokens, limit):
     layer.dispatcher = SimpleNamespace(
         expert_mask_gpu=None, set_quant_config=lambda _: None
     )
-    method = Mxfp4AiterA16W4MoEMethod(None, "test.native_clamp")
+    method = Mxfp4AiterA8W4MoEMethod(None, "test.native_clamp")
     method.process_weights_after_loading(layer)
     method.create_moe_runner(
         layer, MoeRunnerConfig(activation="silu", top_k=topk, swiglu_limit=limit)

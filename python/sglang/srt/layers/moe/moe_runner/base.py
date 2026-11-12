@@ -65,6 +65,9 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
+    # activation="situv2": beta * tanh(g / beta) * sigmoid(g) * lb * tanh(u / lb)
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
 
 
 @dataclass

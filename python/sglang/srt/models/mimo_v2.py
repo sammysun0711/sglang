@@ -65,6 +65,12 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.mimo_sp import (
+    mimo_tp_sp_active,
+    mimo_tp_sp_enabled,
+    run_mimo_tp_sp_moe,
+)
+from sglang.srt.layers.moe.mimo_sp import split_mimo_moe_inputs as _mimo_moe_inputs
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -139,14 +145,6 @@ def _mimo_hidden_num_tokens(hidden_states) -> int:
     return states.shape[0]
 
 
-def _mimo_moe_inputs(hidden_states):
-    """Split fused MiMo MLP input into router BF16 and FMoE activation."""
-    if isinstance(hidden_states, tuple) and len(hidden_states) == 3:
-        normalized, quantized, scale = hidden_states
-        return normalized, (quantized, scale)
-    return hidden_states, hidden_states
-
-
 def _mimo_ep_sp_supported() -> bool:
     args = get_global_server_args()
     return (
@@ -175,6 +173,25 @@ def _mimo_ep_sp_active(forward_batch: ForwardBatch) -> bool:
         return False
     sizes = get_dp_global_num_tokens()
     return sizes is not None and sum(sizes) >= 2048
+
+
+def _mimo_tp_sp_flash_config(config) -> bool:
+    """Initial TP SP model geometry; other MiMo variants need separate qualification."""
+    expected = {
+        "hidden_size": 4096,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 192,
+        "v_head_dim": 128,
+        "swa_num_attention_heads": 64,
+        "swa_num_key_value_heads": 8,
+        "swa_head_dim": 192,
+        "swa_v_head_dim": 128,
+        "n_routed_experts": 256,
+        "moe_intermediate_size": 2048,
+        "num_experts_per_tok": 8,
+    }
+    return all(getattr(config, key, None) == value for key, value in expected.items())
 
 
 def _mimo_needs_v_padding(
@@ -475,6 +492,12 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
+        self._sp_tp_moe = mimo_tp_sp_enabled()
+        self._pyhip_moe: Optional[bool] = None
+        if self._sp_tp_moe and not getattr(
+            self.experts.quant_method, "convert_mxfp4_to_fp8", False
+        ):
+            raise ValueError("MiMo TP prefill SP requires static MXFP4-to-FP8 experts")
 
     def get_moe_weights(self):
         return [
@@ -490,6 +513,8 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        if self._sp_tp_moe and mimo_tp_sp_active(forward_batch):
+            return run_mimo_tp_sp_moe(self, hidden_states)
         if not self._enable_a2a_moe:
             return self.forward_normal(
                 hidden_states,
@@ -721,21 +746,18 @@ class MiMoV2Attention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
-
-        # Keep TP weights for decode/verify and small prefill. SP weights are
-        # loaded from the same checkpoint tensors, without weight collectives.
+        # Both SP modes share full-head weights; their MoE/attention dispatch differs.
+        self._ep_sp_swa = (
+            envs.SGLANG_ENABLE_MIMO_SWA_SP.get() and _mimo_ep_sp_supported()
+        )
         self.qkv_proj_full = None
-        self.o_proj_full = None
         if (
-            envs.SGLANG_ENABLE_MIMO_SWA_SP.get()
-            and _mimo_ep_sp_supported()
+            (mimo_tp_sp_enabled() or self._ep_sp_swa)
             and sliding_window_size > 0
-            and self.total_num_heads == 64
-            and self.total_num_kv_heads == 8
-            and self.head_dim == 192
-            and self.original_v_head_dim == 128
-            and not self.needs_v_pad
             and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and (num_heads, num_kv_heads, self.head_dim, self.original_v_head_dim)
+            == (64, 8, 192, 128)
+            and not self.needs_v_pad
         ):
             self.qkv_proj_full = QKVParallelLinear(
                 hidden_size,
@@ -749,13 +771,6 @@ class MiMoV2Attention(nn.Module):
                 tp_size=1,
                 prefix=add_prefix("qkv_proj", prefix),
                 skip_block_quant_check=True,
-            )
-            self.o_proj_full = ReplicatedLinear(
-                self.total_num_heads * self.original_v_head_dim,
-                hidden_size,
-                bias=False,
-                params_dtype=self.o_proj.params_dtype,
-                prefix=add_prefix("o_proj", prefix),
             )
 
         self.rotary_emb = get_rope(
@@ -791,48 +806,50 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
-
-        self.attention_sink_full = (
-            nn.Parameter(
-                torch.empty(self.total_num_heads, dtype=torch.float32),
-                requires_grad=False,
+        # Full-head SWA output-projection and sink weights.
+        self.o_proj_full: Optional[torch.Tensor] = None
+        self.attention_sink_full: Optional[torch.Tensor] = None
+        if self._ep_sp_swa and self.qkv_proj_full is not None:
+            # Preserve upstream PR43's direct checkpoint loading for EP SWA.
+            self.o_proj_full = ReplicatedLinear(
+                self.total_num_heads * self.original_v_head_dim,
+                hidden_size,
+                bias=False,
+                params_dtype=self.o_proj.params_dtype,
+                prefix=add_prefix("o_proj", prefix),
             )
-            if self.qkv_proj_full is not None and attention_sink_bias
-            else None
-        )
+            if attention_sink_bias:
+                self.attention_sink_full = torch.nn.Parameter(
+                    torch.empty(self.total_num_heads, dtype=torch.float32),
+                    requires_grad=False,
+                )
 
-    def load_sp_weight(self, name, loaded_weight):
-        """Fill the SP copy from the same tensor used by the normal TP loader."""
-        if self.qkv_proj_full is None:
+    def build_sp_weights(self):
+        """Assemble full-head weights from the attention-TP shards (after load_weights)."""
+        from sglang.srt.layers.attention.mimo_sp import _mimo_attn_tp_gather
+
+        if self._ep_sp_swa or self.qkv_proj_full is None:
             return
-        if name == "o_proj.weight":
-            default_weight_loader(self.o_proj_full.weight, loaded_weight)
-        elif name == "attention_sink_bias" and self.attention_sink_full is not None:
-            default_weight_loader(self.attention_sink_full, loaded_weight)
-        elif name.startswith("qkv_proj."):
-            param_name = name.split(".", 1)[1]
-            full = getattr(self.qkv_proj_full, param_name, None)
-            if full is None:
-                return
-            if loaded_weight.shape != full.shape:
-                raise ValueError(
-                    f"MiMo SWA SP needs the full checkpoint tensor for {name}: "
-                    f"expected {tuple(full.shape)}, got {tuple(loaded_weight.shape)}. "
-                    "Disable SGLANG_ENABLE_MIMO_SWA_SP to load TP-only shards."
-                )
-            shard = getattr(self.qkv_proj, param_name)
-            if full.shape != shard.shape:
-                loaded_weight = _mimo_reorder_fused_qkv(
-                    loaded_weight,
-                    (self.q_size, self.k_size, self.v_size),
-                    get_attention_tp_size(),
-                )
-            default_weight_loader(full, loaded_weight)
-        elif name.startswith(("q_proj.", "k_proj.", "v_proj.")):
-            proj_name, param_name = name.split(".", 1)
-            full = getattr(self.qkv_proj_full, param_name, None)
-            if full is not None:
-                full.weight_loader(full, loaded_weight, proj_name[0])
+        if isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
+            shard = self.o_proj.weight.data
+            self.o_proj_full = (
+                _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
+            )
+        if self.attention_sink_bias is not None:
+            self.attention_sink_full = _mimo_attn_tp_gather(
+                self.attention_sink_bias.data
+            )
+        sizes = (self.q_size, self.k_size, self.v_size)
+        full_params = dict(self.qkv_proj_full.named_parameters())
+        for name, shard in self.qkv_proj.named_parameters():
+            full = full_params[name]
+            if full.shape == shard.shape:
+                full.data.copy_(shard.data)
+                continue
+            attn_tp = get_attention_tp_size()
+            assert full.shape == (attn_tp * shard.shape[0], *shard.shape[1:]), name
+            gathered = _mimo_attn_tp_gather(shard.data)
+            full.data.copy_(_mimo_reorder_fused_qkv(gathered, sizes, attn_tp))
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -919,6 +936,39 @@ class MiMoV2Attention(nn.Module):
 
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_sp_weight(self, name, loaded_weight):
+        """Fill the SP copy from the same tensor used by the normal TP loader."""
+        if not self._ep_sp_swa or self.qkv_proj_full is None:
+            return
+        if name == "o_proj.weight":
+            default_weight_loader(self.o_proj_full.weight, loaded_weight)
+        elif name == "attention_sink_bias" and self.attention_sink_full is not None:
+            default_weight_loader(self.attention_sink_full, loaded_weight)
+        elif name.startswith("qkv_proj."):
+            param_name = name.split(".", 1)[1]
+            full = getattr(self.qkv_proj_full, param_name, None)
+            if full is None:
+                return
+            if loaded_weight.shape != full.shape:
+                raise ValueError(
+                    f"MiMo SWA SP needs the full checkpoint tensor for {name}: "
+                    f"expected {tuple(full.shape)}, got {tuple(loaded_weight.shape)}. "
+                    "Disable SGLANG_ENABLE_MIMO_SWA_SP to load TP-only shards."
+                )
+            shard = getattr(self.qkv_proj, param_name)
+            if full.shape != shard.shape:
+                loaded_weight = _mimo_reorder_fused_qkv(
+                    loaded_weight,
+                    (self.q_size, self.k_size, self.v_size),
+                    get_attention_tp_size(),
+                )
+            default_weight_loader(full, loaded_weight)
+        elif name.startswith(("q_proj.", "k_proj.", "v_proj.")):
+            proj_name, param_name = name.split(".", 1)
+            full = getattr(self.qkv_proj_full, param_name, None)
+            if full is not None:
+                full.weight_loader(full, loaded_weight, proj_name[0])
 
 
 class MiMoV2DecoderLayer(nn.Module):
@@ -1046,7 +1096,23 @@ class MiMoV2DecoderLayer(nn.Module):
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
-
+        # SGLANG_ENABLE_MIMO_SWA_SP: token-scattered residual and MoE layout for large forward passes.
+        self.layer_communicator_sp = None
+        if mimo_tp_sp_enabled():
+            self.layer_communicator_sp = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes.init_new(
+                    layer_id=layer_id,
+                    num_layers=config.num_hidden_layers,
+                    is_layer_sparse=self.is_layer_sparse,
+                    is_previous_layer_sparse=is_previous_layer_sparse,
+                    is_next_layer_sparse=is_next_layer_sparse,
+                    sp_tp_moe=True,
+                ),
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            )
         # SWA attention on the token shard in extend batches.
         self.layer_communicator_sp_attn = None
         if self.self_attn.qkv_proj_full is not None:
@@ -1057,6 +1123,7 @@ class MiMoV2DecoderLayer(nn.Module):
                     is_layer_sparse=self.is_layer_sparse,
                     is_previous_layer_sparse=is_previous_layer_sparse,
                     is_next_layer_sparse=is_next_layer_sparse,
+                    sp_tp_moe=self.layer_communicator_sp is not None,
                     sp_attn=True,
                 ),
                 input_layernorm=self.input_layernorm,
@@ -1126,13 +1193,26 @@ class MiMoV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
-        sp_swa = (
-            self.layer_communicator_sp_attn is not None
+        sp_swa = False
+        if self.layer_communicator_sp is not None and mimo_tp_sp_active(forward_batch):
+            communicator = self.layer_communicator_sp
+            if (
+                self.layer_communicator_sp_attn is not None
+                and self.self_attn.o_proj_full is not None
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and forward_batch.extend_seq_lens_cpu is not None
+                and positions.ndim == 1
+            ):
+                communicator = self.layer_communicator_sp_attn
+                sp_swa = True
+        elif (
+            self.self_attn._ep_sp_swa
+            and self.layer_communicator_sp_attn is not None
             and self.self_attn.o_proj_full is not None
             and _mimo_ep_sp_active(forward_batch)
-        )
-        if sp_swa:
+        ):
             communicator = self.layer_communicator_sp_attn
+            sp_swa = True
         # Self Attention
         hidden_states, residual = (
             communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -1576,6 +1656,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
+
+        if mimo_tp_sp_enabled() and not _mimo_tp_sp_flash_config(config):
+            raise ValueError(
+                "MiMo TP prefill SP currently supports the Flash geometry only"
+            )
 
         if not self.config.encoder_only:
             self.model = MiMoV2Model(
@@ -2057,6 +2142,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        for layer in getattr(self.model, "layers", ()):
+            attn = getattr(layer, "self_attn", None)
+            if isinstance(attn, MiMoV2Attention):
+                attn.build_sp_weights()
 
     def get_embed_and_head(self):
         assert (

@@ -3,8 +3,7 @@ set -euo pipefail
 
 # Prefill-only client benchmark.
 # Default customer_pressure follows the executable arrays in
-# benchmark_sglang_prefill.sh: OSL=1, text prompts. Warmup uses 16 concurrent
-# requests for 4K to exercise larger prefill batches, and 4 for other lengths.
+# benchmark_sglang_prefill.sh: OSL=1 and text prompts.
 # Its 4K/8K rows differ from that script's header comments.
 # Set DATASET_PATH to the customer's ShareGPT JSON; when unset, bench_serving
 # uses its standard cached/downloaded ShareGPT dataset. Model/host/port are local.
@@ -14,6 +13,10 @@ set -euo pipefail
 # --flush-cache below does not disable the server's radix cache.
 #
 # DRY_RUN=1 prints commands without contacting the server or creating logs.
+# Client warmup defaults to 16 requests for customer_pressure 4K and 4 elsewhere.
+# WARMUP_REQUESTS_OVERRIDE changes the client count; 0 disables client warmup.
+# The 32 representative prefill requests run during server startup when
+# SGLANG_ENABLE_MIMO_SWA_SP=1; this client does not repeat that sequence.
 # BENCHMARK_PRESET=sweep restores the previous matrix and prompt-count policy.
 # BENCHMARK_PRESET=simple uses 64 measured prompts per input, OSL=1, and
 # concurrency 16/16/12/3/2/2/2/2/2/2 for 4K/8K/16K/32K/64K/128K/256K/512K/768K/1M.
@@ -34,7 +37,6 @@ model="${MODEL:-/models/MiMo-V2.6-Flash-MOPD}"
 host="${HOST:-0.0.0.0}"
 port="${PORT:-30001}"
 dataset_path="${DATASET_PATH:-}"
-default_warmup_requests=4
 declare -A matrix_output_tokens matrix_num_prompts matrix_concurrency
 case "${benchmark_preset}" in
   customer_pressure)
@@ -122,7 +124,7 @@ output_tokens=1
 small_input_concurrency_list="${SMALL_INPUT_CONCURRENCY_LIST_OVERRIDE:-${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_small_concurrency}}}"
 short_concurrency_list="${SHORT_CONCURRENCY_LIST_OVERRIDE:-${default_short_concurrency}}"
 long_concurrency_list="${LONG_CONCURRENCY_LIST_OVERRIDE:-${default_long_concurrency}}"
-warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-${default_warmup_requests}}"
+warmup_requests="${WARMUP_REQUESTS_OVERRIDE:-4}"
 tokenize_prompt="${TOKENIZE_PROMPT:-0}"
 small_input_num_prompts="${SMALL_INPUT_NUM_PROMPTS_OVERRIDE:-${default_small_num_prompts}}"
 prompt_waves="${PROMPT_WAVES:-4}"
@@ -246,8 +248,12 @@ done
 
 echo "Benchmark preset: ${benchmark_preset}; dry run: ${dry_run}"
 echo "Dataset: ${dataset_path:-standard ShareGPT cache/download}; tokenize-prompt=${tokenize_prompt}"
+echo "Client warmup requests: ${warmup_requests}"
 if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
-  echo "Client matrix: benchmark_sglang_prefill.sh active arrays; warmups: 4K=${WARMUP_REQUESTS_OVERRIDE:-16}, others=${warmup_requests}."
+  echo "Client warmup policy: 4K=${WARMUP_REQUESTS_OVERRIDE:-16}, others=${warmup_requests}."
+fi
+if [[ "${benchmark_preset}" == "customer_pressure" ]]; then
+  echo "Client matrix: benchmark_sglang_prefill.sh active arrays."
   echo "Offered request rate is unlimited; each case uses its global concurrency cap."
   echo "Server topology, chunk size, DFlash, quantization and radix-cache mode are configured separately."
 fi

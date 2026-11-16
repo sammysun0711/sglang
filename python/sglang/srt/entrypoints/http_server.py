@@ -392,6 +392,20 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
 
+    # MiMo SP needs varied prefill shapes before any HTTP worker is ready.
+    # This is gated by SGLANG_ENABLE_MIMO_SWA_SP, independently of the generic
+    # smoke request controlled by --skip-server-warmup.
+    from sglang.srt.entrypoints.mimo_prefill_warmup import maybe_warmup_mimo_prefill
+
+    await maybe_warmup_mimo_prefill(
+        _global_state.tokenizer_manager,
+        main_pid=(
+            None
+            if getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            else get_main_process_id()
+        ),
+    )
+
     # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(

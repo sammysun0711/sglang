@@ -31,6 +31,13 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+def _all_active_dp_ranks_prefill(forward_modes):
+    """Plain EXTEND on every active DP replica; idle replicas join its MoE collectives."""
+    return ForwardMode.EXTEND in forward_modes and all(
+        mode in (ForwardMode.EXTEND, ForwardMode.IDLE) for mode in forward_modes
+    )
+
+
 @dataclass
 class MLPSyncBatchInfo:
     dp_size: int
@@ -51,6 +58,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    all_extend_in_batch: bool = False
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -108,9 +116,16 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
+        # Reuse the existing metadata transfer/collective for a rank-consistent SP
+        # decision. is_extend_in_batch alone also includes TARGET_VERIFY and MIXED.
+        sp_enabled = envs.SGLANG_ENABLE_MIMO_SWA_SP.get()
+        metadata_columns = 6 if sp_enabled else 2
+        cpu_data = tp0_info[:, :metadata_columns].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        self.all_extend_in_batch = sp_enabled and _all_active_dp_ranks_prefill(
+            cpu_data[:, 5].tolist()
+        )
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
@@ -124,6 +139,11 @@ def _update_gather_batch(
     require_mlp_tp_gather: bool,
     skip_all_gather=False,
 ):
+    # Reset on every synchronization, including skip_all_gather, so decode cannot
+    # inherit eligibility from a ScheduleBatch previously used for prefill.
+    batch.all_extend_in_batch = (
+        not skip_all_gather and mlp_sync_info.all_extend_in_batch
+    )
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]

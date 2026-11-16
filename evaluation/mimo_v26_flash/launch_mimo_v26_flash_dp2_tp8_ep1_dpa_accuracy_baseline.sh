@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Eight GPUs, global MoE TP8, two attention TP4 groups, FP8 experts by default.
-# Stage 1 is non-speculative; ENABLE_DFLASH=1 selects the stage-2 draft.
+# DFlash is enabled by default; ENABLE_DFLASH=0 selects target-only serving.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -33,7 +33,11 @@ export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 export SGLANG_ENABLE_ASYNC_ASSERT=1
 export SGLANG_FUSED_ASYNC_OOB_CHECKS=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+export SGLANG_ENABLE_MIMO_SWA_SP="${SGLANG_ENABLE_MIMO_SWA_SP:-1}"
+export SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM="${SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM:-1}"
 export SGLANG_USE_PYHIP_MIMO_PREFILL="${SGLANG_USE_PYHIP_MIMO_PREFILL:-1}"
+export FLYDSL_RUNTIME_ENABLE_CACHE="${FLYDSL_RUNTIME_ENABLE_CACHE:-1}"
+export FLYDSL_AUTOTUNE="${FLYDSL_AUTOTUNE:-0}"
 export SGLANG_FLYPA_MIMO_PREFILL="${SGLANG_FLYPA_MIMO_PREFILL:-1}"
 export SGLANG_FLYDSL_MIMO_PREFILL=0
 export SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d
@@ -50,22 +54,20 @@ export SGLANG_AITER_MIMO_FRESH_BF16_ASM=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=0
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
 
-# DPA divides both limits by DP2: 16K prefill and 96 requests/group.
+# DPA divides both limits by DP2: 16K prefill and 48 requests/group.
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.75}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-1048576}"
 CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_DIR="${LOG_DIR:-${SGLANG_ROOT}/evaluation/logs/mimo_dp_attention_${RUN_ID}}"
 ENABLE_DFLASH="${ENABLE_DFLASH:-1}"
-default_mem_fraction=0.75
 dflash_args=()
 case "${ENABLE_DFLASH}" in
   0) ;;
   1)
     # Five draft KV layers mirror full target slots and are included in sizing.
-    # TP8 MoE frees more target capacity; reserve scratch for 32K prefill too.
-    default_mem_fraction=0.60
     export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-flydsl}"
     export SGLANG_DFLASH_FUSED_COMPACT_KV="${SGLANG_DFLASH_FUSED_COMPACT_KV:-1}"
     export SGLANG_SPEC_NAN_DETECTION=1
@@ -83,6 +85,18 @@ case "${ENABLE_DFLASH}" in
     ;;
   *) echo "ENABLE_DFLASH must be 0 or 1" >&2; exit 2 ;;
 esac
+
+prefill_args=()
+case "${ENABLE_PREFILL_DELAYER:-1}" in
+  1)
+    prefill_args+=(
+      --enable-prefill-delayer
+      --prefill-delayer-max-delay-passes "${PREFILL_DELAYER_MAX_DELAY_PASSES:-100}"
+    )
+    ;;
+  0) ;;
+  *) echo "ENABLE_PREFILL_DELAYER must be 0 or 1" >&2; exit 2 ;;
+esac
 # MiMo vision stays within each attention TP4 replica.
 
 server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
@@ -91,12 +105,16 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
   --tp-size 8 --dp-size 2 --ep-size 1
   --enable-dp-attention --enable-dp-lm-head
   --moe-a2a-backend none --moe-runner-backend aiter
+  --moe-dense-tp-size 1
+  --tokenizer-worker-num "${TOKENIZER_WORKER_NUM:-8}"
+  --tokenizer-backend "${TOKENIZER_BACKEND:-huggingface}"
+  --disable-tokenizer-batch-decode
   --attention-backend aiter --mm-attention-backend aiter_attn
   --kv-cache-dtype bf16 --page-size 64
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
   --max-prefill-tokens 1048576 --context-length 1048576
-  --mem-fraction-static "${MEM_FRACTION_STATIC:-${default_mem_fraction}}"
+  --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO:-0.03}"
   --disable-radix-cache
   --cuda-graph-backend-decode "${CUDA_GRAPH_BACKEND_DECODE}"
@@ -105,6 +123,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
   --host "${SERVER_HOST:-127.0.0.1}" --port "${SERVER_PORT:-30001}"
   --trust-remote-code --reasoning-parser mimo --tool-call-parser mimo
   "${dflash_args[@]}"
+  "${prefill_args[@]}"
   "$@"
 )
 

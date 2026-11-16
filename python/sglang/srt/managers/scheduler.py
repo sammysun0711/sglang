@@ -465,6 +465,17 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        from sglang.srt.entrypoints.mimo_prefill_warmup import (
+            warmup_mimo_prefill_memory_kernels,
+        )
+
+        warmup_mimo_prefill_memory_kernels(
+            self.server_args,
+            self.model_config,
+            self.req_to_token_pool,
+            self.max_running_requests,
+        )
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 

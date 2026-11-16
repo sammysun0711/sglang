@@ -82,6 +82,15 @@ pip install amd_mori==1.2.4
 
 The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
 
+The TP8/DP2/EP1 baseline launcher includes the prefill settings: shared SP
+enabled through `SGLANG_ENABLE_MIMO_SWA_SP=1`, dense TP1, eight Hugging Face
+tokenizer workers, disabled tokenizer batch decode, and a 100-pass prefill
+delayer. Requested memory defaults to `0.75`, including with DFlash enabled.
+Use `TOKENIZER_WORKER_NUM`, `TOKENIZER_BACKEND`, `MEM_FRACTION_STATIC` and
+`PREFILL_DELAYER_MAX_DELAY_PASSES` to override these values, or
+`ENABLE_PREFILL_DELAYER=0` to disable the delayer. No Fastokens overlay is
+required. Additional CLI arguments take precedence over launcher defaults.
+
 ### Launch TBO-off server
 
 ```bash
@@ -142,16 +151,35 @@ LOG_DIR=./logs/mimo_v26_flash_dp2_tp8_ep8_dpa_prefill \
 ```
 
 The client keeps `TOKENIZE_PROMPT=0` by default and uses the preset's input
-lengths, concurrency, and request counts. The 4K point runs 16 concurrent warmup
-requests to exercise larger prefill batches; other points run four. Set
-`WARMUP_REQUESTS_OVERRIDE` to override these counts. Each point flushes the cache
-before measurement. The client reports TTFT and input token throughput for the
-whole server.
+lengths, concurrency, and request counts. Client warmup defaults to 16 uniform
+requests for the `customer_pressure` 4K point and four elsewhere.
+`WARMUP_REQUESTS_OVERRIDE` overrides this count; zero disables client warmup.
+Each point flushes the cache before measurement. The client reports TTFT and
+input-token throughput for the whole server. There is no warmup-mode selector;
+set `WARMUP_REQUESTS_OVERRIDE=4` to use four client requests at every point.
+
+With `SGLANG_ENABLE_MIMO_SWA_SP=1`, the server executes the 32 representative
+prefill requests once before HTTP readiness, shared across tokenizer workers.
+Both launchers enable the flag by default; set it to `0` to skip this sequence.
+To reproduce the earlier startup-only warmup
+protocol, use `WARMUP_REQUESTS_OVERRIDE=0`. `--skip-server-warmup` controls the 
+generic smoke request independently of this SP-gated representative warmup. 
+Record warmup counts and distinguish compiler calls from cache loads in performance results.
 
 For **accuracy tests**, stop the performance server and rerun the launch command
 with **`PERFORMANCE_MODE=0`** to enable real expert routing. Set `ENABLE_DFLASH=0`
 for target-only accuracy or `ENABLE_DFLASH=1` for DFlash accuracy, then follow
 the GSM8K evaluation steps in section 8.
+
+`SGLANG_ENABLE_MIMO_SWA_SP` is the shared SP enable flag for both supported
+TP8/DP2/EP1 and MORI/EP configurations. The implementation selects the path
+from the topology and backend. The TP path also shards residuals and MoE
+inputs; the EP path retains MORI expert dispatch/combine. Both launchers
+enable the flag by default; set it to `0` to disable their SP path.
+Eligible TP SP layers select the PyHIP FP8 MoE internally. Unsupported MoE
+layouts or workspace sizes retain the AITER/reduce-scatter fallback. Full
+attention uses the ordinary output projection and communicator reduction;
+SWA retains its full-head projection.
 
 ## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 

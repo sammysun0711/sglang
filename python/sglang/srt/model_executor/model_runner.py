@@ -2504,6 +2504,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cuda":
             return
 
+        if _is_hip and not self.is_draft_worker and self.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.triton_ops.dflash_bookkeeping import (
+                warmup_dflash_decode_bookkeeping,
+            )
+
+            warmup_dflash_decode_bookkeeping(
+                self.req_to_token_pool.req_to_token,
+                self.max_running_requests,
+                self.server_args.page_size,
+            )
+
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 

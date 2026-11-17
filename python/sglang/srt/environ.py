@@ -530,6 +530,10 @@ class Envs:
     # The TP path requires globally agreed plain prefill, including idle replicas.
     # Decode, speculative verify, mixed batches and CUDA graphs keep the original path.
     SGLANG_ENABLE_MIMO_SWA_SP = EnvBool(False)
+    # Opt-in native DFlash target graph MoE sequence parallelism.
+    SGLANG_MIMO_GRAPH_VERIFY_SP = EnvBool(False)
+    SGLANG_MIMO_GRAPH_SP_PACKED = EnvBool(False)
+    SGLANG_MIMO_FUSED_SP_PACKET = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)

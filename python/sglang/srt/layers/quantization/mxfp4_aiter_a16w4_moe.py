@@ -291,8 +291,11 @@ class Mxfp4AiterA16W4MoEMethod:
                 # (flydsl_moe_tp_w4a8_gfx942/configs/a8w4_moe_tuned.txt; untuned
                 # shapes fall back to the 2-kernel bm64 config)
                 output = tuned_moe(hidden_states, layer.all_weights,
-                                   topk_output.topk_weights, topk_output.topk_ids)
+                                   topk_output.topk_weights, topk_output.topk_ids,
+                                   input_scale=dispatch_output.hidden_states_scale)
             else:
+                if dispatch_output.hidden_states_scale is not None:
+                    raise ValueError("Prequantized native MoE requires fd2 weights")
                 output = a8w4_fused_moe(hidden_states, layer.all_weights,
                                         topk_output.topk_weights, topk_output.topk_ids,
                                         block_m=64, fuse_quant=True)

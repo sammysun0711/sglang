@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
-export MODEL="${MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash}"
+export MODEL="${MODEL:-/models/MiMo-V2.6-Flash-MOPD}"
 export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-30001}"
 export DATASET_PATH="${DATASET_PATH:-${REPO_ROOT}/scripts/ShareGPT_V3_unfiltered_cleaned_split.json}"
@@ -17,7 +17,7 @@ export WARMUP_REQUESTS="${WARMUP_REQUESTS:-32}"
 # NUM_PROMPTS override remains available for a deliberately longer run.
 export PROMPT_WAVES="${PROMPT_WAVES:-4}"
 export NUM_PROMPTS="${NUM_PROMPTS:-}"
-export BENCHMARK_PRESET="${BENCHMARK_PRESET:-baseline_highest}"
+export BENCHMARK_PRESET="${BENCHMARK_PRESET:-mimo_v26_flash}"
 DRY_RUN="${DRY_RUN:-0}"
 
 if [[ "${DRY_RUN}" != "0" && "${DRY_RUN}" != "1" ]]; then
@@ -42,13 +42,31 @@ if [[ "${DRY_RUN}" == "0" ]]; then
   curl -fsS --max-time 5 "http://${HOST}:${PORT}/health" >/dev/null
 fi
 
-# supplied IDs | actual input after four MiMo special tokens | label | concurrency
+# supplied token IDs | reported input length | label | global concurrency
+# The Flash preset sends explicit token IDs and uses equal input lengths.
 # CASE_SPECS may override this with newline-separated entries in the same
 # format, allowing one targeted case without editing this file.
 if [[ -n "${CASE_SPECS:-}" ]]; then
   mapfile -t cases <<<"${CASE_SPECS}"
 else
   case "${BENCHMARK_PRESET}" in
+    mimo_v26_flash)
+      # MI300X DP2/TP8/DPA, DFlash8, OSL1024: fix-decode-regression.md.
+      # Configure the server's memory/SWA/request profile for the selected cases;
+      # this script only drives the benchmark client.
+      cases=(
+          "4096|4096|4k|512"
+          "8192|8192|8k|512"
+          "16384|16384|16k|480"
+          "32768|32768|32k|416"
+          "65536|65536|64k|304"
+          "131072|131072|128k|192"
+          "262144|262144|256k|80"
+          "524288|524288|512k|48"
+          "786432|786432|768k|24"
+          "1040000|1040000|1m|24"
+      )
+      ;;
     h200)
       cases=(
           "65532|65536|64k|96"
@@ -86,7 +104,7 @@ else
       )
       ;;
     *)
-      echo "BENCHMARK_PRESET must be customer, baseline_highest, optimized_highest, or sweep, observed '${BENCHMARK_PRESET}'" >&2
+      echo "BENCHMARK_PRESET must be mimo_v26_flash, h200, mi355_baseline_highest, mi355_optimized_highest, or sweep, observed '${BENCHMARK_PRESET}'" >&2
       exit 2
       ;;
   esac

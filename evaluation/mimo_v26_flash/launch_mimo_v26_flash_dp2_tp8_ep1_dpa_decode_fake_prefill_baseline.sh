@@ -4,39 +4,22 @@ set -euo pipefail
 # Eight GPUs: global MoE TP8, two attention TP4 groups, EP1, DFlash.
 # Fake-prefill decode launcher for gfx942 with simulated acceptance mean 3.5.
 # Default: native MXFP4 weights with adaptive A8W4 decode row tiles.
-# AITER_CONFIG_FMOE selects the MoE recipe; override it to compare another CSV.
-# Set SGLANG_MXFP4_TO_FP8_128BLOCK=1 for static FP8 blockscale conversion.
-# Requires AITER's gfx942 MXFP4 kernels (aiter PR #16) alongside Flash attention
-# support. Recipes must match Flash MoE TP8: model_dim=4096, inter_dim=256,
-# expert=256, topk=8; Pro TP8 recipes have different shapes.
-# Match the validated accuracy launcher's FlyDSL and fusion defaults. Fused
-# MoE RMSNorm requires AITER's N=4096/6144 kernel and a rebuilt RMS module.
+# Recipes must match Flash MoE TP8: model_dim=4096, inter_dim=256,
+# expert=256, topk=8;
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EVALUATION_DIR="$(dirname -- "${SCRIPT_DIR}")"
 SGLANG_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-# Accept the older decode-launcher names while preferring baseline names.
-if [[ -z "${MODEL_PATH:-}" && -n "${MODEL:-}" ]]; then
-  export MODEL_PATH="${MODEL}"
-fi
-if [[ -z "${SERVER_HOST:-}" && -n "${HOST:-}" ]]; then
-  export SERVER_HOST="${HOST}"
-fi
-if [[ -z "${SERVER_PORT:-}" && -n "${PORT:-}" ]]; then
-  export SERVER_PORT="${PORT}"
-fi
-if [[ -z "${SPECULATIVE_DRAFT_MODEL_PATH:-}" && -n "${SPECULATIVE_DRAFT_MODEL:-}" ]]; then
-  export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL}"
-fi
+export FLYDSL_RUNTIME_ENABLE_CACHE="${FLYDSL_RUNTIME_ENABLE_CACHE:-1}"
+export FLYDSL_AUTOTUNE="${FLYDSL_AUTOTUNE:-0}"
 
 MODEL_PATH="${MODEL_PATH:-/models/MiMo-V2.6-Flash-MOPD/}"
-export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL_PATH:-${MODEL_PATH%/}/dflash}"
-export DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-8}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-30001}"
-export AITER_ROOT="${AITER_ROOT:-/sgl-workspace/aiter}"
-export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL_PATH:-${MODEL_PATH%/}/dflash}"
+export DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-8}"
 
 export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-0}"
 export SGLANG_INT4_WEIGHT=0
@@ -45,11 +28,6 @@ case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
     moe_weight_description="static FP8 blockscale MoE weights converted from MXFP4 at load time"
     ;;
   0)
-    export AITER_CONFIG_FMOE="${AITER_CONFIG_FMOE:-${AITER_ROOT}/mimo_v2.6_flash_decode_adaptive_a8w4.csv}"
-    if [[ "${DRY_RUN:-0}" != "1" && ! -r "${AITER_CONFIG_FMOE}" ]]; then
-      echo "AITER_CONFIG_FMOE is not readable: ${AITER_CONFIG_FMOE}" >&2
-      exit 2
-    fi
     # The fused MoE RMSNorm path produces per-1x128 FP8 activations, not the
     # BF16 input expected by the native A16W4/A8W4 MoE wrappers.
     export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
@@ -82,6 +60,19 @@ export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
 # Match the Flash accuracy baseline's communication and attention settings.
 unset ROCM_QUICK_REDUCE_QUANTIZATION
 export SGLANG_MIMO_MIXED_ROUTER=0
+
+# Decode related optimization
+export SGLANG_USE_ROCM700A="${SGLANG_USE_ROCM700A:-1}"
+export SGLANG_DFLASH_FAST_CPU_STAGING="${SGLANG_DFLASH_FAST_CPU_STAGING:-1}"
+export SGLANG_MIMO_GROUPED_PA_SWA="${SGLANG_MIMO_GROUPED_PA_SWA:-1}"
+export SGLANG_SCHEDULER_MQ_BROADCAST="${SGLANG_SCHEDULER_MQ_BROADCAST:-1}"
+export SGLANG_DPA_FUSED_PAD_COPY="${SGLANG_DPA_FUSED_PAD_COPY:-1}"
+export SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS="${SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS:-1}"
+
+# Prefill SP related config
+export SGLANG_ENABLE_MIMO_SWA_SP="${SGLANG_ENABLE_MIMO_SWA_SP:-0}"
+export SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM="${SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM:-0}"
+
 export SGLANG_FLYPA_MIMO_PREFILL="${SGLANG_FLYPA_MIMO_PREFILL:-1}"
 export SGLANG_FLYDSL_MIMO_PREFILL=0
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
@@ -97,17 +88,25 @@ export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-${SGLANG_AI
 # FlyDSL handles Qlen8 directly; retain qlen-1 expansion for the Gluon fallback.
 export SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
-export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
-export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-96}"
-export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
+# AITER selects cached/calibrated PA partitions and query splits before capture.
+# Explicit SGLANG_FLYDSL_PA_* overrides remain available.
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
-# DPA divides both limits by DP2: 16K prefill and 96 requests/group.
-export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-192}"
-export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
+# DPA divides the request/prefill limits by DP2.
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-304}"
+if ! [[ "${MAX_RUNNING_REQUESTS}" =~ ^[1-9][0-9]*$ ]] || (( MAX_RUNNING_REQUESTS < 2 )); then
+  echo "MAX_RUNNING_REQUESTS must be an integer >= 2 for DP2" >&2
+  exit 2
+fi
+export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
+export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-$((MAX_RUNNING_REQUESTS / 2))}"
+export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
+
+export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-4}"
+export TOKENIZER_BACKEND="${TOKENIZER_BACKEND:-huggingface}"
+export DISABLE_TOKENIZER_BATCH_DECODE="${DISABLE_TOKENIZER_BATCH_DECODE:-1}"
 export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-12345}"
 # Match the DFlash accuracy baseline's reserve for draft KV and prefill scratch.
-export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.75}"
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-1.0}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.03}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
 export KV_CACHE_DTYPE=bf16
@@ -131,7 +130,7 @@ export SGLANG_SIMULATE_ACC_METHOD=match-expected
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-5000}"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-5000}"
 DECODE_LOG_INTERVAL="${DECODE_LOG_INTERVAL:-1}"
-WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-300}"
+WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1200}"
 
 for name in MAX_RUNNING_REQUESTS TOKENIZER_WORKER_NUM DFLASH_BLOCK_SIZE \
   CHUNKED_PREFILL_SIZE CUDA_GRAPH_MAX_BS_DECODE DECODE_LOG_INTERVAL WATCHDOG_TIMEOUT; do
@@ -174,6 +173,11 @@ fi
 seed_args=()
 if [[ -n "${SERVER_RANDOM_SEED}" ]]; then
   seed_args+=(--random-seed "${SERVER_RANDOM_SEED}")
+fi
+
+tokenizer_args=(--tokenizer-backend "${TOKENIZER_BACKEND}")
+if [[ "${DISABLE_TOKENIZER_BATCH_DECODE}" == "1" ]]; then
+  tokenizer_args+=(--disable-tokenizer-batch-decode)
 fi
 
 cuda_graph_args=(
@@ -220,7 +224,8 @@ echo "Simulated acceptance: expected bonus-inclusive length=${SGLANG_SIMULATE_AC
 echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
 echo "Decode: preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, log-interval=${DECODE_LOG_INTERVAL}, watchdog=${WATCHDOG_TIMEOUT}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}"
 echo "Quick Reduce: disabled; mixed-router=${SGLANG_MIMO_MIXED_ROUTER}; custom all-reduce=${custom_all_reduce_status}; radix cache=${radix_cache_status}; tbo=${ENABLE_TWO_BATCH_OVERLAP}"
-echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
+echo "Tokenizer: workers=${TOKENIZER_WORKER_NUM}, backend=${TOKENIZER_BACKEND}, disable-batch-decode=${DISABLE_TOKENIZER_BATCH_DECODE}; server seed=${SERVER_RANDOM_SEED:-auto}"
+echo "Decode defaults: rocm700a=${SGLANG_USE_ROCM700A}, cpu-staging=${SGLANG_DFLASH_FAST_CPU_STAGING}, grouped-swa=${SGLANG_MIMO_GROUPED_PA_SWA}, mq-broadcast=${SGLANG_SCHEDULER_MQ_BROADCAST}, fused-pad-copy=${SGLANG_DPA_FUSED_PAD_COPY}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 
 server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
@@ -232,6 +237,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   --ep-size 1 \
   --enable-dp-attention \
   --enable-dp-lm-head \
+  --moe-dense-tp-size 1 \
   --moe-a2a-backend none \
   --moe-runner-backend aiter \
   --speculative-moe-a2a-backend none \
@@ -243,6 +249,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   --speculative-draft-kv-cache-dtype bf16 \
   --speculative-draft-window-size 1024 \
   --tokenizer-worker-num "${TOKENIZER_WORKER_NUM}" \
+  "${tokenizer_args[@]}" \
   "${seed_args[@]}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --host "${SERVER_HOST}" \

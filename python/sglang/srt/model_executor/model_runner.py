@@ -3662,6 +3662,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+            if forward_batch.dflash_input_embeds is not None:
+                # A draft batch that cannot replay still needs the ordinary full
+                # embedding input. Keep this allocation off the graph hot path.
+                forward_batch.input_embeds = (
+                    forward_batch.dflash_input_embeds.materialize()
+                )
+                forward_batch.dflash_input_embeds = None
+
             # For MLP sync
             if forward_batch.global_num_tokens_cpu is not None:
                 forward_batch.prepare_mlp_sync_batch(self)

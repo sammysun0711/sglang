@@ -93,6 +93,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.speculative.dflash_input_embedding import DFlashGraphInputCache
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -304,6 +305,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
+        self._dflash_input_cache = DFlashGraphInputCache()
         # --- core state ------------------------------------------------
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -764,6 +766,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        self._dflash_input_cache.invalidate()
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
@@ -953,6 +956,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.backend.cleanup()
             self.capture()
 
+    def _prepare_dflash_input_embeds(self, forward_batch, raw_num_token):
+        if not (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.is_draft_worker
+        ):
+            return
+        if forward_batch.dflash_input_embeds is not None:
+            inputs = forward_batch.dflash_input_embeds
+            if inputs.verified.shape[0] * inputs.block_size != raw_num_token:
+                raise ValueError("DFlash mask-cache input does not match graph batch")
+            self._dflash_input_cache.update(self.buffers.input_embeds, inputs)
+        elif forward_batch.input_embeds is not None:
+            self._dflash_input_cache.invalidate()
+            self.buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
@@ -965,14 +983,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-            if (
-                self.model_runner.spec_algorithm.is_dflash()
-                and self.model_runner.is_draft_worker
-                and forward_batch.input_embeds is not None
-            ):
-                self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
-                )
+            self._prepare_dflash_input_embeds(forward_batch, self.raw_num_token)
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1008,12 +1019,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if (
-            self.model_runner.spec_algorithm.is_dflash()
-            and self.model_runner.is_draft_worker
-            and forward_batch.input_embeds is not None
-        ):
-            buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+        self._prepare_dflash_input_embeds(forward_batch, raw_num_token)
         # Padded tokens aren't read, so skip zeroing them.
         if self.enable_tbo_cuda_graph:
             self.tbo_plugin.replay_prepare(

@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.dflash_input_embedding import DFlashInputEmbeddings
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
@@ -305,6 +306,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    # Draft-only deferred input; materialized directly into graph input storage.
+    dflash_input_embeds: Optional[DFlashInputEmbeddings] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None

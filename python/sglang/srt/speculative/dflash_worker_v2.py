@@ -29,6 +29,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_input_embedding import DFlashInputEmbeddings
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
@@ -60,6 +61,7 @@ from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -130,6 +132,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
         self._full_embed_gpu = None
+        self._mask_embed_gpu = None
+        cache_mask_embedding = envs.SGLANG_DFLASH_CACHE_MASK_EMBEDDING.get()
+        if cache_mask_embedding:
+            if not (is_hip() and get_bool_env_var("SGLANG_USE_AITER")):
+                raise ValueError(
+                    "DFlash mask input caching requires ROCm with SGLANG_USE_AITER=1 "
+                    "and its out-of-place RMSNorm"
+                )
+            if server_args.enable_lora or server_args.enable_pdmux:
+                raise ValueError(
+                    "DFlash mask input caching requires static weights and a "
+                    "single forward stream (no LoRA or PDMux)"
+                )
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             self.model_runner.dflash_draft_model_config,
             enable_dp_attention=server_args.enable_dp_attention,
@@ -288,6 +303,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self._full_embed_gpu is not None:
                 draft_fixed_bytes += (
                     self._full_embed_gpu.numel() * self._full_embed_gpu.element_size()
+                )
+        if cache_mask_embedding:
+            mask_id = torch.tensor(
+                [self._mask_token_id], dtype=torch.long, device=self.device
+            )
+            # The trained mask row is installed above. Use the draft-local TP
+            # scope, or the already gathered table for cross-draft embeddings.
+            with torch.no_grad(), self._draft_context():
+                self._mask_embed_gpu = (
+                    F.embedding(mask_id, self._full_embed_gpu)
+                    if self._full_embed_gpu is not None
+                    else self._draft_embedding(mask_id)
+                ).detach()
+            draft_fixed_bytes += (
+                self._mask_embed_gpu.numel() * self._mask_embed_gpu.element_size()
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFlash mask embedding cache enabled: graph inputs update "
+                    "only verified-token rows; eager inputs materialize on demand"
                 )
         self.model_runner.dflash_draft_kv_budget = DFlashKVCacheBudget(
             self.draft_parallel_layout, draft_cell_size, draft_fixed_bytes
@@ -1635,12 +1670,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = (
-            F.embedding(block_ids, self._full_embed_gpu)
-            if self._full_embed_gpu is not None
-            else embed_module(block_ids)
-        )
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        dflash_input_embeds = None
+        if self._mask_embed_gpu is not None:
+            # block[:, 0] is verified_id; all other positions are the fixed mask.
+            # Read the original contiguous IDs instead of copying a strided column.
+            verified_ids = draft_input.verified_id.view(-1)
+            verified_embedding = (
+                F.embedding(verified_ids.long(), self._full_embed_gpu)
+                if self._full_embed_gpu is not None
+                else embed_module(verified_ids)
+            )
+            dflash_input_embeds = DFlashInputEmbeddings(
+                verified_embedding, self._mask_embed_gpu, block_size
+            )
+            input_embeds = None
+        else:
+            noise_embedding = (
+                F.embedding(block_ids, self._full_embed_gpu)
+                if self._full_embed_gpu is not None
+                else embed_module(block_ids)
+            )
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -1732,6 +1782,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             input_embeds=input_embeds,
+            dflash_input_embeds=dflash_input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,

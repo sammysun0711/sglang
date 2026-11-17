@@ -111,13 +111,15 @@ export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
 export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
-# DPA divides both limits by DP2: 16K prefill and 96 requests/group.
-export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-192}"
+# DPA divides both limits by DP2
+# Leave one extra request slot per DP for the benchmark batch.
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-514}"
 export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-1}"
 export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-12345}"
-# Match the DFlash accuracy baseline's reserve for draft KV and prefill scratch.
-export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.75}"
-export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.03}"
+# Unified decode matrix budget; AITER applies 0.85 at this context length,
+# so the default effective memory fraction is 1.07 * 0.85 = 0.9095.
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-1.07}"
+export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.015}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
 export KV_CACHE_DTYPE=bf16
 export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
@@ -217,7 +219,7 @@ if [[ -n "${CUDA_GRAPH_BS_DECODE}" ]]; then
 fi
 # Target verify has DFLASH_BLOCK_SIZE tokens/request, then TP4 scatters tokens
 # before MORI. The graph runner clamps buckets to the per-DP request pool,
-# rounded up to TP4. Bound that padding too: default 192/2/4*8 = 192 rows/rank.
+# rounded up to TP4. Bound that padding too: default ceil(257/4)*8 = 520 rows/rank.
 # Pure PD decode skips prefill, so chunk size is not a dispatch-capacity floor.
 mori_dispatch_required=$(( ((max_running_per_dp + 3) / 4) * DFLASH_BLOCK_SIZE ))
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-${mori_dispatch_required}}"

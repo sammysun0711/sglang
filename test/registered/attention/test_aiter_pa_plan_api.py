@@ -1,6 +1,7 @@
 """SGLang transport tests against AITER's public plan-based PA API."""
 
 import os
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -172,8 +173,23 @@ def test_full_pa_transport_eager_and_dynamic_graph(query_length, dtype, partitio
 
 @pytest.mark.parametrize("batch_size,partitions,splits", [(12, 24, 1), (40, 64, 2), (96, 3, 1),
                                                        (152, 2, 1), (208, 8, 2), (240, 4, 2)])
-def test_calibrated_full_pa_plan_and_graph_refresh(batch_size, partitions, splits):
-    backend = _backend(8, partitions=0, max_batch=batch_size)
+def test_calibrated_full_pa_plan_and_graph_refresh(
+    batch_size, partitions, splits, tmp_path
+):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if (
+        get_gfx_runtime() != "gfx942"
+        or torch.cuda.get_device_properties("cuda").multi_processor_count != 304
+    ):
+        pytest.skip("Calibrated MiMo PA schedules require gfx942 with 304 CUs")
+
+    with aiter_backend.envs.SGLANG_FLYDSL_PA_QUERY_SPLITS.override(0):
+        backend = _backend(8, partitions=0, max_batch=batch_size)
+    # Isolate both native tuning-cache state and the cache-directory override.
+    backend._flydsl_prepare_pa_decode_plan = partial(
+        backend._flydsl_prepare_pa_decode_plan, config_dir=tmp_path
+    )
     k, v, kc, vc, table, q, guarded = _inputs(8, 1, 192, torch.bfloat16, batch_size)
     output = guarded[1:-1]
     layer = SimpleNamespace(tp_q_head_num=16, tp_k_head_num=1, qk_head_dim=192,

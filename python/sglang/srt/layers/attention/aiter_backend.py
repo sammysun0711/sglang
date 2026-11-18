@@ -466,6 +466,10 @@ class AiterAttnBackend(AttentionBackend):
             return
 
         self._flydsl_pa_decode_num_partitions = get_flydsl_mimo_num_partitions()
+        self._flydsl_pa_decode_auto_partitions = self._flydsl_pa_decode_num_partitions == 0
+        if self._flydsl_pa_decode_auto_partitions:
+            # Bound shared scratch while allowing all calibrated gfx942 shapes.
+            self._flydsl_pa_decode_num_partitions = 64
 
         incompatibilities = []
         if self.use_mla:
@@ -516,6 +520,9 @@ class AiterAttnBackend(AttentionBackend):
         kernels = load_flydsl_pa_decode_kernels()
         self._flydsl_pa_decode = kernels.pa_decode
         self._flydsl_plan_pa_decode = kernels.plan_pa_decode
+        self._flydsl_prepare_pa_decode_plan = kernels.prepare_pa_decode_plan
+        if self._flydsl_pa_decode_auto_partitions and self._flydsl_prepare_pa_decode_plan is None:
+            raise RuntimeError("Automatic FlyDSL PA selection requires AITER prepare_pa_decode_plan")
         # Keep MiMo block4 queries together on gfx942: split-query CTAs reread
         # the same long KV cache. This BF16 D192/V128 geometry fits 64 KiB LDS.
         # Older plan APIs retain their automatic policy when no override exists.
@@ -527,12 +534,24 @@ class AiterAttnBackend(AttentionBackend):
             and getattr(kernels, "supports_query_splits", False)
             else None
         )
+        requested_splits = envs.SGLANG_FLYDSL_PA_QUERY_SPLITS.get()
+        if requested_splits:
+            if requested_splits not in (1, 2, 4) or (
+                self._flydsl_pa_decode_query_length % requested_splits
+            ):
+                raise ValueError(
+                    "SGLANG_FLYDSL_PA_QUERY_SPLITS must be 0 (auto), or 1, 2, 4 "
+                    "dividing the configured query length"
+                )
+            if not getattr(kernels, "supports_query_splits", False):
+                raise RuntimeError("The installed AITER PA API lacks query_splits support")
+            self._flydsl_pa_decode_query_splits = requested_splits
         self._ensure_flydsl_pa_decode_workspace(max_bs)
         logger.info(
             "Enabled MiMo FlyDSL PA decode on target worker: full "
             "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=%s, "
             "ordinary full decode=FlyDSL; runtime=%s (%s), kernel=%s, "
-            "partitions=%d, workspace_max_bs=%d, block4_query_splits=%s",
+            "partitions=%d, workspace_max_bs=%d, query_splits=%s",
             "FlyDSL" if flydsl_target_verify_swa_enabled() else "AITER",
             kernels.version,
             kernels.runtime_path,

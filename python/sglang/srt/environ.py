@@ -516,6 +516,8 @@ class Envs:
     # sink-free full-attention target verification; SWA/sink layers remain on
     # AITER Gluon.
     SGLANG_AITER_PA_DECODE_IMPL = EnvStr("gluon")
+    # Zero lets the retained PA plan choose the query split.
+    SGLANG_FLYDSL_PA_QUERY_SPLITS = EnvInt(0)
     # Optional gfx942 BF16 MiMo full prefill, behind the existing FlyPA guards.
     SGLANG_USE_PYHIP_MIMO_PREFILL = EnvBool(False)
     SGLANG_FLYPA_MIMO_PREFILL = EnvBool(False)

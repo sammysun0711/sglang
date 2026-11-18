@@ -18,6 +18,7 @@ rm -rf /sgl-workspace/sglang /sgl-workspace/aiter
 ```
 
 ### Setup multimodal support
+
 ```bash
 apt-get update
 apt-get install -y --no-install-recommends \
@@ -38,6 +39,7 @@ TORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR=ON \
 CMAKE_BUILD_PARALLEL_LEVEL=8 ENABLE_CUDA=0 \
 python -m pip install -e . --no-build-isolation --no-deps
 ```
+
 ### Install sglang
 
 ```bash
@@ -162,8 +164,8 @@ With `SGLANG_ENABLE_MIMO_SWA_SP=1`, the server executes the 32 representative
 prefill requests once before HTTP readiness, shared across tokenizer workers.
 Both launchers enable the flag by default; set it to `0` to skip this sequence.
 To reproduce the earlier startup-only warmup
-protocol, use `WARMUP_REQUESTS_OVERRIDE=0`. `--skip-server-warmup` controls the 
-generic smoke request independently of this SP-gated representative warmup. 
+protocol, use `WARMUP_REQUESTS_OVERRIDE=0`. `--skip-server-warmup` controls the
+generic smoke request independently of this SP-gated representative warmup.
 Record warmup counts and distinguish compiler calls from cache loads in performance results.
 
 For **accuracy tests**, stop the performance server and rerun the launch command
@@ -214,11 +216,10 @@ more than that reduces the full-token pool without increasing concurrency.
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
-MEM_FRACTION_STATIC=0.75 \
+MEM_FRACTION_STATIC=1.0 \
 DISABLE_RADIX_CACHE=1 \
 SWA_FULL_TOKENS_RATIO=0.03 \
-MAX_RUNNING_REQUESTS=96 \
-SGLANG_USE_PYHIP_MIMO_PREFILL=1 \
+MAX_RUNNING_REQUESTS=512 \
 SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 ./launch_mimo_v26_flash_dp2_tp8_ep1_dpa_decode_fake_prefill_baseline.sh
 ```
@@ -230,7 +231,7 @@ Use `DRY_RUN=1` to inspect the command without starting the server.
 ```bash
 cd /sgl-workspace/sglang/evaluation
 MODEL=/models/MiMo-V2.6-Flash-MOPD/ \
-CASE_SPECS='65536|65536|64k|128' \
+CASE_SPECS='65536|65536|64k|304' \
 PROMPT_WAVES=4 \
 WARMUP_REQUESTS=32 \
 ./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh
@@ -238,8 +239,8 @@ WARMUP_REQUESTS=32 \
 
 The client uses explicit token IDs, so no four-token subtraction is needed.
 At the 1M context boundary, reserve additional slots for the scheduler:
-use `CASE_SPECS='1047548|1047548|1m|10'` for 1,024 output tokens. An input
-length of 1,047,552 leaves no scheduler margin and is capped at 1,022 output
+use `CASE_SPECS='1040000|1040000|1m|24'` for 1,024 output tokens. An input
+length of `1040000`leaves no scheduler margin and is capped at 1,022 output
 tokens. This margin is separate from tokenizer special tokens.
 
 ### Run decode throughput analysis
@@ -383,7 +384,7 @@ WARMUP_REQUESTS=32 \
 
 The client uses explicit token IDs, so no four-token subtraction is needed.
 At the 1M context boundary, reserve additional slots for the scheduler:
-use `CASE_SPECS='1047548|1047548|1m|10'` for 1,024 output tokens. An input
+use `CASE_SPECS='1040000|1040000|1m|10'` for 1,024 output tokens. An input
 length of 1,047,552 leaves no scheduler margin and is capped at 1,022 output
 tokens. This margin is separate from tokenizer special tokens.
 

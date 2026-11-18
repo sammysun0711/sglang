@@ -31,7 +31,7 @@ case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
     # The fused MoE RMSNorm path produces per-1x128 FP8 activations, not the
     # BF16 input expected by the native A16W4/A8W4 MoE wrappers.
     export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
-    moe_weight_description="native MXFP4 MoE weights; A16W4/A8W4 selected by AITER_CONFIG_FMOE"
+    moe_weight_description="native MXFP4 MoE weights; local tuned A8W4 decode kernels"
     ;;
   *)
     echo "SGLANG_MXFP4_TO_FP8_128BLOCK must be 0 or 1" >&2
@@ -61,17 +61,27 @@ export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
 unset ROCM_QUICK_REDUCE_QUANTIZATION
 export SGLANG_MIMO_MIXED_ROUTER=0
 
-# Decode related optimization
-export SGLANG_USE_ROCM700A="${SGLANG_USE_ROCM700A:-1}"
+# Native graph MoE SP uses MAX_LEN padding independently of full o_proj SP.
+# Keep full o_proj off by default to retain KV capacity, including small graphs.
+export SGLANG_USE_ROCM700A="${SGLANG_USE_ROCM700A:-0}"
+export SGLANG_MIMO_GRAPH_VERIFY_SP="${SGLANG_MIMO_GRAPH_VERIFY_SP:-1}"
+export SGLANG_MIMO_GRAPH_SP_PACKED="${SGLANG_MIMO_GRAPH_SP_PACKED:-1}"
+export SGLANG_MIMO_FUSED_SP_PACKET="${SGLANG_MIMO_FUSED_SP_PACKET:-1}"
+export SGLANG_DFLASH_REQUEST_OWNER_VERIFY="${SGLANG_DFLASH_REQUEST_OWNER_VERIFY:-1}"
+export SGLANG_MIMO_GRAPH_OPROJ_SP="${SGLANG_MIMO_GRAPH_OPROJ_SP:-0}"
+export SGLANG_DFLASH_GREEDY_CHUNK_SIZE="${SGLANG_DFLASH_GREEDY_CHUNK_SIZE:-2048}"
 export SGLANG_DFLASH_FAST_CPU_STAGING="${SGLANG_DFLASH_FAST_CPU_STAGING:-1}"
 export SGLANG_MIMO_GROUPED_PA_SWA="${SGLANG_MIMO_GROUPED_PA_SWA:-1}"
 export SGLANG_SCHEDULER_MQ_BROADCAST="${SGLANG_SCHEDULER_MQ_BROADCAST:-1}"
 export SGLANG_DPA_FUSED_PAD_COPY="${SGLANG_DPA_FUSED_PAD_COPY:-1}"
 export SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS="${SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS:-1}"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM="${SGLANG_ENABLE_OVERLAP_PLAN_STREAM:-1}"
+
 # Keep AITER's cached/default plan selection for the gfx942 MiMo register-P
 export AITER_PA_MIMO_REGP="${AITER_PA_MIMO_REGP:-1}"
 export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-0}"
 export SGLANG_FLYDSL_PA_QUERY_SPLITS="${SGLANG_FLYDSL_PA_QUERY_SPLITS:-0}"
+
 
 # Prefill SP related config
 export SGLANG_ENABLE_MIMO_SWA_SP="${SGLANG_ENABLE_MIMO_SWA_SP:-0}"
@@ -91,10 +101,9 @@ export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL="${SGLANG_AITER_TARGET_VERIFY_SWA_IMP
 export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-${SGLANG_AITER_PA_DECODE_IMPL}}"
 # FlyDSL handles Qlen8 directly; retain qlen-1 expansion for the Gluon fallback.
 export SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 # DPA divides the request/prefill limits by DP2.
-export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-304}"
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-512}"
 if ! [[ "${MAX_RUNNING_REQUESTS}" =~ ^[1-9][0-9]*$ ]] || (( MAX_RUNNING_REQUESTS < 2 )); then
   echo "MAX_RUNNING_REQUESTS must be an integer >= 2 for DP2" >&2
   exit 2
@@ -107,7 +116,6 @@ export TOKENIZER_WORKER_NUM="${TOKENIZER_WORKER_NUM:-4}"
 export TOKENIZER_BACKEND="${TOKENIZER_BACKEND:-huggingface}"
 export DISABLE_TOKENIZER_BATCH_DECODE="${DISABLE_TOKENIZER_BATCH_DECODE:-1}"
 export SERVER_RANDOM_SEED="${SERVER_RANDOM_SEED:-12345}"
-# Match the DFlash accuracy baseline's reserve for draft KV and prefill scratch.
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-1.0}"
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.03}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
@@ -215,8 +223,6 @@ if [[ -n "${MAX_TOTAL_TOKENS:-}" ]]; then
   decode_args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
 fi
 
-echo "MiMo-V2.6-Flash: ${moe_weight_description}"
-echo "MoE recipe file: ${AITER_CONFIG_FMOE:-auto}"
 echo "Configuration: model=${MODEL_PATH}, global-tp=8, attention-dp=2 x tp=4, ep=1, dp-attention=enabled, dp-lm-head=enabled, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}"
 echo "Per-DP limits: requests=$((MAX_RUNNING_REQUESTS / 2)), chunked-prefill=$((CHUNKED_PREFILL_SIZE / 2))"
 echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}, qlen1=${SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-max-bs=${CUDA_GRAPH_MAX_BS_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}"
@@ -227,7 +233,8 @@ echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
 echo "Decode: preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, log-interval=${DECODE_LOG_INTERVAL}, watchdog=${WATCHDOG_TIMEOUT}, max-total-tokens=${MAX_TOTAL_TOKENS:-auto}"
 echo "Quick Reduce: disabled; mixed-router=${SGLANG_MIMO_MIXED_ROUTER}; custom all-reduce=${custom_all_reduce_status}; radix cache=${radix_cache_status}; tbo=${ENABLE_TWO_BATCH_OVERLAP}"
 echo "Tokenizer: workers=${TOKENIZER_WORKER_NUM}, backend=${TOKENIZER_BACKEND}, disable-batch-decode=${DISABLE_TOKENIZER_BATCH_DECODE}; server seed=${SERVER_RANDOM_SEED:-auto}"
-echo "Decode defaults: rocm700a=${SGLANG_USE_ROCM700A}, cpu-staging=${SGLANG_DFLASH_FAST_CPU_STAGING}, grouped-swa=${SGLANG_MIMO_GROUPED_PA_SWA}, mq-broadcast=${SGLANG_SCHEDULER_MQ_BROADCAST}, fused-pad-copy=${SGLANG_DPA_FUSED_PAD_COPY}"
+echo "Decode defaults: rocm700a=${SGLANG_USE_ROCM700A}, cpu-staging=${SGLANG_DFLASH_FAST_CPU_STAGING}, grouped-swa=${SGLANG_MIMO_GROUPED_PA_SWA}, mq-broadcast=${SGLANG_SCHEDULER_MQ_BROADCAST}, fused-pad-copy=${SGLANG_DPA_FUSED_PAD_COPY}, overlap-plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}"
+echo "Graph MoE: sp=${SGLANG_MIMO_GRAPH_VERIFY_SP}, packed=${SGLANG_MIMO_GRAPH_SP_PACKED}, fused-packet=${SGLANG_MIMO_FUSED_SP_PACKET}; full-o-proj=${SGLANG_MIMO_GRAPH_OPROJ_SP}; request-owner=${SGLANG_DFLASH_REQUEST_OWNER_VERIFY}; draft-chunk=${SGLANG_DFLASH_GREEDY_CHUNK_SIZE}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 
 server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \

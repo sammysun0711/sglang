@@ -106,8 +106,12 @@ export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL="${SGLANG_AITER_TARGET_VERIFY_SWA_IMP
 export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-${SGLANG_AITER_PA_DECODE_IMPL}}"
 # FlyDSL handles Qlen8 directly; retain qlen-1 expansion for the Gluon fallback.
 export SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1=1
+# Target-verify SWA layers share one FlyDSL work plan per forward.
+export SGLANG_MIMO_GROUPED_PA_SWA="${SGLANG_MIMO_GROUPED_PA_SWA:-1}"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-16}"
+# Zero lets AITER select cached/calibrated PA partitions and query splits before
+# graph capture. Explicit SGLANG_FLYDSL_PA_* overrides remain available.
+export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-0}"
 export CUDA_GRAPH_BACKEND_DECODE="${CUDA_GRAPH_BACKEND_DECODE:-full}"
 export CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-}"
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
@@ -293,7 +297,7 @@ echo "MiMo-V2.6-Flash: ${moe_weight_description}"
 echo "MoE recipe file: ${AITER_CONFIG_FMOE:-default lookup (native EP A8W4 uses built-in configs)}"
 echo "Configuration: model=${MODEL_PATH}, global-tp=8, attention-dp=2 x tp=4, ep=8, moe-tp=1, dense-tp=1, dp-attention=enabled, dp-lm-head=enabled, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}"
 echo "Per-DP limits: requests=$((MAX_RUNNING_REQUESTS / 2)), chunked-prefill=$((CHUNKED_PREFILL_SIZE / 2))"
-echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}, qlen1=${SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-max-bs=${CUDA_GRAPH_MAX_BS_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}"
+echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}, qlen1=${SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1}, pa-partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS} (0=auto), grouped-swa=${SGLANG_MIMO_GROUPED_PA_SWA}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-max-bs=${CUDA_GRAPH_MAX_BS_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}"
 echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/${SGLANG_AITER_DFLASH_SWA_IMPL}, draft-kv=bf16, draft-window=1024, acceptance=simulated"
 echo "DFlash logits: draft-greedy-chunk=${SGLANG_DFLASH_GREEDY_CHUNK_SIZE} rows per GEMM (TP exchanges maxima and token IDs)"
 echo "DFlash embedding: mask-cache=${SGLANG_DFLASH_CACHE_MASK_EMBEDDING} (graph verified rows updated in place)"

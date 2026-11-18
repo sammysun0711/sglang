@@ -68,6 +68,10 @@ export SGLANG_MIMO_GROUPED_PA_SWA="${SGLANG_MIMO_GROUPED_PA_SWA:-1}"
 export SGLANG_SCHEDULER_MQ_BROADCAST="${SGLANG_SCHEDULER_MQ_BROADCAST:-1}"
 export SGLANG_DPA_FUSED_PAD_COPY="${SGLANG_DPA_FUSED_PAD_COPY:-1}"
 export SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS="${SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS:-1}"
+# Keep AITER's cached/default plan selection for the gfx942 MiMo register-P
+export AITER_PA_MIMO_REGP="${AITER_PA_MIMO_REGP:-1}"
+export SGLANG_FLYDSL_PA_NUM_PARTITIONS="${SGLANG_FLYDSL_PA_NUM_PARTITIONS:-0}"
+export SGLANG_FLYDSL_PA_QUERY_SPLITS="${SGLANG_FLYDSL_PA_QUERY_SPLITS:-0}"
 
 # Prefill SP related config
 export SGLANG_ENABLE_MIMO_SWA_SP="${SGLANG_ENABLE_MIMO_SWA_SP:-0}"
@@ -88,8 +92,6 @@ export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-${SGLANG_AI
 # FlyDSL handles Qlen8 directly; retain qlen-1 expansion for the Gluon fallback.
 export SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-# AITER selects cached/calibrated PA partitions and query splits before capture.
-# Explicit SGLANG_FLYDSL_PA_* overrides remain available.
 export REASONING_PARSER="${REASONING_PARSER:-mimo}"
 # DPA divides the request/prefill limits by DP2.
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-304}"

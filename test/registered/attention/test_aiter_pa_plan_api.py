@@ -1,5 +1,6 @@
 """SGLang transport tests against AITER's public plan-based PA API."""
 
+import importlib
 import os
 from functools import partial
 from types import SimpleNamespace
@@ -96,7 +97,7 @@ def _reference(
 
 @pytest.mark.parametrize("query_length", [1, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, fp8_dtype], ids=["bf16", "fp8"])
-@pytest.mark.parametrize("partitions", [0, 8, 64])
+@pytest.mark.parametrize("partitions", [0, 8, 16, 64])
 def test_full_pa_transport_eager_and_dynamic_graph(query_length, dtype, partitions):
     backend = _backend(query_length, partitions, dtype)
     backend._compile_flydsl_pa_decode()
@@ -174,7 +175,7 @@ def test_full_pa_transport_eager_and_dynamic_graph(query_length, dtype, partitio
 @pytest.mark.parametrize("batch_size,partitions,splits", [(12, 24, 1), (40, 64, 2), (96, 3, 1),
                                                        (152, 2, 1), (208, 8, 2), (240, 4, 2)])
 def test_calibrated_full_pa_plan_and_graph_refresh(
-    batch_size, partitions, splits, tmp_path
+    batch_size, partitions, splits, tmp_path, monkeypatch
 ):
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -184,6 +185,8 @@ def test_calibrated_full_pa_plan_and_graph_refresh(
     ):
         pytest.skip("Calibrated MiMo PA schedules require gfx942 with 304 CUs")
 
+    # These expected schedules describe the tile kernel's calibrated policy.
+    monkeypatch.setenv("AITER_PA_MIMO_REGP", "0")
     with aiter_backend.envs.SGLANG_FLYDSL_PA_QUERY_SPLITS.override(0):
         backend = _backend(8, partitions=0, max_batch=batch_size)
     # Isolate both native tuning-cache state and the cache-directory override.
@@ -221,6 +224,111 @@ def test_calibrated_full_pa_plan_and_graph_refresh(
     graph.replay()
     check()
     assert next(iter(backend._flydsl_pa_work_plans.values())) is plan
+    assert backend._flydsl_pa_decode_pout.data_ptr() == scratch
+
+
+@pytest.mark.parametrize("batch_size", [1, 24])
+@pytest.mark.parametrize("partitions", [0, 16])
+@pytest.mark.parametrize(
+    "regp,query_splits,expected_kernel",
+    [(True, 0, "regp"), (True, 1, "regp"), (False, 0, "tile"), (True, 2, "tile")],
+)
+def test_mimo_pa_dispatch_and_graph_refresh(
+    batch_size,
+    partitions,
+    regp,
+    query_splits,
+    expected_kernel,
+    monkeypatch,
+    tmp_path,
+):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942":
+        pytest.skip("MiMo register-P attention requires gfx942")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    if not hasattr(pa, "compile_mimo_verify_tile"):
+        pytest.skip("Requires AITER's MiMo register-P kernel")
+
+    monkeypatch.setenv("AITER_PA_MIMO_REGP", "1" if regp else "0")
+    with aiter_backend.envs.SGLANG_FLYDSL_PA_QUERY_SPLITS.override(query_splits):
+        backend = _backend(8, partitions=partitions, max_batch=batch_size)
+    backend._flydsl_prepare_pa_decode_plan = partial(
+        backend._flydsl_prepare_pa_decode_plan, config_dir=tmp_path
+    )
+
+    calls = {"regp": 0, "tile": 0}
+    for name, attribute in (
+        ("regp", "compile_mimo_verify_tile"),
+        ("tile", "compile_pa_decode_tile"),
+    ):
+        original = getattr(pa, attribute)
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(pa, attribute, record)
+
+    k, v, kc, vc, table, q, guarded = _inputs(
+        8, 1, 192, torch.bfloat16, batch_size
+    )
+    output = guarded[1:-1]
+    layer = SimpleNamespace(
+        tp_q_head_num=16,
+        tp_k_head_num=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        sliding_window_size=-1,
+        logit_cap=0.0,
+        scaling=192**-0.5,
+    )
+    lengths = torch.tensor(
+        ([0, 67, 2081] * ((batch_size + 2) // 3))[:batch_size],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    batch = SimpleNamespace(batch_size=batch_size, seq_lens=lengths)
+    backend.forward_metadata = SimpleNamespace(
+        max_q_len=8, kv_indices=table[:batch_size]
+    )
+
+    def run():
+        aiter_utils.forward_target_verify_flydsl_5d(
+            backend, q, layer, batch, kc, vc, output, None
+        )
+
+    def check():
+        expected = _reference(q, k, v, table, (lengths + 8).tolist(), 8, 192)
+        torch.testing.assert_close(output, expected, atol=0.006, rtol=0.04)
+        assert torch.all(guarded[[0, -1]] == 19)
+
+    run()
+    check()
+    assert calls[expected_kernel] > 0
+    assert calls["tile" if expected_kernel == "regp" else "regp"] == 0
+    plan = next(iter(backend._flydsl_pa_work_plans.values()))
+    if partitions == 16:
+        assert plan.max_partitions == 16 and plan.capacity == batch_size * 16
+        assert not plan.balanced
+    elif expected_kernel == "regp":
+        assert plan.max_partitions == 64 and plan.query_splits == 1
+        assert plan.balanced and plan.capacity <= batch_size * 64
+    else:
+        assert not plan.balanced
+    pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
+    scratch = backend._flydsl_pa_decode_pout.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    captured_calls = dict(calls)
+    lengths.fill_(1027)
+    table[:batch_size].copy_(table[:batch_size].roll(1, dims=1))
+    graph.replay()
+    check()
+    assert calls == captured_calls
+    assert next(iter(backend._flydsl_pa_work_plans.values())) is plan
+    assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
     assert backend._flydsl_pa_decode_pout.data_ptr() == scratch
 
 

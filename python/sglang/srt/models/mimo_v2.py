@@ -999,17 +999,35 @@ class MiMoV2Attention(nn.Module):
                     requires_grad=False,
                 )
 
+        self._graph_sp_o_proj = (
+            envs.SGLANG_MIMO_GRAPH_OPROJ_SP.get()
+            and _mimo_graph_sp_enabled()
+            and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+            and not self._ep_sp_swa
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+        )
+
     def build_sp_weights(self):
         """Assemble full-head weights from the attention-TP shards (after load_weights)."""
         from sglang.srt.layers.attention.mimo_sp import _mimo_attn_tp_gather
 
-        if self._ep_sp_swa or self.qkv_proj_full is None:
+        if self._ep_sp_swa or (
+            self.qkv_proj_full is None and not getattr(self, "_graph_sp_o_proj", False)
+        ):
             return
         if isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
             shard = self.o_proj.weight.data
             self.o_proj_full = (
                 _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
             )
+            if getattr(self, "_graph_sp_o_proj", False):
+                logger.info(
+                    "Using optional MiMo graph full o_proj: shape=%s, full_qkv=%s",
+                    tuple(self.o_proj_full.shape),
+                    self.qkv_proj_full is not None,
+                )
+        if self.qkv_proj_full is None:
+            return
         if self.attention_sink_bias is not None:
             self.attention_sink_full = _mimo_attn_tp_gather(
                 self.attention_sink_bias.data
@@ -1082,6 +1100,7 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         sp_swa: bool = False,
+        scatter_output: bool = False,
     ) -> torch.Tensor:
         if sp_swa:
             from sglang.srt.layers.attention.mimo_sp import run_mimo_sp_swa
@@ -1109,6 +1128,12 @@ class MiMoV2Attention(nn.Module):
                 ..., : self.original_v_head_dim
             ].reshape(-1, self.num_heads * self.original_v_head_dim)
 
+        if scatter_output:
+            from sglang.srt.layers.attention.mimo_sp import mimo_sp_o_proj
+
+            return mimo_sp_o_proj(
+                attn_output, self.o_proj_full, self.o_proj.quant_method
+            )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1368,7 +1393,7 @@ class MiMoV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
-        sp_swa = False
+        sp_o_proj = sp_swa = False
         if self.layer_communicator_sp is not None and _mimo_sp_moe_active(
             forward_batch
         ):
@@ -1382,6 +1407,12 @@ class MiMoV2DecoderLayer(nn.Module):
             ):
                 communicator = self.layer_communicator_sp_attn
                 sp_swa = True
+            elif forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+                sp_o_proj = (
+                    getattr(self.self_attn, "_graph_sp_o_proj", False)
+                    and self.self_attn.o_proj_full is not None
+                    and communicator.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED
+                )
         elif (
             self.self_attn._ep_sp_swa
             and self.layer_communicator_sp_attn is not None
@@ -1407,14 +1438,22 @@ class MiMoV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 sp_swa=sp_swa,
+                scatter_output=sp_o_proj,
             )
 
-        hidden_states, residual = communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format=self._prefill_moe_quant_format(forward_batch),
-        )
+        if sp_o_proj:
+            hidden_states, residual = communicator.prepare_mlp_from_scattered_attn(
+                hidden_states,
+                residual,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
+        else:
+            hidden_states, residual = communicator.prepare_mlp(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=self._prefill_moe_quant_format(forward_batch),
+            )
 
         should_allreduce_fusion = (
             communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)

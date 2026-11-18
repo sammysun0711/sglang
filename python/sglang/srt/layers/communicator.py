@@ -844,6 +844,25 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    def prepare_mlp_from_scattered_attn(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        quant_format: str = "",
+    ):
+        """prepare_mlp when attention already returned this rank's reduced token slice
+        (MiMo graph-verify SP): only the residual add and post-attention norm remain.
+        """
+        assert self.layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        assert self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED
+        if self.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL:
+            residual = residual.tensor_split(self._context.attn_tp_size)[
+                self._context.attn_tp_rank
+            ]
+        if hidden_states.shape[0] == 0:
+            return hidden_states, residual
+        return self._get_prepare_mlp_layernorm(quant_format)(hidden_states, residual)
+
     def _get_prepare_mlp_layernorm(self, quant_format: str):
         layernorm = self.post_attention_layernorm
         if (

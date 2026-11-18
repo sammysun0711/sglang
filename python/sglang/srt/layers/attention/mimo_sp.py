@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.mimo_v2_utils import mimo_effective_prefix_lengths
 
 
@@ -569,6 +570,39 @@ def _run_mimo_tp_sp_swa(
     return self.o_proj.quant_method.apply(
         SimpleNamespace(weight=self.o_proj_full), out.view(rows, heads * dv)
     )
+
+
+def mimo_sp_o_proj(attn_output: torch.Tensor, weight: torch.Tensor, quant_method):
+    """o_proj for this rank's token slice: all-to-all over attention TP
+    gives every rank its token slice of all head groups, then one GEMM with the full weight.
+    """
+    attn_tp = get_attention_tp_size()
+    rows = attn_output.shape[0] // attn_tp
+    assert rows * attn_tp == attn_output.shape[0]
+    source = attn_output.contiguous()
+    received = torch.empty_like(source)
+    group = get_attention_tp_group()
+    if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+        # ROCm 7.2's ProcessGroupNCCL watchdog may query events from a
+        # capturing stream. Use the same direct RCCL interface as the MoE
+        # gather instead of creating ProcessGroup work inside the graph.
+        comm = group.pynccl_comm
+        if comm is None or not comm.available:
+            raise RuntimeError("MiMo graph SP requires the direct RCCL communicator")
+        sends = source.tensor_split(attn_tp)
+        receives = received.tensor_split(attn_tp)
+        with comm.change_state(enable=True):
+            comm.group_start()
+            try:
+                for peer in range(attn_tp):
+                    comm.send(sends[peer], peer)
+                    comm.recv(receives[peer], peer)
+            finally:
+                comm.group_end()
+    else:
+        group.all_to_all_single(received, source)
+    x = received.view(attn_tp, rows, -1).transpose(0, 1).reshape(rows, -1)
+    return quant_method.apply(SimpleNamespace(weight=weight), x)
 
 
 def run_mimo_sp_swa(

@@ -620,10 +620,10 @@ def test_tp_swa_weight_assembly_preserves_projection_and_qkv_order(
     )
 
 
-@pytest.mark.parametrize("mode", ["tp_full", "tp_swa", "ep_swa", "graph"])
+@pytest.mark.parametrize("mode", ["tp_full", "tp_swa", "ep_swa", "graph", "graph_oproj"])
 def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
     calls = []
-    swa = mode not in ("tp_full", "graph")
+    swa = mode not in ("tp_full", "graph", "graph_oproj")
     local_rows = 4 if swa else 2
 
     def reduce_scatter(output, value):
@@ -676,12 +676,13 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
 
     class Attention:
         _ep_sp_swa = mode == "ep_swa"
-        o_proj_full = object() if swa or mode == "graph" else None
+        o_proj_full = object() if swa or mode.startswith("graph") else None
+        _graph_sp_o_proj = mode == "graph_oproj"
 
         def __call__(
             self, positions, hidden_states, forward_batch, sp_swa, scatter_output=False
         ):
-            assert not scatter_output
+            assert scatter_output == (mode == "graph_oproj")
             assert sp_swa == swa
             return (hidden_states[:local_rows] if scatter_output else hidden_states) + 1
 
@@ -695,7 +696,7 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
         nn=torch.nn,
         ForwardMode=Mode,
         _mimo_sp_moe_active=lambda batch: True,
-        _mimo_graph_verify_sp_active=lambda batch: mode == "graph",
+        _mimo_graph_verify_sp_active=lambda batch: mode.startswith("graph"),
         ScatterMode=communication.ScatterMode,
         _mimo_ep_sp_active=lambda batch: True,
         _mimo_hidden_num_tokens=lambda x: x.shape[0],
@@ -712,20 +713,20 @@ def test_decoder_keeps_normal_mlp_reduction_and_swa_dispatch(mode):
     x = torch.arange(32, dtype=torch.float32).view(8, 4)
     residual = torch.zeros_like(x)
     batch = SimpleNamespace(
-        forward_mode=Mode.TARGET_VERIFY if mode == "graph" else Mode.EXTEND,
-        extend_seq_lens_cpu=None if mode == "graph" else [8],
+        forward_mode=Mode.TARGET_VERIFY if mode.startswith("graph") else Mode.EXTEND,
+        extend_seq_lens_cpu=None if mode.startswith("graph") else [8],
     )
     output, _ = cls.forward(layer, torch.arange(8), x, batch, residual)
     selected = "swa" if swa else "tp"
     expected_calls = [
         (selected, "attn"),
-        (selected, "mlp"),
+        (selected, "scattered_mlp" if mode == "graph_oproj" else "mlp"),
     ]
-    if not swa:
+    if not swa and mode != "graph_oproj":
         expected_calls.append(("reduce_scatter", "attn_tp"))
     assert calls == expected_calls
     expected = (
-        x[:local_rows] + 3 if swa else 4 * (x[:local_rows] + 1) + 2
+        x[:local_rows] + 3 if swa or mode == "graph_oproj" else 4 * (x[:local_rows] + 1) + 2
     )
     torch.testing.assert_close(output, expected)
 
@@ -976,3 +977,30 @@ def test_static_moe_keeps_prefill_selection_and_uses_direct_graph_reduction(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def test_optional_graph_weight_assembly_needs_no_full_qkv(monkeypatch):
+    class Unquantized:
+        pass
+
+    calls = []
+    def gather(value):
+        calls.append(value.shape)
+        return torch.cat([value + rank * 100 for rank in range(4)])
+
+    package = types.ModuleType("sglang.srt.layers.attention.mimo_sp")
+    package._mimo_attn_tp_gather = gather
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    cls = load("models/mimo_v2.py", ["MiMoV2Attention"], nn=torch.nn,
+               UnquantizedLinearMethod=Unquantized,
+               logger=SimpleNamespace(info=lambda *args: None)).MiMoV2Attention
+    shard = torch.arange(12).reshape(3, 4)
+    layer = SimpleNamespace(_ep_sp_swa=False, _graph_sp_o_proj=True,
+                            qkv_proj_full=None, o_proj_full=None,
+                            o_proj=SimpleNamespace(weight=shard, quant_method=Unquantized()))
+    cls.build_sp_weights(layer)
+    torch.testing.assert_close(layer.o_proj_full,
+                               torch.cat([shard + rank * 100 for rank in range(4)], dim=1))
+    assert calls == [torch.Size([4, 3])]
+    assert layer.qkv_proj_full is None
+    assert layer.o_proj.weight is shard

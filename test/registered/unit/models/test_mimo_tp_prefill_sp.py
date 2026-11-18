@@ -1004,3 +1004,16 @@ def test_optional_graph_weight_assembly_needs_no_full_qkv(monkeypatch):
     assert calls == [torch.Size([4, 3])]
     assert layer.qkv_proj_full is None
     assert layer.o_proj.weight is shard
+
+
+@pytest.mark.parametrize("threshold,bs,qlen,expected", [
+    (0, 208, 8, None), (152, 12, 8, None), (152, 96, 8, None),
+    (152, 151, 8, None), (152, 152, 8, 1), (152, 208, 8, 1),
+    (152, 240, 8, 1), (152, 256, 8, 1), (152, 208, 4, None),
+    (152, 208, 1, None),
+])
+def test_grouped_swa_qs1_policy_preserves_small_batches_and_non_q8(threshold, bs, qlen, expected):
+    fn = load("layers/attention/grouped_pa_swa_eval.py", ["_grouped_swa_query_splits"],
+              envs=SimpleNamespace(SGLANG_MIMO_GROUPED_PA_SWA_QS1_MIN_BS=
+                                   SimpleNamespace(get=lambda: threshold)))._grouped_swa_query_splits
+    assert fn(bs, qlen) == expected

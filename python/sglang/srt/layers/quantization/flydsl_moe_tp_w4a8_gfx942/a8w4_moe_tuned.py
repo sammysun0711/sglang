@@ -85,8 +85,7 @@ def lookup_config(num_tokens, model_dim, inter_dim, experts, topk, routing="unif
 
 
 def run_config(cfg, x, W, topk_weights, topk_ids, input_scale=None):
-    """Run one kernel combination end to end (moe_sorting + x quant + kernels);
-    returns bf16 [tokens, model_dim]."""
+    """Run the selected expert kernels and return BF16 [tokens, model_dim]."""
     E, model_dim, _ = W["w2"].shape
     topk = topk_ids.shape[1]
     if cfg["kind"] == "1kq" and torch.cuda.is_current_stream_capturing():
@@ -121,8 +120,11 @@ def run_config(cfg, x, W, topk_weights, topk_ids, input_scale=None):
 
 
 def tuned_moe(x, weights, topk_weights, topk_ids, *, csv_path=DEFAULT_CSV, routing="uniform", input_scale=None):
-    """A8W4 MoE (bf16 x [tokens, H] -> bf16 [tokens, H]) with the tuned kernel
-    combination for this batch size. ``weights``: fd2 dict (w1/w2_fast_dec == 2)."""
+    """Apply the tuned A8W4 experts with fd2 weights and return BF16 [tokens, H].
+
+    BF16 input is quantized per row. For prequantized E4M3FNUZ input, pass its
+    FP32 [tokens] scales in ``input_scale``.
+    """
     assert weights["w1_fast_dec"] == 2 and weights["w2_fast_dec"] == 2, "needs fd2 weights"
     if input_scale is not None:
         assert x.dtype == torch.float8_e4m3fnuz and x.is_contiguous()

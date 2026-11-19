@@ -61,14 +61,12 @@ export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
 unset ROCM_QUICK_REDUCE_QUANTIZATION
 export SGLANG_MIMO_MIXED_ROUTER=0
 
-# Native graph MoE SP uses MAX_LEN padding independently of full o_proj SP.
-# Keep full o_proj off by default to retain KV capacity, including small graphs.
+# Native graph MoE SP uses MAX_LEN padding and sharded attention output projection.
 export SGLANG_USE_ROCM700A="${SGLANG_USE_ROCM700A:-0}"
 export SGLANG_MIMO_GRAPH_VERIFY_SP="${SGLANG_MIMO_GRAPH_VERIFY_SP:-1}"
 export SGLANG_MIMO_GRAPH_SP_PACKED="${SGLANG_MIMO_GRAPH_SP_PACKED:-1}"
 export SGLANG_MIMO_FUSED_SP_PACKET="${SGLANG_MIMO_FUSED_SP_PACKET:-1}"
 export SGLANG_DFLASH_REQUEST_OWNER_VERIFY="${SGLANG_DFLASH_REQUEST_OWNER_VERIFY:-1}"
-export SGLANG_MIMO_GRAPH_OPROJ_SP="${SGLANG_MIMO_GRAPH_OPROJ_SP:-0}"
 export SGLANG_DFLASH_GREEDY_CHUNK_SIZE="${SGLANG_DFLASH_GREEDY_CHUNK_SIZE:-2048}"
 export SGLANG_DFLASH_FAST_CPU_STAGING="${SGLANG_DFLASH_FAST_CPU_STAGING:-1}"
 export SGLANG_MIMO_GROUPED_PA_SWA="${SGLANG_MIMO_GROUPED_PA_SWA:-1}"
@@ -234,7 +232,7 @@ echo "Decode: preallocate-reqs=${SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS}, l
 echo "Quick Reduce: disabled; mixed-router=${SGLANG_MIMO_MIXED_ROUTER}; custom all-reduce=${custom_all_reduce_status}; radix cache=${radix_cache_status}; tbo=${ENABLE_TWO_BATCH_OVERLAP}"
 echo "Tokenizer: workers=${TOKENIZER_WORKER_NUM}, backend=${TOKENIZER_BACKEND}, disable-batch-decode=${DISABLE_TOKENIZER_BATCH_DECODE}; server seed=${SERVER_RANDOM_SEED:-auto}"
 echo "Decode defaults: rocm700a=${SGLANG_USE_ROCM700A}, cpu-staging=${SGLANG_DFLASH_FAST_CPU_STAGING}, grouped-swa=${SGLANG_MIMO_GROUPED_PA_SWA}, mq-broadcast=${SGLANG_SCHEDULER_MQ_BROADCAST}, fused-pad-copy=${SGLANG_DPA_FUSED_PAD_COPY}, overlap-plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}"
-echo "Graph MoE: sp=${SGLANG_MIMO_GRAPH_VERIFY_SP}, packed=${SGLANG_MIMO_GRAPH_SP_PACKED}, fused-packet=${SGLANG_MIMO_FUSED_SP_PACKET}; full-o-proj=${SGLANG_MIMO_GRAPH_OPROJ_SP}; request-owner=${SGLANG_DFLASH_REQUEST_OWNER_VERIFY}; draft-chunk=${SGLANG_DFLASH_GREEDY_CHUNK_SIZE}"
+echo "Graph MoE: sp=${SGLANG_MIMO_GRAPH_VERIFY_SP}, packed=${SGLANG_MIMO_GRAPH_SP_PACKED}, fused-packet=${SGLANG_MIMO_FUSED_SP_PACKET}; request-owner=${SGLANG_DFLASH_REQUEST_OWNER_VERIFY}; draft-chunk=${SGLANG_DFLASH_GREEDY_CHUNK_SIZE}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 
 server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \

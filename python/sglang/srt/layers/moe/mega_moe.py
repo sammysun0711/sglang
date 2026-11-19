@@ -11,7 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Mega-MoE forward path and expert-weight prep shared by Deepseek V2/V4."""
+"""Mega-MoE forward path and expert-weight prep shared by Deepseek V2/V4 (DeepGEMM)
+and MiMo-V2 (pyhip's MOE_EP on ROCm)."""
 
 from __future__ import annotations
 
@@ -24,15 +25,21 @@ import torch
 from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    get_dp_global_num_tokens,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
 
+    from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+    from sglang.srt.models.mimo_v2 import MiMoV2MoE
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
@@ -99,6 +106,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
+    if getattr(moe.experts, "mega_moe_comm", None) is not None:
+        # pyhip MOE_EP: a collective with no other EP path; the tokens a rank
+        # brings are bounded at load time (check_pyhip_mega_moe_config).
+        return True
     if get_is_capture_mode():
         return True
 
@@ -117,6 +128,9 @@ def forward_mega_moe(
     forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if getattr(moe.experts, "mega_moe_comm", None) is not None:
+        return _forward_pyhip_mega_moe(moe, hidden_states, forward_batch)
+
     num_tokens = hidden_states.shape[0]
 
     sbo_overlap_flag = (
@@ -330,3 +344,187 @@ def build_mega_moe_experts_weights(experts) -> None:
         experts.mega_l2_weights = l2_pair
 
     experts._mega_moe_weights_built = True
+
+
+# ---- pyhip MOE_EP (ROCm) ------------------------------------------------------------
+# pyhip.contrib.flydsl.a8w4.moe_ep: the EP layer of MiMo-V2.6-Flash (EP8, 32 MXFP4
+# experts per rank) as fused kernels -- dispatch, A8W4 experts, combine -- that talk
+# through MORI shmem. Every rank calls MOE_EP once per layer, idle ranks with 0 rows,
+# with the same ``tokens`` (the batch over all ranks), which picks the kernel family
+# from pyhip's tuned table: ranks that pick differently would wait on each other.
+
+# Tokens per rank and call the buffers hold: pyhip's tuned size, raised to a prefill
+# chunk's share of one attention-TP rank, up to what the kernels can index.
+PYHIP_MEGA_MOE_MIN_TOKENS_PER_RANK = 4096
+PYHIP_MEGA_MOE_MAX_TOKENS_PER_RANK = 8192
+
+# MOE_EP solver -> the EpComm method that builds its buffers.
+_PYHIP_MEGA_MOE_FAMILIES = {
+    "mega": "mega",
+    "mega_small": "small",
+    "mega_large": "large",
+    "mori": "mori",
+    "mori_eager": "mori",
+}
+
+# One EpComm per (EP group, shape), shared by every layer of that shape.
+_PYHIP_MEGA_MOE_COMM: dict = {}
+
+
+def _pyhip_mega_moe_problem(config: MoeRunnerConfig) -> dict:
+    """MOE_EP's problem for a layer's shape (tokens, act, routing and x quant left to
+    the defaults)."""
+    from pyhip.contrib.flydsl.a8w4.moe_ep import MOE_EP
+
+    from sglang.srt.distributed import get_moe_expert_parallel_world_size
+
+    return dict(
+        dict.fromkeys(MOE_EP.dim_names),
+        model_dim=config.hidden_size,
+        inter_dim=config.intermediate_size_per_partition,
+        experts_global=config.num_experts,
+        world=get_moe_expert_parallel_world_size(),
+        topk=config.top_k,
+    )
+
+
+def _pyhip_mega_moe_max_tokens() -> int:
+    """Tokens per rank and call: a prefill chunk is scattered over the attention-TP
+    ranks of its DP group."""
+    server_args = get_global_server_args()
+    per_rank = 0
+    if server_args.disaggregation_mode != "decode":
+        chunk = server_args.chunked_prefill_size
+        if chunk is None or chunk <= 0:
+            raise ValueError(
+                "--moe-a2a-backend megamoe (pyhip MOE_EP) needs chunked prefill: "
+                "--chunked-prefill-size bounds the tokens a rank brings to a call."
+            )
+        per_rank = -(-chunk // get_attention_tp_size())
+    if per_rank > PYHIP_MEGA_MOE_MAX_TOKENS_PER_RANK:
+        raise ValueError(
+            "--moe-a2a-backend megamoe (pyhip MOE_EP) takes at most "
+            f"{PYHIP_MEGA_MOE_MAX_TOKENS_PER_RANK} tokens per rank and call, but a "
+            f"prefill chunk brings {per_rank}; lower --chunked-prefill-size."
+        )
+    return max(PYHIP_MEGA_MOE_MIN_TOKENS_PER_RANK, per_rank)
+
+
+def check_pyhip_mega_moe_config(config: MoeRunnerConfig) -> None:
+    """Fail at load time on what MOE_EP cannot run."""
+    from pyhip.contrib.flydsl.a8w4.moe_ep import MOE_EP
+
+    server_args = get_global_server_args()
+    name = "--moe-a2a-backend megamoe (pyhip MOE_EP)"
+    if server_args.enable_two_batch_overlap or server_args.enable_single_batch_overlap:
+        raise ValueError(
+            f"{name} does not support two / single batch overlap: its output is a "
+            "buffer that the next MoE call overwrites."
+        )
+    if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+        raise ValueError(
+            f"{name} needs the token counts the scheduler all-gathers; unset "
+            "SGLANG_SCHEDULER_SKIP_ALL_GATHER."
+        )
+    if config.num_fused_shared_experts or config.apply_router_weight_on_input:
+        raise ValueError(
+            f"{name} does not support fused shared experts or "
+            "apply_router_weight_on_input."
+        )
+    problem = _pyhip_mega_moe_problem(config)
+    if not MOE_EP.points(problem):
+        raise ValueError(
+            f"{name} has no tuned config for {problem}; its kernels run EP8 with 32 "
+            "experts per rank (MiMo-V2.6-Flash)."
+        )
+    _pyhip_mega_moe_max_tokens()
+
+
+def _init_mori_shmem(group) -> None:
+    """MORI shmem over ``group``, registered as sglang's MORI dispatcher does
+    (``init_mori_op``): a group already registered keeps its shmem."""
+    import mori
+
+    try:
+        torch._C._distributed_c10d._register_process_group("mori", group.cpu_group)
+    except Exception as e:
+        if "already registered" not in str(e):
+            raise
+    else:
+        mori.shmem.shmem_torch_process_group_init("mori")
+
+
+def build_pyhip_mega_moe(experts, weights: dict) -> None:
+    """Run ``experts`` (``weights``: pyhip ``prepare_weights`` of its local experts)
+    with MOE_EP. The first layer builds the shared EpComm, every rank in the same
+    order: MORI shmem and the buffers of every solver family the tuned table can
+    pick. Their constructors synchronize all ranks, which CUDA-graph capture does not
+    allow, and built at load time their memory counts in sglang's profiling."""
+    from pyhip.contrib.flydsl.a8w4.moe_ep import MOE_EP, EpComm
+
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    config = experts.moe_runner_config
+    group = get_moe_ep_group()
+    max_tokens = _pyhip_mega_moe_max_tokens()
+    key = (
+        id(group),
+        max_tokens,
+        config.num_experts,
+        config.top_k,
+        config.hidden_size,
+        config.intermediate_size_per_partition,
+    )
+    comm = _PYHIP_MEGA_MOE_COMM.get(key)
+    if comm is None:
+        _init_mori_shmem(group)
+        comm = EpComm(
+            rank=group.rank_in_group, world=group.world_size, max_tokens=max_tokens
+        )
+        problem = _pyhip_mega_moe_problem(config)
+        solvers = {
+            MOE_EP.pick({**problem, "tokens": tokens}, capturing=capturing)["solver"]
+            for tokens, _ in MOE_EP.points(problem)
+            for capturing in (False, True)
+        }
+        # Sorted: symmetric buffers must be allocated in the same order on all ranks.
+        for solver in sorted(solvers):
+            getattr(comm, _PYHIP_MEGA_MOE_FAMILIES[solver])(weights, config.top_k)
+        _PYHIP_MEGA_MOE_COMM[key] = comm
+
+    experts.mega_moe_weights = weights
+    experts.mega_moe_comm = comm
+    experts._mega_moe_weights_built = True
+
+
+def _forward_pyhip_mega_moe(
+    moe: MiMoV2MoE,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    from pyhip.contrib.flydsl.a8w4.moe_ep import MOE_EP
+
+    if hidden_states.shape[0] > 0:
+        router_logits = moe.gate(hidden_states)
+        topk_output = moe.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=forward_batch.num_token_non_padded,
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                layer_id=moe.layer_id,
+            ),
+        )
+    else:
+        topk_output = moe.topk.empty_topk_output(hidden_states.device)
+
+    # tokens: the DP ranks' token counts the scheduler all-gathers (a CUDA graph's
+    # batch while it is captured), the same on every rank. The output is this rank's
+    # tokens summed over all experts: a view of a buffer the next call overwrites.
+    return MOE_EP(
+        hidden_states,
+        moe.experts.mega_moe_weights,
+        topk_output.topk_weights,
+        topk_output.topk_ids,
+        comm=moe.experts.mega_moe_comm,
+        tokens=sum(get_dp_global_num_tokens()),
+    )

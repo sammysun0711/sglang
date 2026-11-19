@@ -491,7 +491,16 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_megamoe()
         )
+        if get_moe_a2a_backend().is_megamoe() and not getattr(
+            self.experts.quant_method, "use_mega_moe", False
+        ):
+            raise ValueError(
+                "MiMo --moe-a2a-backend megamoe runs pyhip's MOE_EP: it needs MXFP4 "
+                "experts on --moe-runner-backend aiter with "
+                "SGLANG_MXFP4_TO_FP8_128BLOCK=0."
+            )
         self._sp_tp_moe = mimo_tp_sp_enabled()
         self._pyhip_moe: Optional[bool] = None
         if self._sp_tp_moe and not getattr(
@@ -513,6 +522,10 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        if should_use_mega_moe(self, hidden_states):
+            return forward_mega_moe(self, hidden_states, forward_batch)
         if self._sp_tp_moe and mimo_tp_sp_active(forward_batch):
             return run_mimo_tp_sp_moe(self, hidden_states)
         if not self._enable_a2a_moe:

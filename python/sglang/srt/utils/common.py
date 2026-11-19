@@ -3153,6 +3153,11 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         elif get_moe_a2a_backend().is_none():
             return True
+        elif get_moe_a2a_backend().is_megamoe() and is_hip():
+            # pyhip's MOE_EP (megamoe on ROCm) picks its kernels from the token count
+            # of all DP ranks, which every rank must see alike: keep the gathered
+            # counts, and pick CUDA graphs by their max (layers/moe/mega_moe.py).
+            return True
         else:
             return (
                 server_args.moe_dense_tp_size

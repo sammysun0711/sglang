@@ -1,14 +1,12 @@
-"""CPU-only checks for automatic and explicit PA partition selection."""
+"""Manual pytest checks for automatic and explicit PA partition selection."""
 
 import ast
 import os
 from pathlib import Path
 
 import pytest
-from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-b-test-cpu")
-source = Path(__file__).resolve().parents[3] / "python/sglang/srt/layers/attention/aiter_utils.py"
+source = Path(__file__).resolve().parents[2] / "python/sglang/srt/layers/attention/aiter_utils.py"
 tree = ast.parse(source.read_text())
 constants = {"FLYDSL_MIMO_DEFAULT_NUM_PARTITIONS", "FLYDSL_MIMO_SUPPORTED_NUM_PARTITIONS", "FLYDSL_MIMO_NUM_PARTITIONS_ENV"}
 nodes = [node for node in tree.body if (

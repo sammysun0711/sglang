@@ -89,7 +89,7 @@ def can_verify_owned(sampling_info):
 
 def verify_owned(logits, candidates, sampling_info, group, *, chunk,
                  max_top_k=None, uniform_top_k_value=None):
-    """Return full-batch accepted lengths/bonus IDs, or request dense fallback."""
+    """Return full-batch correct-draft counts and bonus tokens, or None for fallback."""
     from sglang.srt.speculative.dflash_utils import (
         compute_dflash_correct_drafts_and_bonus,
         compute_dflash_sampling_correct_drafts_and_bonus,
@@ -115,7 +115,7 @@ def verify_owned(logits, candidates, sampling_info, group, *, chunk,
     if end > start:
         local = logits[:(end - start) * block]
         if greedy:
-            accepted, bonus = compute_dflash_correct_drafts_and_bonus(
+            num_correct_drafts, bonus_tokens = compute_dflash_correct_drafts_and_bonus(
                 candidates=candidates[start:end], target_predict=local.argmax(-1).view(end - start, block))
         else:
             info = SimpleNamespace(
@@ -124,13 +124,18 @@ def verify_owned(logits, candidates, sampling_info, group, *, chunk,
                 need_top_k_sampling=sampling_info.need_top_k_sampling,
                 need_top_p_sampling=sampling_info.need_top_p_sampling,
             )
-            accepted, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+            (
+                num_correct_drafts,
+                bonus_tokens,
+            ) = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates[start:end], next_token_logits=local, sampling_info=info,
                 uniform_samples=coins[start:end], uniform_samples_for_final_sampling=final_coins[start:end],
                 max_top_k=max_top_k, uniform_top_k_value=uniform_top_k_value,
                 reference_batch_size=batch,
             )
-        packed[:end - start].copy_(torch.stack((accepted.to(torch.int64), bonus), dim=1))
+        packed[:end - start].copy_(
+            torch.stack((num_correct_drafts.to(torch.int64), bonus_tokens), dim=1)
+        )
     gathered = packed.new_empty((group.world_size * chunk, 2))
     with group.pynccl_comm.change_state(enable=True):
         group.pynccl_comm.all_gather(gathered, packed)

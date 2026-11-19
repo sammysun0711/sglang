@@ -19,6 +19,7 @@ fake_prefill="${FAKE_PREFILL:-0}"
 profile_by_stage="${PROFILE_BY_STAGE:-0}"
 profile_stages="${PROFILE_STAGES:-prefill}"
 profile_num_steps="${PROFILE_NUM_STEPS:-}"
+profile_batch_api="${PROFILE_BATCH_API:-0}"
 
 export SGLANG_TORCH_PROFILER_DIR="${profile_output_dir}"
 model_args=(--model "${model_path}")
@@ -52,7 +53,19 @@ if [[ "${fake_prefill}" == "1" ]]; then
     profile_args+=(--fake-prefill)
 fi
 
-python3 -m sglang.bench_serving \
+case "${profile_batch_api}" in
+    0) benchmark_cmd=(python3 -m sglang.bench_serving) ;;
+    1)
+        if [[ "${profile_by_stage}" != "0" || -n "${profile_num_steps}" ]]; then
+            echo "PROFILE_BATCH_API=1 uses explicit start/stop profiling; omit stage/step limits" >&2
+            exit 2
+        fi
+        benchmark_cmd=(python3 "${script_dir}/profile_decode_batch.py")
+        ;;
+    *) echo "PROFILE_BATCH_API must be 0 or 1" >&2; exit 2 ;;
+esac
+
+"${benchmark_cmd[@]}" \
     --backend sglang \
     "${model_args[@]}" \
     --host "${host}" \

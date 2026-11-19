@@ -530,6 +530,10 @@ class Envs:
     # The TP path requires globally agreed plain prefill, including idle replicas.
     # Decode, speculative verify, mixed batches and CUDA graphs keep the original path.
     SGLANG_ENABLE_MIMO_SWA_SP = EnvBool(False)
+    # Opt-in native DFlash target graph MoE sequence parallelism.
+    SGLANG_MIMO_GRAPH_VERIFY_SP = EnvBool(False)
+    SGLANG_MIMO_GRAPH_SP_PACKED = EnvBool(False)
+    SGLANG_MIMO_FUSED_SP_PACKET = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -712,8 +716,10 @@ class Envs:
     SGLANG_DFLASH_FUSED_COMPACT_KV = EnvBool(False)
     # Fill the existing CPU length buffers through shared NumPy views.
     SGLANG_DFLASH_FAST_CPU_STAGING = EnvBool(False)
+    SGLANG_DFLASH_REQUEST_OWNER_VERIFY = EnvBool(False)
     # Opt-in grouped PA for MiMo target DFlash SWA verification.
     SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)
+    SGLANG_DFLASH_GREEDY_CHUNK_SIZE = EnvInt(256)
     # Keep target graphs enabled while comparing eager and captured DP drafts.
     SGLANG_DFLASH_DISABLE_DRAFT_CUDA_GRAPH = EnvBool(False)
 

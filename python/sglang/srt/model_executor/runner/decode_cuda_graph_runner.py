@@ -424,6 +424,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
         # --- buffers ---------------------------------------------------
+        owner_worlds = [module.request_owner_world_size
+                        for module in model_runner.model.modules()
+                        if getattr(module, "request_owner_world_size", 1) > 1]
+        if owner_worlds and (model_runner.is_draft_worker or len(owner_worlds) != 1
+                             or not model_runner.spec_algorithm.is_dflash()
+                             or self.num_tokens_per_bs != 8):
+            raise ValueError("Invalid request-owner decode graph configuration")
+        self.request_owner_world_size = owner_worlds[0] if owner_worlds else 1
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -440,6 +448,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            request_owner_world_size=self.request_owner_world_size,
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
@@ -1073,13 +1082,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else:
                 full_logits = None
                 next_token_logits = (
-                    output.next_token_logits[: self.raw_num_token]
+                    (output.next_token_logits if output.request_owner_chunk_size
+                     else output.next_token_logits[: self.raw_num_token])
                     if output.next_token_logits is not None
                     else None
                 )
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
+                request_owner_chunk_size=output.request_owner_chunk_size,
                 full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]

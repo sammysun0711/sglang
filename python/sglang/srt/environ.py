@@ -719,8 +719,6 @@ class Envs:
     SGLANG_DFLASH_REQUEST_OWNER_VERIFY = EnvBool(False)
     # Opt-in grouped PA for MiMo target DFlash SWA verification.
     SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)
-    # Zero retains AITER auto; positive values force Q8 QS1 at/above this batch.
-    SGLANG_MIMO_GROUPED_PA_SWA_QS1_MIN_BS = EnvInt(0)
     SGLANG_DFLASH_GREEDY_CHUNK_SIZE = EnvInt(256)
     # Keep target graphs enabled while comparing eager and captured DP drafts.
     SGLANG_DFLASH_DISABLE_DRAFT_CUDA_GRAPH = EnvBool(False)

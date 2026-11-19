@@ -1,21 +1,8 @@
 """Opt-in MiMo target SWA using AITER PA and one shared plan per forward."""
 
-import logging
-
 import torch
 import triton
 import triton.language as tl
-
-from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
-
-
-def _grouped_swa_query_splits(bs, qlen):
-    threshold = envs.SGLANG_MIMO_GROUPED_PA_SWA_QS1_MIN_BS.get()
-    if threshold < 0:
-        raise ValueError("SGLANG_MIMO_GROUPED_PA_SWA_QS1_MIN_BS must be nonnegative")
-    return 1 if qlen == 8 and threshold > 0 and bs >= threshold else None
 
 
 @triton.jit
@@ -79,8 +66,7 @@ def forward_grouped_pa_swa(backend, q, layer, batch, k, v, out, sinks):
     cache = getattr(backend, "_grouped_pa_swa_workspace", None)
     if cache is None:
         cache = backend._grouped_pa_swa_workspace = {}
-    query_splits = _grouped_swa_query_splits(bs, qlen)
-    key = (bs, qlen, width, query_splits)
+    key = (bs, qlen, width)
     if key not in cache:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -98,10 +84,6 @@ def forward_grouped_pa_swa(backend, q, layer, batch, k, v, out, sinks):
         psum = torch.empty_like(pmax)
         pout = torch.empty(*shape, 128, device=q.device, dtype=torch.bfloat16)
         cache[key] = (lengths, dense, plan, pmax, psum, pout)
-        logger.info(
-            "Grouped SWA schedule: batch=%s, qlen=%s, query_splits=%s",
-            bs, qlen, query_splits,
-        )
     lengths, dense, plan, pmax, psum, pout = cache[key]
     if layer.layer_id == backend._grouped_pa_swa_first_layer:
         # Captured once per target forward; each replay refreshes the shared
@@ -131,5 +113,4 @@ def forward_grouped_pa_swa(backend, q, layer, batch, k, v, out, sinks):
         exp_sums=psum,
         max_logits=pmax,
         temporary_output=pout,
-        query_splits=query_splits,
     )

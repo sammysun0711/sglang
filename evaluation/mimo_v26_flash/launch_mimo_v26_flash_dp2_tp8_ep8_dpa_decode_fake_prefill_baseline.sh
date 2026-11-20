@@ -100,6 +100,11 @@ export SGLANG_DFLASH_FAST_CPU_STAGING="${SGLANG_DFLASH_FAST_CPU_STAGING:-1}"
 # exact compact lengths back from the device every step, which waits for the previous
 # verify. Only valid with the fused compact draft table, so it follows that switch.
 export SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND="${SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND:-${SGLANG_DFLASH_FUSED_COMPACT_KV}}"
+# Keep the windowed DFlash draft KV in one ring per request instead of a pool as
+# large as the target's; the freed memory becomes target KV capacity. Off by
+# default: it needs --disable-radix-cache and, with real PD, a prefill server
+# started with SGLANG_ENABLE_DFLASH_DRAFT_WINDOW_TRANSFER=1.
+export SGLANG_ENABLE_DFLASH_DRAFT_KV_RING="${SGLANG_ENABLE_DFLASH_DRAFT_KV_RING:-0}"
 # Keep draft mask rows in the graph input buffer; update only verified tokens.
 export SGLANG_ENABLE_DFLASH_CACHE_MASK_EMBEDDING="${SGLANG_ENABLE_DFLASH_CACHE_MASK_EMBEDDING:-1}"
 # Draft LM-head rows per GEMM. 4096 covers the whole candidate batch (7 rows per
@@ -312,7 +317,7 @@ echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLA
 echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/${SGLANG_AITER_DFLASH_SWA_IMPL}, draft-kv=bf16, draft-window=1024, acceptance=simulated"
 echo "DFlash logits: draft-greedy-chunk=${SGLANG_DFLASH_GREEDY_CHUNK_SIZE} rows per GEMM (TP exchanges maxima and token IDs); request-owner-verify=${SGLANG_DFLASH_REQUEST_OWNER_VERIFY}"
 echo "DFlash embedding: mask-cache=${SGLANG_ENABLE_DFLASH_CACHE_MASK_EMBEDDING} (graph verified rows updated in place)"
-echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; compact draft table=${SGLANG_DFLASH_FUSED_COMPACT_KV}; draft-len-bound=${SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND}; cpu-staging=${SGLANG_DFLASH_FAST_CPU_STAGING}; fused bounds checks=${SGLANG_FUSED_ASYNC_OOB_CHECKS}; fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}; fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}; fused-router=${SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS}"
+echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; compact draft table=${SGLANG_DFLASH_FUSED_COMPACT_KV}; draft-len-bound=${SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND}; draft-kv-ring=${SGLANG_ENABLE_DFLASH_DRAFT_KV_RING}; cpu-staging=${SGLANG_DFLASH_FAST_CPU_STAGING}; fused bounds checks=${SGLANG_FUSED_ASYNC_OOB_CHECKS}; fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}; fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}; fused-router=${SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS}"
 echo "Simulated acceptance: expected bonus-inclusive length=${SGLANG_SIMULATE_ACC_LEN}, method=${SGLANG_SIMULATE_ACC_METHOD} (throughput only)"
 echo "Fake prefill: disaggregation-mode=decode, transfer-backend=fake"
 echo "MORI: mode=${MORI_MODE}, sdma=${MORI_ENABLE_SDMA}, launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, tuning-config=${MORI_EP_TUNING_CONFIG:-unset} (AUTO only), dispatch=${SGLANG_MORI_DISPATCH_DTYPE}, combine=${SGLANG_MORI_COMBINE_DTYPE}, capacity/rank=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}"

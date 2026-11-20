@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_aborted,
     is_mla_backend,
+    log_dflash_draft_window_checksum,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
     setup_state_kv_args,
@@ -61,6 +62,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.speculative.dflash_draft_ring import get_dflash_draft_window
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -159,9 +161,13 @@ class PrefillBootstrapQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
-        if self.draft_token_to_kv_pool is not None:
+        if (
+            self.draft_token_to_kv_pool is not None
+            and get_dflash_draft_window(self.draft_token_to_kv_pool) is None
+        ):
             # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
+            # shared with a target model, unless only the DFlash draft window is
+            # transferred: setup_state_kv_args registers that as a state component.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
@@ -1007,6 +1013,26 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            def _draft_window_payload():
+                # Pages of the draft window at this request's target slots, in
+                # position order; decode lists the same positions in its layout.
+                draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+                if envs.SGLANG_DEBUG_DFLASH_DRAFT_WINDOW_CHECKSUM.get():
+                    log_dflash_draft_window_checksum(
+                        "prefill",
+                        draft_pool,
+                        self.req_to_token_pool,
+                        req,
+                        seq_len,
+                        page_size,
+                    )
+                return get_dflash_draft_window(draft_pool).page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    req.req_pool_idx,
+                    seq_len,
+                    page_size,
+                )
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1020,6 +1046,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_dsa_payload())
                 elif st == StateType.SWA_RING:
                     state_indices.append(_swa_ring_payload())
+                elif st == StateType.DRAFT_WINDOW:
+                    state_indices.append(_draft_window_payload())
                 else:
                     state_indices.append(None)
 

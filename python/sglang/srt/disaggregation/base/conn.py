@@ -21,6 +21,10 @@ class StateType(str, enum.Enum):
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
+    # Window of the windowed DFlash draft KV: whole pages that prefill and decode
+    # each list by window position in their own layout (target slots, or a
+    # per-request ring), positional like SWA_RING.
+    DRAFT_WINDOW = "draft_window"
 
 
 @dataclasses.dataclass
@@ -46,6 +50,10 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Draft window size of a server that transfers the DFlash draft window as the
+    # DRAFT_WINDOW state component, else None. Set by setup_state_kv_args and
+    # compared between prefill and decode at bootstrap.
+    dflash_draft_window_size: Optional[int]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int

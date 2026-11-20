@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    check_pd_dflash_draft_window,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -74,6 +75,10 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    # Draft window size of a prefill server that transfers the DFlash draft
+    # window as its own state component; None when it does not (the key is then
+    # left out of the bootstrap reply, see CommonKVBootstrapServer).
+    dflash_draft_window_size: Optional[int] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -272,6 +277,11 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        check_pd_dflash_draft_window(
+            info.dflash_draft_window_size,
+            getattr(self.kv_args, "dflash_draft_window_size", None),
+        )
+
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -418,6 +428,9 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "dflash_draft_window_size": getattr(
+                self.kv_args, "dflash_draft_window_size", None
+            ),
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -1212,6 +1225,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.dflash_draft_window_size: Optional[int] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1298,6 +1312,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
 
+        if data.get("dflash_draft_window_size") is not None:
+            self.dflash_draft_window_size = int(data["dflash_draft_window_size"])
+
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
                 "load_balance_method", "follow_bootstrap_room"
@@ -1367,8 +1384,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                dflash_draft_window_size=self.dflash_draft_window_size,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            reply = dataclasses.asdict(info)
+            if reply["dflash_draft_window_size"] is None:
+                # A decode server built before this field rejects unknown keys:
+                # only a prefill server that transfers the draft window sends it.
+                del reply["dflash_draft_window_size"]
+            return web.json_response(reply, status=200)
 
         if not self._is_ready():
             return web.Response(

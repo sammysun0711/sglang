@@ -296,6 +296,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
         # The DFlash pool is indexed by full target slots even when its own
         # attention window is compact. Charge every row, not the SWA ratio.
+        # A draft KV ring is charged through fixed_bytes and has a zero cell.
         if draft_budget is not None:
             self._cell_size += draft_budget.cell_size
 

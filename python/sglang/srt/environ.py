@@ -724,7 +724,7 @@ class Envs:
     SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)
     SGLANG_DFLASH_GREEDY_CHUNK_SIZE = EnvInt(256)
     # AITER draft input: cache the mask row and patch graph verified rows in place.
-    SGLANG_DFLASH_CACHE_MASK_EMBEDDING = EnvBool(False)
+    SGLANG_ENABLE_DFLASH_CACHE_MASK_EMBEDDING = EnvBool(False)
     # Keep target graphs enabled while comparing eager and captured DP drafts.
     SGLANG_DFLASH_DISABLE_DRAFT_CUDA_GRAPH = EnvBool(False)
 

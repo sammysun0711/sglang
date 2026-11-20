@@ -126,3 +126,9 @@ def check_sampling(monkeypatch, rows, dtype, chunk_size):
         assert group.offset == rows
         if rows and chunk_size >= rows:
             assert calls == [(rows, hidden)]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

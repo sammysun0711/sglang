@@ -239,3 +239,9 @@ def test_model_runner_graph_path_never_materializes_full_input(monkeypatch):
     assert out.can_run_graph
     assert fb.input_embeds is None
     assert out.logits_output.data_ptr() == graph_runner.buffers.input_embeds.data_ptr()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

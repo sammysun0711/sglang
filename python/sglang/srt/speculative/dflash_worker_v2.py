@@ -61,7 +61,6 @@ from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
-    get_bool_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -133,9 +132,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
         self._full_embed_gpu = None
         self._mask_embed_gpu = None
-        cache_mask_embedding = envs.SGLANG_DFLASH_CACHE_MASK_EMBEDDING.get()
+        cache_mask_embedding = envs.SGLANG_ENABLE_DFLASH_CACHE_MASK_EMBEDDING.get()
         if cache_mask_embedding:
-            if not (is_hip() and get_bool_env_var("SGLANG_USE_AITER")):
+            if not (is_hip() and envs.SGLANG_USE_AITER.get()):
                 raise ValueError(
                     "DFlash mask input caching requires ROCm with SGLANG_USE_AITER=1 "
                     "and its out-of-place RMSNorm"

@@ -105,6 +105,9 @@ export SGLANG_DFLASH_CACHE_MASK_EMBEDDING="${SGLANG_DFLASH_CACHE_MASK_EMBEDDING:
 # Draft LM-head rows per GEMM. 4096 covers the whole candidate batch (7 rows per
 # request) of up to 585 requests per DP replica, so each TP rank runs one GEMM.
 export SGLANG_DFLASH_GREEDY_CHUNK_SIZE="${SGLANG_DFLASH_GREEDY_CHUNK_SIZE:-4096}"
+# Target verification: each attention-TP rank collects full-vocabulary logits only for
+# the requests it owns, and the ranks exchange compact token/acceptance results.
+export SGLANG_DFLASH_REQUEST_OWNER_VERIFY="${SGLANG_DFLASH_REQUEST_OWNER_VERIFY:-1}"
 export SGLANG_AITER_PA_DECODE_IMPL="${SGLANG_AITER_PA_DECODE_IMPL:-flydsl}"
 export SGLANG_AITER_TARGET_VERIFY_SWA_IMPL="${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL:-${SGLANG_AITER_PA_DECODE_IMPL}}"
 export SGLANG_AITER_DFLASH_SWA_IMPL="${SGLANG_AITER_DFLASH_SWA_IMPL:-${SGLANG_AITER_PA_DECODE_IMPL}}"
@@ -307,7 +310,7 @@ echo "Configuration: model=${MODEL_PATH}, global-tp=8, attention-dp=2 x tp=4, ep
 echo "Per-DP limits: requests=$((MAX_RUNNING_REQUESTS / 2)), chunked-prefill=$((CHUNKED_PREFILL_SIZE / 2))"
 echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}, qlen1=${SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1}, pa-partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS} (0=auto), grouped-swa=${SGLANG_MIMO_GROUPED_PA_SWA}, plan-stream=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-max-bs=${CUDA_GRAPH_MAX_BS_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}"
 echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/${SGLANG_AITER_DFLASH_SWA_IMPL}, draft-kv=bf16, draft-window=1024, acceptance=simulated"
-echo "DFlash logits: draft-greedy-chunk=${SGLANG_DFLASH_GREEDY_CHUNK_SIZE} rows per GEMM (TP exchanges maxima and token IDs)"
+echo "DFlash logits: draft-greedy-chunk=${SGLANG_DFLASH_GREEDY_CHUNK_SIZE} rows per GEMM (TP exchanges maxima and token IDs); request-owner-verify=${SGLANG_DFLASH_REQUEST_OWNER_VERIFY}"
 echo "DFlash embedding: mask-cache=${SGLANG_DFLASH_CACHE_MASK_EMBEDDING} (graph verified rows updated in place)"
 echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; compact draft table=${SGLANG_DFLASH_FUSED_COMPACT_KV}; draft-len-bound=${SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND}; cpu-staging=${SGLANG_DFLASH_FAST_CPU_STAGING}; fused bounds checks=${SGLANG_FUSED_ASYNC_OOB_CHECKS}; fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}; fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}; fused-router=${SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS}"
 echo "Simulated acceptance: expected bonus-inclusive length=${SGLANG_SIMULATE_ACC_LEN}, method=${SGLANG_SIMULATE_ACC_METHOD} (throughput only)"

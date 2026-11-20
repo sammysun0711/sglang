@@ -8,6 +8,8 @@ filtering to produce reproducible, comparable performance metrics.
 
 Pipeline:
   1. Parse all "Decode batch" lines + detect cache flush section boundaries
+     (optional: rescale every sample to an expected accept length, see
+     --normalize-accept-len)
   2. DP and TP rank filters (single scheduler)
   3. Split into sections (by cache flush markers)
   4. Per-section full-load filter (running_req >= ceil(target_bs * ratio))
@@ -19,6 +21,18 @@ Pipeline:
 Usage:
     python decode_bench_analyzer.py <log_file> --target-bs 96
     python decode_bench_analyzer.py <log_file> --target-bs 194 --per-round --drift-check
+    python decode_bench_analyzer.py <log_file> --target-bs 256 --dp-rank 0 --exact-bs --normalize-accept-len 3.5
+
+Accept-length normalization
+    A benchmark with simulated speculative acceptance (for example
+    SGLANG_SIMULATE_ACC_LEN=3.5) draws one integer accept length per decode step for
+    the whole batch. With decode-log-interval 1 every line is one step, so the logged
+    throughput is bs * accept_len / step_time: it takes one value per accept length
+    (3 and 4 are 33% apart) while the step time is constant, and the median lands on
+    whichever accept length has a few more samples. --normalize-accept-len EXPECTED
+    multiplies each sample by EXPECTED / accept_len before any filtering, which turns
+    it into bs * EXPECTED / step_time. The statistics then describe the step time at
+    the expected acceptance; every line stays its own sample.
 """
 
 import argparse
@@ -50,6 +64,8 @@ class DecodeSample:
     queue_req: int
     section_id: int = -1
     round_id: str = ""
+    # Throughput as logged, kept when accept-length normalization rescales `throughput`.
+    logged_throughput: Optional[float] = None
 
 
 @dataclass
@@ -166,6 +182,29 @@ def parse_log(filepath: str) -> Tuple[List[DecodeSample], List[int]]:
                 queue_req=int(m.group(7)),
             ))
     return samples, flush_line_nos
+
+
+def normalize_accept_len(
+    samples: List[DecodeSample], expected_accept_len: float,
+) -> List[DecodeSample]:
+    """Rescale each sample's throughput to a fixed accept length, in place.
+
+    throughput * expected_accept_len / accept_len == bs * expected_accept_len / step_time
+    for a line that covers one decode step. Samples without an accept length
+    (non-speculative lines log 0) are left as logged.
+    """
+    if not expected_accept_len > 0:
+        raise ValueError("--normalize-accept-len must be positive")
+    if not any(s.accept_len > 0 for s in samples):
+        raise ValueError(
+            "--normalize-accept-len needs speculative decode lines: "
+            "no sample has a positive accept len"
+        )
+    for s in samples:
+        s.logged_throughput = s.throughput
+        if s.accept_len > 0:
+            s.throughput = s.throughput * expected_accept_len / s.accept_len
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +404,14 @@ def compute_stats(samples: List[DecodeSample], target_bs: int) -> dict:
     mean = float(np.mean(t))
     median = float(np.median(t))
     std = float(np.std(t, ddof=1)) if len(t) > 1 else 0.0
+    extra = {"accept_len_mean": float(np.mean([s.accept_len for s in samples]))}
+    logged = [s.logged_throughput for s in samples if s.logged_throughput is not None]
+    if logged:
+        # Same retained samples, before accept-length normalization.
+        extra["logged_mean"] = float(np.mean(logged))
+        extra["logged_median"] = float(np.median(logged))
     return {
+        **extra,
         "mean": mean,
         "median": median,
         "std": std,
@@ -484,6 +530,11 @@ def run_pipeline(args: argparse.Namespace) -> Tuple[
     if not samples:
         print("ERROR: No 'Decode batch' lines found.", file=sys.stderr)
         sys.exit(1)
+
+    # Optional: one value per step instead of one per accept length.
+    expected_accept_len = getattr(args, "normalize_accept_len", None)
+    if expected_accept_len is not None:
+        normalize_accept_len(samples, expected_accept_len)
 
     report = FilteringReport()
     report.total_decode_lines = len(samples)
@@ -649,6 +700,11 @@ def format_text_report(
     lines.append(f"  IQR Coefficient (k):  {args.iqr_k}")
     lines.append(f"  Warmup / Drain Trim:  {args.warmup_n} / {args.drain_n}")
     lines.append(f"  Gap Multiplier:       {args.gap_multiplier}")
+    expected_accept_len = getattr(args, "normalize_accept_len", None)
+    if expected_accept_len is not None:
+        lines.append(
+            f"  Accept-Len Normalize: throughput * {expected_accept_len:g} / accept len"
+        )
     lines.append("")
 
     # Section summary
@@ -757,6 +813,12 @@ def format_text_report(
         lines.append(f"    P90:           {stats['p90']:>10.2f}")
         lines.append(f"    P95:           {stats['p95']:>10.2f}")
         lines.append(f"    P99:           {stats['p99']:>10.2f}")
+        lines.append(f"    Accept len:    {stats['accept_len_mean']:>10.3f}  (mean of the samples)")
+        if "logged_median" in stats:
+            lines.append(
+                f"    As logged:     {stats['logged_median']:>10.2f}  median, "
+                f"{stats['logged_mean']:.2f} mean (before normalization)"
+            )
         lines.append("")
         lines.append(f"  Derived Metrics (target_bs={args.target_bs})")
         lines.append(f"    TPS/request:   {stats['tps_per_request']:>10.3f}")
@@ -922,6 +984,7 @@ def format_json_report(
             "warmup_n": args.warmup_n,
             "drain_n": args.drain_n,
             "gap_multiplier": args.gap_multiplier,
+            "normalize_accept_len": getattr(args, "normalize_accept_len", None),
         },
         "filtering": {
             "total_decode_lines": report.total_decode_lines,
@@ -1059,6 +1122,15 @@ def main():
     parser.add_argument(
         "--tp-rank", type=int, default=None,
         help="TP rank to filter (default: auto).",
+    )
+    parser.add_argument(
+        "--normalize-accept-len", type=float, default=None, metavar="EXPECTED",
+        help="Rescale each sample to this accept length before filtering: "
+        "throughput * EXPECTED / accept len. Use the simulated accept length of the run "
+        "(3.5 for SGLANG_SIMULATE_ACC_LEN=3.5). At decode-log-interval 1 the whole batch "
+        "accepts 3 or 4 tokens in a step, so the logged throughput is bimodal and its "
+        "median lands on whichever accept length has more samples; normalized samples "
+        "all equal bs * EXPECTED / step_time (default: off).",
     )
     parser.add_argument(
         "--min-tps", type=float, default=None,

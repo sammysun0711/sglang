@@ -251,6 +251,7 @@ python3 analyze_server_output_throughput.py \
   --dp-rank 0 \
   --target-bs <C-per-replica> \
   --exact-bs \
+  --normalize-accept-len 3.5 \
   --min-tps 40 \
   --max-tpot 25
 ```
@@ -260,6 +261,17 @@ Repeat with `--dp-rank 1` for the other replica. Each scheduler reports its own
 running requests and throughput: at balanced client concurrency 128, use
 `--target-bs 64` per replica. Verify residency in the log before choosing this value. The analyzer requires explicit replica selection for logs containing multiple DP ranks. Report both medians; their sum is an aggregate estimate, not a time-aligned node-wide median.
 
+`--normalize-accept-len` takes the launcher's simulated accept length
+(`SGLANG_SIMULATE_ACC_LEN=3.5`). `match-expected` draws one integer accept
+length per decode step for the whole batch, so with the launcher's
+`--decode-log-interval 1` every log line is one step whose throughput is
+`C-per-replica * accept_len / step_time`. Three-token and four-token steps
+therefore differ by 33% at the same step time, and the unnormalized median
+lands on whichever accept length has a few more samples. The option rescales
+each line to `throughput * 3.5 / accept_len` before any filtering, so the
+median describes the step time at the expected acceptance. Every line stays
+its own sample; omit the option to analyze the logged values unchanged.
+
 The analyzer reports the following median-consistent derived values:
 
 ```text
@@ -267,8 +279,11 @@ TPS/request = filtered replica median / C-per-replica
 TPOT (ms)   = 1000 * C-per-replica / filtered replica median
 ```
 
-The analyzer also retains `mean_tpot_ms` and `mean_tps_per_request` as explicit
-mean-based reference values.
+With `--normalize-accept-len`, the median is the normalized one, and the report
+also carries `accept_len_mean` plus `logged_median` and `logged_mean` for the
+same retained samples before normalization. The analyzer also retains
+`mean_tpot_ms` and `mean_tps_per_request` as explicit mean-based reference
+values.
 
 <details>
 <summary>5. Run DP2/TP4 w/o dp attention baseline single node prefill benchmark</summary>
@@ -413,6 +428,11 @@ TPOT (ms)   = 1000 * C-per-replica / filtered replica median
 ```
 
 The analyzer also retains `mean_tpot_ms` and `mean_tps_per_request` as explicit mean-based reference values.
+
+This launcher simulates an integer accept length (`SGLANG_SIMULATE_ACC_LEN=4`),
+so every full step accepts the same number of tokens and
+`--normalize-accept-len` is not needed. Use it, as in section 4, whenever the
+simulated accept length is fractional.
 
 </details>
 

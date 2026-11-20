@@ -29,6 +29,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_input_embedding import DFlashInputEmbeddings
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
@@ -130,6 +131,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
         self._full_embed_gpu = None
+        self._mask_embed_gpu = None
+        cache_mask_embedding = envs.SGLANG_ENABLE_DFLASH_CACHE_MASK_EMBEDDING.get()
+        if cache_mask_embedding:
+            if not (is_hip() and envs.SGLANG_USE_AITER.get()):
+                raise ValueError(
+                    "DFlash mask input caching requires ROCm with SGLANG_USE_AITER=1 "
+                    "and its out-of-place RMSNorm"
+                )
+            if server_args.enable_lora or server_args.enable_pdmux:
+                raise ValueError(
+                    "DFlash mask input caching requires static weights and a "
+                    "single forward stream (no LoRA or PDMux)"
+                )
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             self.model_runner.dflash_draft_model_config,
             enable_dp_attention=server_args.enable_dp_attention,
@@ -289,6 +303,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_fixed_bytes += (
                     self._full_embed_gpu.numel() * self._full_embed_gpu.element_size()
                 )
+        if cache_mask_embedding:
+            mask_id = torch.tensor(
+                [self._mask_token_id], dtype=torch.long, device=self.device
+            )
+            # The trained mask row is installed above. Use the draft-local TP
+            # scope, or the already gathered table for cross-draft embeddings.
+            with torch.no_grad(), self._draft_context():
+                self._mask_embed_gpu = (
+                    F.embedding(mask_id, self._full_embed_gpu)
+                    if self._full_embed_gpu is not None
+                    else self._draft_embedding(mask_id)
+                ).detach()
+            draft_fixed_bytes += (
+                self._mask_embed_gpu.numel() * self._mask_embed_gpu.element_size()
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFlash mask embedding cache enabled: graph inputs update "
+                    "only verified-token rows; eager inputs materialize on demand"
+                )
         self.model_runner.dflash_draft_kv_budget = DFlashKVCacheBudget(
             self.draft_parallel_layout, draft_cell_size, draft_fixed_bytes
         )
@@ -353,6 +387,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._use_triton_accept_bonus = supports_gpu_triton
         self._use_fused_compact_kv = (
             supports_gpu_triton and envs.SGLANG_DFLASH_FUSED_COMPACT_KV.get()
+        )
+        # Validated against the draft backend in init_backends().
+        self._use_draft_len_bound = envs.SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND.get()
+        self._draft_len_bound = (
+            int(self.draft_window_size) + int(self.page_size) - 1
+            if self.draft_window_size is not None
+            else 0
         )
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
@@ -485,6 +526,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
+        if self._use_draft_len_bound and not (
+            self.use_compact_draft_cache
+            and self._use_fused_compact_kv
+            and getattr(
+                self.draft_model_runner.attn_backend, "_use_unified_verify", False
+            )
+        ):
+            raise ValueError(
+                "SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND requires a windowed draft, "
+                "SGLANG_DFLASH_FUSED_COMPACT_KV and AITER unified verification: only "
+                "that path reads the draft lengths on the device"
+            )
         logger.info(
             "DFlash draft CUDA graphs: %s",
             "disabled" if disable_cuda_graph else "enabled when supported",
@@ -1635,12 +1688,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = (
-            F.embedding(block_ids, self._full_embed_gpu)
-            if self._full_embed_gpu is not None
-            else embed_module(block_ids)
-        )
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        dflash_input_embeds = None
+        if self._mask_embed_gpu is not None:
+            # block[:, 0] is verified_id; all other positions are the fixed mask.
+            # Read the original contiguous IDs instead of copying a strided column.
+            verified_ids = draft_input.verified_id.view(-1)
+            verified_embedding = (
+                F.embedding(verified_ids.long(), self._full_embed_gpu)
+                if self._full_embed_gpu is not None
+                else embed_module(verified_ids)
+            )
+            dflash_input_embeds = DFlashInputEmbeddings(
+                verified_embedding, self._mask_embed_gpu, block_size
+            )
+            input_embeds = None
+        else:
+            noise_embedding = (
+                F.embedding(block_ids, self._full_embed_gpu)
+                if self._full_embed_gpu is not None
+                else embed_module(block_ids)
+            )
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -1660,11 +1728,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                     window_size=int(self.draft_window_size),
                     page_size=int(self.page_size),
                 )
-                # The planner still consumes exact CPU lengths. Keep this
-                # transfer; fusion removes max().item(), nonzero and gather.
-                seq_lens_cpu.copy_(
-                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
-                )
+                if (
+                    self._use_draft_len_bound
+                    and draft_input.planning_seq_lens_cpu is not None
+                ):
+                    # Unified verification reads the lengths on the device; the host
+                    # only sizes buffers. The committed prefix is at most one block
+                    # behind planning_seq_lens_cpu, and the compact view never exceeds
+                    # the window plus its page-alignment slack.
+                    torch.clamp(
+                        draft_input.planning_seq_lens_cpu,
+                        max=self._draft_len_bound,
+                        out=seq_lens_cpu,
+                    )
+                else:
+                    # Legacy planners consume exact CPU lengths. This transfer waits
+                    # for the previous verify; fusion removes max().item(), nonzero
+                    # and gather.
+                    seq_lens_cpu.copy_(
+                        draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                    )
             else:
                 draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
                 seq_lens_cpu.copy_(
@@ -1732,6 +1815,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             input_embeds=input_embeds,
+            dflash_input_embeds=dflash_input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,

@@ -214,9 +214,24 @@ def build_mega_moe_experts_weights(layer) -> None:
 def _build_gfx942_weights(layer) -> None:
     # MegaMoEGfx942 takes the a16w4 shuffle with gate_up=False and converts it to its
     # fd2 form. Only MegaMoE reads fd2, so a batch must never fall back to fused_moe.
-    from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
+    from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942, eligible
     from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
+    shape = dict(
+        world_size=layer.moe_ep_size,
+        model_dim=layer.hidden_size,
+        inter_dim=layer.w13_weight.shape[1] // 2,
+        experts=layer.num_experts,
+        topk=layer.top_k,
+    )
+    # Checked before the conversion: once in fd2, the experts run nowhere else.
+    if not eligible(**shape):
+        raise ValueError(
+            f"gfx942 aiter MegaMoE does not run this MoE layer ({shape}): it runs "
+            "DeepSeek-V4-Flash's routed experts over EP8 on MI300X, without shared "
+            "expert fusion (--disable-shared-experts-fusion). Pick another "
+            "--moe-a2a-backend."
+        )
     experts = layer.w13_weight.shape[0]
     w13_scale = layer.w13_weight_scale_inv
     w2_scale = layer.w2_weight_scale_inv

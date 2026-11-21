@@ -79,6 +79,7 @@ def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     if cfg.moe_a2a_backend != "megamoe" or cfg.encoder_only:
         return
     validate_flydsl_decode_capacity(server_args)
+    validate_flydsl_gfx942_prefill_capacity(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
     model_config = model_config_of(server_args)
@@ -153,6 +154,31 @@ def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
             f"per DP rank x tokens per request = {decode_tokens}. Raise it to a "
             f"power of two of at least {decode_tokens} or lower "
             "--max-running-requests."
+        )
+
+
+def validate_flydsl_gfx942_prefill_capacity(server_args: ServerArgs) -> None:
+    # gfx942 converts the experts into a form only MegaMoE reads, so a prefill
+    # forward past SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR has no fused-MoE fallback.
+    platform = get_platform()
+    if not (platform.is_hip and platform.is_gfx942):
+        return
+    cfg = resolving_view(server_args)
+    if cfg.disaggregation_mode == "decode":
+        return
+    mtpr = envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get()
+    if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
+        raise ValueError(
+            "gfx942 aiter MegaMoE needs chunked prefill (--chunked-prefill-size > 0) "
+            "to bound the rows of a prefill forward on one rank."
+        )
+    # Under DP attention the resolved chunked_prefill_size is already per DP rank.
+    if cfg.chunked_prefill_size > mtpr:
+        raise ValueError(
+            f"SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR={mtpr} must cover the largest prefill "
+            f"forward on one rank: a chunk of {cfg.chunked_prefill_size} tokens "
+            "(--chunked-prefill-size, divided by the DP attention size). Raise it "
+            "or lower --chunked-prefill-size."
         )
 
 

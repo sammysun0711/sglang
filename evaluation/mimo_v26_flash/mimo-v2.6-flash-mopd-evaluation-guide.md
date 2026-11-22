@@ -1,6 +1,22 @@
-## 1. Prepare docker image
+## 1. Prepare docker image for MiMO-v2.6-Flash-MOPD on MI300X (gfx942)
 
-### gfx942
+### Build docker image with rocm 7.14.1 base docker image
+
+Base docker image: `rocm/pytorch:rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.12.0`
+
+```bash
+git clone https://github.com/sammysun0711/sglang -b mimo-opt-mxfp4-dflash && cd sglang
+docker build -f docker/rocm.Dockerfile \
+  --target mimo-rocm7141 --build-arg GPU_ARCH=gfx942 \
+  -t mimo-flash:rocm7141-gfx942-sglang .
+```
+
+Please refer to the [build-rocm7.14.1-docker-image-guide.md](build-rocm7.14.1-docker-image-guide.md) for detailed build guide and component version.
+
+<details>
+<summary> (Legacy) Prepare docker container with rocm 7.2.0 base docker image </summary>
+
+Base docker image: `rocm/sgl-dev:v0.5.11-rocm720-mi30x-20260510`
 
 ```bash
 docker run -it --name mimo-v26-flash-opt-gfx942 --ipc=host --network=host --privileged --security-opt seccomp=unconfined \
@@ -79,6 +95,8 @@ pip uninstall -y amd_mori
 rm -rf /sgl-workspace/mori
 pip install amd_mori==1.2.4
 ```
+
+</details>
 
 ## 3. Run DP2/TP8 with dp attention baseline single node prefill benchmark
 

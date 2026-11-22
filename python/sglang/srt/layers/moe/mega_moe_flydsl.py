@@ -320,9 +320,8 @@ def _get_or_build_mega_moe_gfx942(
     _ensure_mori_shmem()
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
-    # One instance holds every path; the decode capacity turns on the small path
-    # (AITER_MEGA_LARGE_M turns on the large one). a8w8 runs extend steps on its own
-    # mega kernel and decode steps on the main kernel compiled for fp8 W.
+    # Extend steps run the LDS mega kernel; with a decode capacity set, decode steps
+    # run the main kernel at that capacity (the small path). Same for a8w4 and a8w8.
     decode_mtpr = _decode_mtpr()
     mega = MegaMoEGfx942(
         rank=rank,

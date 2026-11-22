@@ -2171,7 +2171,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if _use_aiter and self.is_fp4_expert:
-            if get_moe_a2a_backend().is_megamoe() and self.dequant_fp4_to_fp8:
+            megamoe = get_moe_a2a_backend().is_megamoe()
+            # gfx942 runs MegaMoE on the dequantized block-FP8 experts too (a8w8).
+            if megamoe and self.dequant_fp4_to_fp8 and not get_platform().is_gfx942:
                 raise ValueError(
                     "SGLANG_DSV4_FP4_DEQUANT strips the packed FP4 layout that "
                     "aiter MegaMoE builds from; unset it, or pick another "
@@ -2180,7 +2182,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 arm; the gfx1250 MegaMoE
             # runs aiter fused_moe on that arm's layout.
-            if get_moe_a2a_backend().is_megamoe() and not _is_gfx1250_supported:
+            if megamoe and not _is_gfx1250_supported and not self.dequant_fp4_to_fp8:
                 from sglang.srt.layers.moe.mega_moe import (
                     build_mega_moe_experts_weights,
                 )
@@ -2358,6 +2360,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     layer.w13_input_scale = None
                     layer.w2_input_scale = None
+
+                if megamoe:
+                    # The gfx942 a8w8 MegaMoE reads aiter's (16, 16) shuffle.
+                    from sglang.srt.layers.moe.mega_moe import (
+                        build_mega_moe_experts_weights,
+                    )
+
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
+                    build_mega_moe_experts_weights(layer)
+                    return
 
                 # Only aiter-shuffle when the MoE runner is aiter; the triton runner
                 # consumes un-shuffled weights (shuffling the wrong runner corrupts output).

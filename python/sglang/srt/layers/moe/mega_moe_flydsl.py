@@ -212,6 +212,9 @@ def build_mega_moe_experts_weights(layer) -> None:
 
 
 def _build_gfx942_weights(layer) -> None:
+    if layer.w13_weight.data.dtype == torch.float8_e4m3fnuz:
+        _build_gfx942_a8w8_weights(layer)
+        return
     # MegaMoEGfx942 takes the a16w4 shuffle with gate_up=False and converts it to its
     # fd2 form. Only MegaMoE reads fd2, so a batch must never fall back to fused_moe.
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942, eligible
@@ -232,6 +235,7 @@ def _build_gfx942_weights(layer) -> None:
             "expert fusion (--disable-shared-experts-fusion). Pick another "
             "--moe-a2a-backend."
         )
+    layer._mega_quant = "a8w4"
     experts = layer.w13_weight.shape[0]
     w13_scale = layer.w13_weight_scale_inv
     w2_scale = layer.w2_weight_scale_inv
@@ -253,6 +257,41 @@ def _build_gfx942_weights(layer) -> None:
     w2_scale.data = w2_scale
 
 
+def _build_gfx942_a8w8_weights(layer) -> None:
+    # Block-FP8 experts (SGLANG_DSV4_FP4_DEQUANT=1), aiter-shuffled (16, 16) in fp8.py:
+    # MegaMoEGfx942(quant="a8w8") reads them in place (prepare_weights zeroes the W
+    # of zero-scale blocks and returns the scales as f32).
+    from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942, eligible
+
+    shape = dict(
+        world_size=layer.moe_ep_size,
+        model_dim=layer.hidden_size,
+        inter_dim=layer.w13_weight.shape[1] // 2,
+        experts=layer.num_experts,
+        topk=layer.top_k,
+    )
+    if not eligible(**shape, quant="a8w8"):
+        raise ValueError(
+            f"gfx942 aiter a8w8 MegaMoE does not run this MoE layer ({shape}): it "
+            "runs DeepSeek-V4-Flash's routed experts over EP8 on MI300X, without "
+            "shared expert fusion (--disable-shared-experts-fusion). Pick another "
+            "--moe-a2a-backend."
+        )
+    layer._mega_quant = "a8w8"
+    (
+        layer._mega_w1,
+        layer._mega_w1_scale,
+        layer._mega_w2,
+        layer._mega_w2_scale,
+    ) = MegaMoEGfx942.prepare_weights(
+        layer.w13_weight.data,
+        layer.w13_weight_scale_inv.data,
+        layer.w2_weight.data,
+        layer.w2_weight_scale_inv.data,
+        quant="a8w8",
+    )
+
+
 def _get_or_build_mega_moe_gfx942(
     layer,
     *,
@@ -263,7 +302,18 @@ def _get_or_build_mega_moe_gfx942(
     swiglu_limit: float,
 ):
     rank, world = _ep_rank_world()
-    key = ("gfx942", rank, world, model_dim, inter_dim, experts, topk, swiglu_limit)
+    quant = layer._mega_quant
+    key = (
+        "gfx942",
+        quant,
+        rank,
+        world,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        swiglu_limit,
+    )
     mega = _MEGA_MOE_INSTANCE.get(key)
     if mega is not None:
         return mega
@@ -271,7 +321,8 @@ def _get_or_build_mega_moe_gfx942(
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
     # One instance holds every path; the decode capacity turns on the small path
-    # (AITER_MEGA_LARGE_M turns on the large one).
+    # (AITER_MEGA_LARGE_M turns on the large one). a8w8 runs extend steps on its own
+    # mega kernel and decode steps on the main kernel compiled for fp8 W.
     decode_mtpr = _decode_mtpr()
     mega = MegaMoEGfx942(
         rank=rank,
@@ -285,12 +336,15 @@ def _get_or_build_mega_moe_gfx942(
         w2=layer._mega_w2,
         w2_scale=layer._mega_w2_scale,
         max_tok_per_rank=_mtpr(),
+        quant=quant,
         swiglu_limit=swiglu_limit,
         small_m_mtprs=(decode_mtpr,),
         small_m_enabled=decode_mtpr > 0,
     )
     logger.info(
-        "Aiter MegaMoEGfx942: max_tok_per_rank=%d, small path mtpr=%d, large path %s",
+        "Aiter MegaMoEGfx942 %s: max_tok_per_rank=%d, small path mtpr=%d, "
+        "large path %s",
+        quant,
         _mtpr(),
         mega.small_m_mtpr,
         "on" if mega.large_m_available else "off",

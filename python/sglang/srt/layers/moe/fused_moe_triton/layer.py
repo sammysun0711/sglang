@@ -1099,8 +1099,8 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
-        # A prequantized standard-dispatch input is an eager-only contract;
-        # decode graph routes continue to receive ordinary tensors.
+        # The piecewise custom ops take a single activation tensor. Pass both
+        # tensors to the dispatcher, including during MiMo target graph capture.
         if isinstance(hidden_states, tuple):
             return self.forward_impl(hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():

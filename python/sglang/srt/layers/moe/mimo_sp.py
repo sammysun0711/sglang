@@ -35,6 +35,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend, should_use_dpa_sp_moe
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.mimo_v2_utils import mimo_flydsl_target_verify_enabled
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_gfx942_supported
@@ -211,7 +212,8 @@ def run_mimo_tp_sp_moe(layer, hidden_states) -> torch.Tensor:
         quantized_bytes.view(quantized.dtype),
         _mimo_sp_moe_gather_scales(scale, sizes),
     )
-    if _use_pyhip_moe(layer, sizes):
+    capturing = get_is_capture_mode() or torch.cuda.is_current_stream_capturing()
+    if not capturing and _use_pyhip_moe(layer, sizes):
         _log_mimo_prefill_pyhip_moe()
         from sglang.srt.layers.moe import pyhip_fp8_blockscale_moe
 
@@ -230,7 +232,11 @@ def run_mimo_tp_sp_moe(layer, hidden_states) -> torch.Tensor:
     final_hidden_states = layer.experts(expert_input, topk_output)
     if all(size == sizes[0] for size in sizes):
         output = final_hidden_states.new_empty((sizes[0], final_hidden_states.shape[1]))
-        tp_group.reduce_scatter_tensor(output, final_hidden_states)
+        if capturing:
+            with tp_group.pynccl_comm.change_state(enable=True):
+                tp_group.pynccl_comm.reduce_scatter(output, final_hidden_states)
+        else:
+            tp_group.reduce_scatter_tensor(output, final_hidden_states)
         return output
     return tp_group.reduce_scatterv(final_hidden_states, sizes=sizes)
 

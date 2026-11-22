@@ -276,14 +276,13 @@ class Mxfp4AiterA8W4MoEMethod:
             StandardCombineInput,
         )
 
-        if getattr(dispatch_output, "hidden_states_scale", None) is not None:
-            raise NotImplementedError(
-                "A8W4 MoE quantizes bf16 activations itself; prequantized MoE "
-                "input is not supported."
-            )
         x = dispatch_output.hidden_states
         if x.shape[0] == 0:
-            return StandardCombineInput(hidden_states=x)
+            return StandardCombineInput(hidden_states=x.to(torch.bfloat16))
+        x_scale = getattr(dispatch_output, "hidden_states_scale", None)
+        kwargs = self._act_kwargs
+        if x_scale is not None:
+            kwargs = dict(kwargs, x_scale=x_scale)
         topk_output = dispatch_output.topk_output
         # TP: all experts local (offset 0); EP: global ids, this rank's experts.
         expert_offset, num_experts = _expert_layout(layer)
@@ -294,7 +293,7 @@ class Mxfp4AiterA8W4MoEMethod:
             topk_output.topk_ids.to(torch.int32).contiguous(),
             expert_offset=expert_offset,
             num_experts=num_experts,
-            **self._act_kwargs,
+            **kwargs,
         )
         return StandardCombineInput(hidden_states=out)
 

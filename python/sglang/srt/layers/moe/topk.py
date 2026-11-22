@@ -1525,6 +1525,7 @@ def _post_process_topk_ids(
     layer_id: int,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    hip_padding_applied: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     fused_shared_experts_scaling_factor = (
@@ -1582,7 +1583,10 @@ def _post_process_topk_ids(
         # contribution to the hidden state is still zero regardless of the id.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        # hip_padding_applied: the fused router kernel already wrote id 0 and
+        # zero weights for the padded rows.
+        if not hip_padding_applied:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
@@ -1592,7 +1596,8 @@ def _post_process_topk_ids(
             )
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely, so
         # padded tokens are neutralized by zeroing their routing weights.
-        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        if not hip_padding_applied:
+            _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
@@ -1634,7 +1639,7 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    if _is_hip:
+    if _is_hip and not (hip_padding_applied and num_fused_shared_experts == 0):
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -1650,8 +1655,14 @@ def _stable_noaux_sigmoid_topk_weights(
     renormalize: bool,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: bool = False,
+    hip_padding_non_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Recompute noaux routed weights from selected ids without sigmoid underflow."""
+    """Recompute noaux routed weights from selected ids without sigmoid underflow.
+
+    ``hip_padding_non_padded`` additionally applies the HIP padding convention
+    (expert id 0 and zero weights beyond it) in the fused kernel; callers pass it
+    only when SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS selects that kernel.
+    """
     if topk_ids.numel() == 0:
         return torch.empty_like(topk_ids, dtype=torch.float32)
 
@@ -1664,6 +1675,7 @@ def _stable_noaux_sigmoid_topk_weights(
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            num_token_non_padded=hip_padding_non_padded,
         )
 
     selected_logits = router_logits.float().gather(1, topk_ids.long())
@@ -1704,6 +1716,8 @@ def select_experts(
 
     # Set by the fused-gating+pack branch below; None everywhere else.
     packed_topk = None
+    # Set when the fused MiMo router kernel already masked the padded rows.
+    hip_padding_applied = False
 
     (
         router_logits,
@@ -1749,12 +1763,27 @@ def select_experts(
                 topk_config.stable_noaux_sigmoid_weights
                 and num_fused_shared_experts == 0
             ):
+                # SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS: the fused kernel also
+                # applies the HIP padding masks, instead of the separate
+                # arange/compare/fill triples below.
+                hip_padding_applied = (
+                    _fuse_stable_router_weights
+                    and num_token_non_padded is not None
+                    and router_logits.is_cuda
+                    and topk_ids.dtype == torch.int32
+                    # The benchmark-only overrides below replace every row.
+                    and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+                    and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+                )
                 topk_weights = _stable_noaux_sigmoid_topk_weights(
                     router_logits,
                     topk_ids,
                     renormalize=renormalize,
                     routed_scaling_factor=routed_scaling_factor,
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                    hip_padding_non_padded=(
+                        num_token_non_padded if hip_padding_applied else None
+                    ),
                 )
     elif torch_native and custom_routing_function is None:
         assert (
@@ -1911,6 +1940,7 @@ def select_experts(
         num_token_non_padded=num_token_non_padded,
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
+        hip_padding_applied=hip_padding_applied,
     )
 
     get_global_expert_distribution_recorder().on_select_experts(

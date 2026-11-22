@@ -29,6 +29,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_input_embedding import DFlashInputEmbeddings
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
@@ -105,6 +106,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_worker: TpModelWorker,
     ):
         self.server_args = server_args
+        self._draft_greedy_chunk_size = envs.SGLANG_DFLASH_GREEDY_CHUNK_SIZE.get()
+        if self._draft_greedy_chunk_size <= 0:
+            raise ValueError("SGLANG_DFLASH_GREEDY_CHUNK_SIZE must be positive")
+        if self._draft_greedy_chunk_size != 256:
+            logger.info("DFlash greedy projection chunk size: %s", self._draft_greedy_chunk_size)
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
@@ -125,6 +131,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
         self._full_embed_gpu = None
+        self._mask_embed_gpu = None
+        cache_mask_embedding = envs.SGLANG_ENABLE_DFLASH_CACHE_MASK_EMBEDDING.get()
+        if cache_mask_embedding:
+            if not (is_hip() and envs.SGLANG_USE_AITER.get()):
+                raise ValueError(
+                    "DFlash mask input caching requires ROCm with SGLANG_USE_AITER=1 "
+                    "and its out-of-place RMSNorm"
+                )
+            if server_args.enable_lora or server_args.enable_pdmux:
+                raise ValueError(
+                    "DFlash mask input caching requires static weights and a "
+                    "single forward stream (no LoRA or PDMux)"
+                )
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             self.model_runner.dflash_draft_model_config,
             enable_dp_attention=server_args.enable_dp_attention,
@@ -284,6 +303,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_fixed_bytes += (
                     self._full_embed_gpu.numel() * self._full_embed_gpu.element_size()
                 )
+        if cache_mask_embedding:
+            mask_id = torch.tensor(
+                [self._mask_token_id], dtype=torch.long, device=self.device
+            )
+            # The trained mask row is installed above. Use the draft-local TP
+            # scope, or the already gathered table for cross-draft embeddings.
+            with torch.no_grad(), self._draft_context():
+                self._mask_embed_gpu = (
+                    F.embedding(mask_id, self._full_embed_gpu)
+                    if self._full_embed_gpu is not None
+                    else self._draft_embedding(mask_id)
+                ).detach()
+            draft_fixed_bytes += (
+                self._mask_embed_gpu.numel() * self._mask_embed_gpu.element_size()
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFlash mask embedding cache enabled: graph inputs update "
+                    "only verified-token rows; eager inputs materialize on demand"
+                )
         self.model_runner.dflash_draft_kv_budget = DFlashKVCacheBudget(
             self.draft_parallel_layout, draft_cell_size, draft_fixed_bytes
         )
@@ -349,11 +388,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._use_fused_compact_kv = (
             supports_gpu_triton and envs.SGLANG_DFLASH_FUSED_COMPACT_KV.get()
         )
+        # Validated against the draft backend in init_backends().
+        self._use_draft_len_bound = envs.SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND.get()
+        self._draft_len_bound = (
+            int(self.draft_window_size) + int(self.page_size) - 1
+            if self.draft_window_size is not None
+            else 0
+        )
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
-        self._accept_len_buf: Optional[torch.Tensor] = None
+        self._num_correct_drafts_buf: Optional[torch.Tensor] = None
         self._commit_lens_bufs: List[torch.Tensor] = []
-        self._bonus_id_bufs: List[torch.Tensor] = []
+        self._bonus_tokens_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
@@ -480,6 +526,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
+        if self._use_draft_len_bound and not (
+            self.use_compact_draft_cache
+            and self._use_fused_compact_kv
+            and getattr(
+                self.draft_model_runner.attn_backend, "_use_unified_verify", False
+            )
+        ):
+            raise ValueError(
+                "SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND requires a windowed draft, "
+                "SGLANG_DFLASH_FUSED_COMPACT_KV and AITER unified verification: only "
+                "that path reads the draft lengths on the device"
+            )
         logger.info(
             "DFlash draft CUDA graphs: %s",
             "disabled" if disable_cuda_graph else "enabled when supported",
@@ -1299,11 +1357,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         device = self.device
         block_size = int(self.block_size)
-        self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
+        self._num_correct_drafts_buf = torch.empty(
+            (new_cap,), dtype=torch.int32, device=device
+        )
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
         ]
-        self._bonus_id_bufs = [
+        self._bonus_tokens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
         ]
         self._out_tokens_bufs = [
@@ -1323,13 +1383,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         torch.Tensor,
     ]:
         self._ensure_accept_bonus_buffers(bs)
-        assert self._accept_len_buf is not None
+        assert self._num_correct_drafts_buf is not None
         slot = self._accept_bonus_buffer_slot
         self._accept_bonus_buffer_slot = (slot + 1) % 2
         return (
-            self._accept_len_buf[:bs],
+            self._num_correct_drafts_buf[:bs],
             self._commit_lens_bufs[slot][:bs],
-            self._bonus_id_bufs[slot][:bs],
+            self._bonus_tokens_bufs[slot][:bs],
             self._out_tokens_bufs[slot][:bs],
             self._new_seq_lens_bufs[slot][:bs],
         )
@@ -1628,12 +1688,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = (
-            F.embedding(block_ids, self._full_embed_gpu)
-            if self._full_embed_gpu is not None
-            else embed_module(block_ids)
-        )
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        dflash_input_embeds = None
+        if self._mask_embed_gpu is not None:
+            # block[:, 0] is verified_id; all other positions are the fixed mask.
+            # Read the original contiguous IDs instead of copying a strided column.
+            verified_ids = draft_input.verified_id.view(-1)
+            verified_embedding = (
+                F.embedding(verified_ids.long(), self._full_embed_gpu)
+                if self._full_embed_gpu is not None
+                else embed_module(verified_ids)
+            )
+            dflash_input_embeds = DFlashInputEmbeddings(
+                verified_embedding, self._mask_embed_gpu, block_size
+            )
+            input_embeds = None
+        else:
+            noise_embedding = (
+                F.embedding(block_ids, self._full_embed_gpu)
+                if self._full_embed_gpu is not None
+                else embed_module(block_ids)
+            )
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -1653,11 +1728,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                     window_size=int(self.draft_window_size),
                     page_size=int(self.page_size),
                 )
-                # The planner still consumes exact CPU lengths. Keep this
-                # transfer; fusion removes max().item(), nonzero and gather.
-                seq_lens_cpu.copy_(
-                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
-                )
+                if (
+                    self._use_draft_len_bound
+                    and draft_input.planning_seq_lens_cpu is not None
+                ):
+                    # Unified verification reads the lengths on the device; the host
+                    # only sizes buffers. The committed prefix is at most one block
+                    # behind planning_seq_lens_cpu, and the compact view never exceeds
+                    # the window plus its page-alignment slack.
+                    torch.clamp(
+                        draft_input.planning_seq_lens_cpu,
+                        max=self._draft_len_bound,
+                        out=seq_lens_cpu,
+                    )
+                else:
+                    # Legacy planners consume exact CPU lengths. This transfer waits
+                    # for the previous verify; fusion removes max().item(), nonzero
+                    # and gather.
+                    seq_lens_cpu.copy_(
+                        draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                    )
             else:
                 draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
                 seq_lens_cpu.copy_(
@@ -1725,6 +1815,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             input_embeds=input_embeds,
+            dflash_input_embeds=dflash_input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -1742,6 +1833,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
+            chunk_size=self._draft_greedy_chunk_size,
         ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
@@ -1796,7 +1888,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        if sampling_info is not None:
+        owner_result = None
+        if logits_output.request_owner_chunk_size:
+            from sglang.srt.speculative.request_owner_verify import restore_full_logits, verify_owned
+
+            owner_result = verify_owned(
+                logits_output.next_token_logits, draft_tokens, sampling_info, get_attention_tp_group(),
+                chunk=logits_output.request_owner_chunk_size,
+                max_top_k=draft_input.max_top_k, uniform_top_k_value=draft_input.uniform_top_k_value)
+            if owner_result is None:
+                logits_output.next_token_logits = restore_full_logits(
+                    logits_output.next_token_logits, get_attention_tp_group(), batch_size=bs,
+                    block_size=int(self.block_size), chunk=logits_output.request_owner_chunk_size)
+                logits_output.request_owner_chunk_size = 0
+
+        if owner_result is None and sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -1805,26 +1911,40 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
-        if (
+        if owner_result is not None:
+            num_correct_drafts, bonus_tokens = owner_result
+            commit_lens = num_correct_drafts.to(torch.int32) + 1
+            out_tokens = torch.empty((bs, int(self.block_size)), dtype=torch.int64, device=device)
+            out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+            out_tokens[:, int(self.block_size) - 1].fill_(0)
+            out_tokens.scatter_(
+                1, num_correct_drafts.to(torch.int64)[:, None], bonus_tokens[:, None]
+            )
+        elif (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+            (
+                num_correct_drafts,
+                bonus_tokens,
+            ) = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+            commit_lens = num_correct_drafts.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
                 (bs, int(self.block_size)), dtype=torch.int64, device=device
             )
             if int(self.block_size) > 1:
                 out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
             out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            out_tokens.scatter_(
+                1, num_correct_drafts.to(torch.int64)[:, None], bonus_tokens[:, None]
+            )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
@@ -1832,18 +1952,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self._use_triton_accept_bonus:
                 try:
                     (
-                        accept_len,
+                        num_correct_drafts,
                         commit_lens,
-                        bonus,
+                        bonus_tokens,
                         out_tokens,
                         new_seq_lens,
                     ) = self._next_accept_bonus_buffers(bs)
                     _compute_dflash_accept_bonus_triton_unchecked(
                         candidates=candidates,
                         target_top1=target_predict,
-                        accept_lens_out=accept_len,
+                        accept_lens_out=num_correct_drafts,
                         commit_lens_out=commit_lens,
-                        bonus_ids_out=bonus,
+                        bonus_ids_out=bonus_tokens,
                         out_tokens_out=out_tokens,
                         prefix_lens=prefix_lens,
                         new_seq_lens_out=new_seq_lens,
@@ -1854,11 +1974,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
                         e,
                     )
-                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                    (
+                        num_correct_drafts,
+                        bonus_tokens,
+                    ) = compute_dflash_correct_drafts_and_bonus(
                         candidates=candidates,
                         target_predict=target_predict,
                     )
-                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                    commit_lens = num_correct_drafts.to(torch.int32) + 1  # [bs]
                     out_tokens = torch.empty(
                         (bs, int(self.block_size)),
                         dtype=torch.int64,
@@ -1870,14 +1993,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                         )
                     out_tokens[:, int(self.block_size) - 1].fill_(0)
                     out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                        1,
+                        num_correct_drafts.to(torch.int64)[:, None],
+                        bonus_tokens[:, None],
                     )
             else:
-                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                (
+                    num_correct_drafts,
+                    bonus_tokens,
+                ) = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
                 )
-                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                commit_lens = num_correct_drafts.to(torch.int32) + 1  # [bs]
                 out_tokens = torch.empty(
                     (bs, int(self.block_size)), dtype=torch.int64, device=device
                 )
@@ -1885,15 +2013,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
                 out_tokens[:, int(self.block_size) - 1].fill_(0)
                 out_tokens.scatter_(
-                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    1,
+                    num_correct_drafts.to(torch.int64)[:, None],
+                    bonus_tokens[:, None],
                 )
 
         if SIMULATE_ACC_LEN > 0:
             apply_dflash_simulated_acceptance(
                 candidates=candidates,
-                accept_len=accept_len,
+                accept_len=num_correct_drafts,
                 commit_lens=commit_lens,
-                bonus=bonus,
+                bonus=bonus_tokens,
                 out_tokens=out_tokens,
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
@@ -1933,7 +2063,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output.hidden_states = None
 
         next_draft_input = self._make_next_draft_input_decode(
-            verified_id=bonus,
+            verified_id=bonus_tokens,
             new_seq_lens=new_seq_lens,
             cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
         )

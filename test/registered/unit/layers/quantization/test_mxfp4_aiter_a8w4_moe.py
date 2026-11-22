@@ -173,7 +173,7 @@ def _make_layer(ckpt, rank=0, ep_size=1, a2a=MoeA2ABackend.NONE, **runner_config
     return method, layer
 
 
-def _standard_dispatch(x, topk_weights, topk_ids):
+def _standard_dispatch(x, topk_weights, topk_ids, x_scale=None):
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardDispatchOutput,
     )
@@ -181,7 +181,7 @@ def _standard_dispatch(x, topk_weights, topk_ids):
 
     return StandardDispatchOutput(
         hidden_states=x,
-        hidden_states_scale=None,
+        hidden_states_scale=x_scale,
         topk_output=StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
         ),
@@ -313,6 +313,34 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
             tw = torch.empty((0, TP_TOPK), dtype=torch.float32, device="cuda")
             ti = torch.empty((0, TP_TOPK), dtype=torch.int32, device="cuda")
             self._apply_standard(method, layer, x, tw, ti)
+
+    def test_standard_prequantized_row_scales(self):
+        from pyhip.contrib.flydsl.a8w4 import a8w4_moe
+        from pyhip.contrib.flydsl.a8w4.kernels.row_quant import quantize_rows
+
+        method, layer = _make_layer(self.tp)
+        x, tw, ti = self.tp.routing(128, TP_E)
+        x8, scale = quantize_rows(x)
+        supplied = scale * 2
+        out = method.apply(layer, _standard_dispatch(x8, tw, ti, supplied)).hidden_states
+        reference = self.tp.reference(x8.to(torch.bfloat16) * supplied[:, None], tw, ti)
+        self.assertLess(_cos_diff(reference, out), COS_TOL)
+        for cfg in ("tp1k bcm1 ks1", "tp1kq bcm1", "tp2k bm64 g1bcm1 g2base"):
+            with self.subTest(cfg=cfg):
+                gold = a8w4_moe(x, layer.a8w4_weights, tw, ti, config=cfg)
+                actual = a8w4_moe(x8, layer.a8w4_weights, tw, ti, x_scale=scale, config=cfg)
+                self.assertLess(_cos_diff(gold, actual), COS_TOL)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            y = method.apply(layer, _standard_dispatch(x8, tw, ti, scale)).hidden_states
+        scale.copy_(supplied)
+        g.replay()
+        self.assertLess(_cos_diff(reference, y), COS_TOL)
+        for invalid in (scale.bfloat16(), scale[:1], scale.cpu()):
+            with self.assertRaises(ValueError):
+                a8w4_moe(x8, layer.a8w4_weights, tw, ti, x_scale=invalid)
+        empty = method.apply(layer, _standard_dispatch(x8[:0], tw[:0], ti[:0], scale[:0]))
+        self.assertEqual(empty.hidden_states.dtype, torch.bfloat16)
 
     def test_apply_ep_global_ids(self):
         """--moe-a2a-backend none: every rank gets all tokens with global top-k

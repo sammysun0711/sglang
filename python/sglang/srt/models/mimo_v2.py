@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -45,6 +46,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_size,
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -66,12 +68,15 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.mimo_sp import (
+    _MIMO_SP_MIN_TOKENS,
+    _mimo_sp_moe_sizes,
     mimo_tp_sp_active,
     mimo_tp_sp_enabled,
     run_mimo_tp_sp_moe,
 )
 from sglang.srt.layers.moe.mimo_sp import split_mimo_moe_inputs as _mimo_moe_inputs
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -95,6 +100,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -173,6 +179,97 @@ def _mimo_ep_sp_active(forward_batch: ForwardBatch) -> bool:
         return False
     sizes = get_dp_global_num_tokens()
     return sizes is not None and sum(sizes) >= 2048
+
+
+@functools.lru_cache(maxsize=1)
+def _log_mimo_graph_verify_sp():
+    storage = "static FP8" if envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get() else "native MXFP4"
+    logger.info("Using MiMo DFlash8 target graph sequence parallel (TP8/DP2/EP1, %s)", storage)
+
+
+@functools.lru_cache(maxsize=1)
+def _log_mimo_fused_sp_packet():
+    logger.info("Using fused native SP quantization and packet kernels")
+
+
+def _mimo_graph_verify_sp_active(forward_batch: ForwardBatch) -> bool:
+    """Select SP only while warming/capturing a uniform DFlash8 target graph.
+
+    Decode graph construction gives every rank the same TARGET_VERIFY mode and
+    padded token counts, including graphs later replayed with an idle replica.
+    Eager/mixed batches keep the original path; no runtime-local decision may
+    change the collective sequence recorded in a graph.
+    """
+    if (
+        not envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+        or not get_is_capture_mode()
+        or forward_batch.forward_mode != ForwardMode.TARGET_VERIFY
+        or forward_batch.global_forward_mode != ForwardMode.TARGET_VERIFY
+        or forward_batch.can_run_tbo
+        or forward_batch.all_extend_in_batch
+        or forward_batch.spec_algorithm is None
+        or not forward_batch.spec_algorithm.is_dflash()
+        or getattr(forward_batch.spec_info, "draft_token_num", None) != 8
+        or forward_batch.dp_padding_mode is None
+        or not forward_batch.dp_padding_mode.is_max_len()
+    ):
+        return False
+    sizes = get_dp_global_num_tokens()
+    return (
+        sizes is not None
+        and len(sizes) == 2
+        and sizes[0] == sizes[1] == forward_batch.batch_size * 8
+        and sum(sizes) >= _MIMO_SP_MIN_TOKENS
+    )
+
+def _mimo_sp_moe_active(forward_batch: Optional[ForwardBatch]) -> bool:
+    """Keep prefill SP under its shared flag and graph SP under its own gate."""
+    if forward_batch is None:
+        return False
+    if _mimo_graph_verify_sp_active(forward_batch):
+        _log_mimo_graph_verify_sp()
+        return True
+    return (
+        envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+        and envs.SGLANG_ENABLE_MIMO_SWA_SP.get()
+        and mimo_tp_sp_active(forward_batch)
+    )
+
+
+def _mimo_sp_attn_enabled() -> bool:
+    """Construct token-shard communicators for either supported execution path."""
+    return mimo_tp_sp_enabled() or _mimo_graph_sp_enabled()
+
+def _mimo_graph_sp_enabled() -> bool:
+    """Construction-time eligibility for PR47 target graph SP, separate from prefill."""
+    if not (
+        envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+        and is_dp_attention_enabled()
+        and get_tensor_model_parallel_world_size() == 8
+        and get_attention_dp_size() == 2
+        and get_attention_tp_size() == 4
+        and get_moe_expert_parallel_world_size() == 1
+        and get_moe_a2a_backend().is_none()
+        and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+    ):
+        return False
+    args = get_global_server_args()
+    return (
+        is_gfx942_supported()
+        and envs.SGLANG_FLYPA_MIMO_PREFILL.get()
+        and mimo_flydsl_target_verify_enabled()
+        and (get_moe_runner_backend().is_aiter() or get_moe_runner_backend().is_auto())
+        and args.attention_backend == "aiter"
+        and args.prefill_attention_backend in (None, "aiter")
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        and args.page_size == 64
+        and args.kv_cache_dtype == "bf16"
+        and args.attn_cp_size == 1
+        and args.pp_size == 1
+        and args.moe_dense_tp_size == 1
+        and not args.enable_two_batch_overlap
+    )
+
 
 
 def _mimo_tp_sp_flash_config(config) -> bool:
@@ -492,12 +589,21 @@ class MiMoV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
-        self._sp_tp_moe = mimo_tp_sp_enabled()
+        self._sp_tp_moe = _mimo_sp_attn_enabled()
         self._pyhip_moe: Optional[bool] = None
         if self._sp_tp_moe and not getattr(
             self.experts.quant_method, "convert_mxfp4_to_fp8", False
         ):
-            raise ValueError("MiMo TP prefill SP requires static MXFP4-to-FP8 experts")
+            from sglang.srt.layers.quantization.mxfp4_aiter_a8w4_moe import (
+                Mxfp4AiterA8W4MoEMethod,
+            )
+
+            if not (
+                envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
+                and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+                and isinstance(self.experts.quant_method, Mxfp4AiterA8W4MoEMethod)
+            ):
+                raise ValueError("MiMo SP requires static FP8 or the opted-in native MXFP4 graph path")
 
     def get_moe_weights(self):
         return [
@@ -513,7 +619,9 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if self._sp_tp_moe and mimo_tp_sp_active(forward_batch):
+        if self._sp_tp_moe and _mimo_sp_moe_active(forward_batch):
+            if not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get():
+                return self.forward_sp_native(hidden_states)
             return run_mimo_tp_sp_moe(self, hidden_states)
         if not self._enable_a2a_moe:
             return self.forward_normal(
@@ -523,6 +631,73 @@ class MiMoV2MoE(nn.Module):
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_sp_native(self, hidden_states) -> torch.Tensor:
+        """Run native MXFP4 experts across token shards in a target graph.
+
+        Packed mode gathers FP8 activations and one FP32 scale per token with
+        the routing metadata. In unpacked mode the experts quantize the gathered
+        BF16 rows.
+        """
+        assert isinstance(hidden_states, torch.Tensor)
+        assert hidden_states.dtype == torch.bfloat16
+        sizes = _mimo_sp_moe_sizes()
+        assert sizes and all(size == sizes[0] for size in sizes)
+        assert hidden_states.shape[0] == sizes[0] > 0
+        topk = self.topk(hidden_states, self.gate(hidden_states))
+        tp_group = get_tp_group()
+        if envs.SGLANG_MIMO_GRAPH_SP_PACKED.get():
+            # The native row quantizer is independent of the number of rows.
+            # Gather its bytes and exact FP32 scales before the expert GEMMs.
+            rows, hidden = hidden_states.shape
+            count = topk.topk_weights.shape[1]
+            data_words = hidden // 4
+            words = ((data_words + 1 + 2 * count + 3) // 4) * 4
+            fused_packet = envs.SGLANG_MIMO_FUSED_SP_PACKET.get()
+            if fused_packet:
+                _log_mimo_fused_sp_packet()
+                from sglang.srt.layers.quantization.mimo_native_sp_fusion import (
+                    quantize_pack_native_sp, unpack_native_sp,
+                )
+                packed = quantize_pack_native_sp(hidden_states, topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32))
+            else:
+                from pyhip.contrib.flydsl.a8w4.kernels.row_quant import quantize_rows
+
+                quantized, scale = quantize_rows(hidden_states)
+                packed = torch.empty((rows, words), dtype=torch.float32, device=hidden_states.device)
+                packed[:, :data_words].view(torch.uint8).copy_(quantized.view(torch.uint8))
+                packed[:, data_words].copy_(scale)
+                packed[:, data_words + 1:data_words + 1 + count].copy_(topk.topk_weights)
+                packed[:, data_words + 1 + count:data_words + 1 + 2 * count].view(torch.int32).copy_(topk.topk_ids)
+            merged = packed.new_empty((sum(sizes), words))
+            # Float32 is a copy-only transport here; never cast the FP8 bytes
+            # numerically or send them through a reduction.
+            tp_group.all_gather_into_tensor(merged, packed)
+            if fused_packet:
+                values, scales, weights, ids = unpack_native_sp(merged, hidden, count)
+            else:
+                values = merged[:, :data_words].contiguous().view(quantized.dtype)
+                scales = merged[:, data_words].contiguous()
+                weights = merged[:, data_words + 1:data_words + 1 + count].contiguous()
+                ids = merged[:, data_words + 1 + count:data_words + 1 + 2 * count].contiguous().view(torch.int32)
+            gathered = (values, scales)
+        else:
+            weights, ids, gathered = tp_group.all_gatherv(
+                [topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32), hidden_states],
+                sizes=sizes,
+            )
+        partial = self.experts(gathered, StandardTopKOutput(
+            topk_weights=weights,
+            topk_ids=ids,
+            router_logits=weights.new_empty((0,)),
+        ))
+        output = partial.new_empty((sizes[0], partial.shape[1]))
+        comm = tp_group.pynccl_comm
+        if comm is None or not comm.available:
+            raise RuntimeError("MiMo native graph SP requires the direct RCCL communicator")
+        with comm.change_state(enable=True):
+            comm.reduce_scatter(output, partial)
+        return output
 
     def forward_normal(
         self,
@@ -1098,7 +1273,7 @@ class MiMoV2DecoderLayer(nn.Module):
         )
         # SGLANG_ENABLE_MIMO_SWA_SP: token-scattered residual and MoE layout for large forward passes.
         self.layer_communicator_sp = None
-        if mimo_tp_sp_enabled():
+        if _mimo_sp_attn_enabled():
             self.layer_communicator_sp = LayerCommunicator(
                 layer_scatter_modes=LayerScatterModes.init_new(
                     layer_id=layer_id,
@@ -1194,7 +1369,9 @@ class MiMoV2DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         communicator = self.layer_communicator
         sp_swa = False
-        if self.layer_communicator_sp is not None and mimo_tp_sp_active(forward_batch):
+        if self.layer_communicator_sp is not None and _mimo_sp_moe_active(
+            forward_batch
+        ):
             communicator = self.layer_communicator_sp
             if (
                 self.layer_communicator_sp_attn is not None
@@ -1657,7 +1834,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
 
-        if mimo_tp_sp_enabled() and not _mimo_tp_sp_flash_config(config):
+        if _mimo_sp_attn_enabled() and not _mimo_tp_sp_flash_config(config):
             raise ValueError(
                 "MiMo TP prefill SP currently supports the Flash geometry only"
             )
@@ -1684,6 +1861,24 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
+        if envs.SGLANG_DFLASH_REQUEST_OWNER_VERIFY.get():
+            args = get_global_server_args()
+            if not (
+                is_gfx942_supported() and _mimo_tp_sp_flash_config(self.config)
+                and self.config.vocab_size == 152576 and self.logits_processor is not None
+                and args.speculative_algorithm == "DFLASH" and args.speculative_dflash_block_size == 8
+                and args.tp_size == 8 and args.dp_size == 2 and args.attn_cp_size == 1
+                and args.pp_size == 1 and args.enable_dp_attention and args.enable_dp_lm_head
+                and not args.enable_fp32_lm_head and not args.enable_lora
+                and not args.enable_two_batch_overlap and args.kv_cache_dtype == "bf16"
+                and self.logits_processor.use_attn_tp_group
+                and self.logits_processor.do_tensor_parallel_all_gather
+                and not self.logits_processor.final_logit_softcapping
+            ):
+                raise ValueError("Request-owner verification requires the validated gfx942 Flash DFlash8 TP8/DP2 BF16 configuration")
+            self.logits_processor.request_owner_world_size = 4
+            self.logits_processor.request_owner_block_size = 8
+            logger.info("Enabled request-owner target logits: attention TP4, DFlash8, BF16")
         self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)

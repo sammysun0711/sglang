@@ -142,9 +142,9 @@ export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
 export AITER_FMOE_FP8_BLOCKSCALE_FLYDSL="${AITER_FMOE_FP8_BLOCKSCALE_FLYDSL:-1}"
 export SGLANG_MORI_MOE_MAX_INPUT_TOKENS="${SGLANG_MORI_MOE_MAX_INPUT_TOKENS:-${CHUNKED_PREFILL_SIZE}}"
 
-# AUTO loads the bundled gfx942 EP8 tuning rules. Use MANUAL for a baseline.
+# AUTO loads the bundled gfx942 EP8 prefill tuning rules. Use MANUAL for a baseline.
 export MORI_EP_LAUNCH_CONFIG_MODE="${MORI_EP_LAUNCH_CONFIG_MODE:-AUTO}"
-export MORI_EP_TUNING_CONFIG="${MORI_EP_TUNING_CONFIG:-${SCRIPT_DIR}/gfx942_mimo_v26_flash_ep8_mori_a2a.json}"
+export MORI_EP_TUNING_CONFIG="${MORI_EP_TUNING_CONFIG:-${SCRIPT_DIR}/gfx942_mimo_v26_flash_ep8_mori_a2a_prefill.json}"
 if [[ "${MORI_EP_LAUNCH_CONFIG_MODE}" == "AUTO" && ! -r "${MORI_EP_TUNING_CONFIG}" ]]; then
   echo "MORI tuning config is not readable: ${MORI_EP_TUNING_CONFIG}" >&2
   exit 2
@@ -287,6 +287,7 @@ fi
 server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   "${mm_attention_args[@]}" \
   --model-path "${MODEL_PATH}" \
+  --skip-server-warmup \
   --tp-size 8 \
   --dp-size 2 \
   --ep-size 8 \

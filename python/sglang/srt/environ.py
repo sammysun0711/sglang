@@ -537,6 +537,9 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Native A8W4 uses a positive cap per PyHIP call (0 uses the kernel limit).
+    # The AITER FP8 runner applies a positive cap to the whole receive buffer.
+    SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)

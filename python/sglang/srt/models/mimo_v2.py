@@ -594,14 +594,14 @@ class MiMoV2MoE(nn.Module):
         if self._sp_tp_moe and not getattr(
             self.experts.quant_method, "convert_mxfp4_to_fp8", False
         ):
-            from sglang.srt.layers.quantization.mxfp4_aiter_a16w4_moe import (
-                Mxfp4AiterA16W4MoEMethod,
+            from sglang.srt.layers.quantization.mxfp4_aiter_a8w4_moe import (
+                Mxfp4AiterA8W4MoEMethod,
             )
 
             if not (
                 envs.SGLANG_MIMO_GRAPH_VERIFY_SP.get()
                 and not envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
-                and isinstance(self.experts.quant_method, Mxfp4AiterA16W4MoEMethod)
+                and isinstance(self.experts.quant_method, Mxfp4AiterA8W4MoEMethod)
             ):
                 raise ValueError("MiMo SP requires static FP8 or the opted-in native MXFP4 graph path")
 
@@ -647,8 +647,6 @@ class MiMoV2MoE(nn.Module):
         topk = self.topk(hidden_states, self.gate(hidden_states))
         tp_group = get_tp_group()
         if envs.SGLANG_MIMO_GRAPH_SP_PACKED.get():
-            from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import quantize_rows
-
             # The native row quantizer is independent of the number of rows.
             # Gather its bytes and exact FP32 scales before the expert GEMMs.
             rows, hidden = hidden_states.shape
@@ -663,6 +661,8 @@ class MiMoV2MoE(nn.Module):
                 )
                 packed = quantize_pack_native_sp(hidden_states, topk.topk_weights.to(torch.float32), topk.topk_ids.to(torch.int32))
             else:
+                from pyhip.contrib.flydsl.a8w4.kernels.row_quant import quantize_rows
+
                 quantized, scale = quantize_rows(hidden_states)
                 packed = torch.empty((rows, words), dtype=torch.float32, device=hidden_states.device)
                 packed[:, :data_words].view(torch.uint8).copy_(quantized.view(torch.uint8))

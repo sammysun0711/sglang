@@ -305,8 +305,9 @@ def _get_or_build_mega_moe_gfx942(
     _ensure_mori_shmem()
     from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
 
-    # Extend steps run the LDS mega kernel; with a decode capacity set, decode steps
-    # run the main kernel at that capacity (the small path). Same for a8w4 and a8w8.
+    # Extend steps run large_M (aiter's LDS mega kernel); with a decode capacity set,
+    # decode steps run small_M at that capacity (the small kernel for a8w4, the main
+    # path for a8w8). The main path is then not built.
     decode_mtpr = _decode_mtpr()
     mega = MegaMoEGfx942(
         rank=rank,
@@ -324,10 +325,12 @@ def _get_or_build_mega_moe_gfx942(
         swiglu_limit=swiglu_limit,
         small_m_mtprs=(decode_mtpr,),
         small_m_enabled=decode_mtpr > 0,
+        large_m_enabled=True,
     )
     logger.info(
-        "Aiter MegaMoEGfx942 %s: max_tok_per_rank=%d, small path mtpr=%d",
+        "Aiter MegaMoEGfx942 %s: forward on %s (max_tok_per_rank=%d), small_M mtpr=%d",
         quant,
+        "large_M" if mega.large_m_available else "the main path",
         _mtpr(),
         mega.small_m_mtpr,
     )
@@ -516,7 +519,8 @@ def _should_overlap_shared_and_routed(
     moe: DeepseekV2MoE,
     num_tokens: int,
 ) -> bool:
-    if envs.SGLANG_AITER_MEGA_RANK_SYNC.get():
+    if envs.SGLANG_AITER_MEGA_RANK_SYNC.get() or _is_gfx942:
+        # gfx942's small_M kernel spins on its peers, so it needs the whole GPU.
         return False
     return (
         moe.alt_stream is not None

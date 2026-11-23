@@ -322,22 +322,21 @@ class Mxfp4AiterA8W4MoEMethod:
             )
 
         capacity = x.shape[0]
+        rows, est = _mori_token_bounds(capacity, total_recv)
+        # Combine consumes every received row. Limit the size of each PyHIP call.
+        chunk_size = A8W4_DYN_MAX_TOKENS
         mori_max = envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.get()
-        rows, est = _mori_token_bounds(
-            min(capacity, mori_max) if mori_max > 0 else capacity, total_recv
-        )
-        # The output keeps the receive-buffer capacity: MORI combine reads rows
-        # [0, total_recv). Only the first ``rows`` are computed (beyond a too small
-        # SGLANG_MORI_MOE_MAX_INPUT_TOKENS the rows are undefined).
+        if mori_max > 0:
+            chunk_size = min(chunk_size, mori_max)
         out = torch.empty((capacity, x.shape[1]), dtype=torch.bfloat16, device=x.device)
         expert_offset, num_experts = _expert_layout(layer)
         topk_ids = dispatch_output.topk_ids[:rows].to(torch.int32)
         topk_weights = dispatch_output.topk_weights[:rows].to(torch.float32)
-        for s in range(0, rows, A8W4_DYN_MAX_TOKENS):
-            e = min(s + A8W4_DYN_MAX_TOKENS, rows)
+        for s in range(0, rows, chunk_size):
+            e = min(s + chunk_size, rows)
             m_valid = (
                 total_recv
-                if s == 0
+                if rows <= chunk_size
                 else (total_recv - s).clamp(min=0, max=e - s).to(torch.int32)
             )
             a8w4_moe_dyn(

@@ -447,6 +447,35 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
                 ),
             )
 
+    def test_mori_receive_count_exceeds_configured_cap(self):
+        from pyhip.contrib.flydsl import a8w4
+
+        from sglang.srt.layers.moe.token_dispatcher.moriep import (
+            MoriEPNormalDispatchOutput,
+        )
+
+        rank, capacity, valid, cap = 1, 1024, 300, 128
+        method, layer = _make_layer(self.ep, rank, EP, MoeA2ABackend.MORI)
+        x, tw, ti = self.ep.mori_recv(rank, capacity, seed=valid)
+        count = torch.tensor([valid], dtype=torch.int32, device="cuda")
+        dispatch = self._mori_dispatch(
+            MoriEPNormalDispatchOutput, x, None, ti, tw, count
+        )
+        with self.mod.envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.override(cap), patch.object(
+            a8w4, "a8w4_moe_dyn", wraps=a8w4.a8w4_moe_dyn
+        ) as kernel:
+            out = method.apply(layer, dispatch).hidden_states
+        self.assertEqual(
+            [
+                (call.args[0].shape[0], call.args[4].item())
+                for call in kernel.call_args_list
+            ],
+            [(128, 128), (128, 128), (44, 44)],
+        )
+        self.assertEqual(tuple(out.shape), (capacity, self.ep.hidden))
+        ref = self.ep.reference(x[:valid], tw[:valid], ti[:valid], rank * E_LOCAL)
+        self.assertLess(_cos_diff(ref, out[:valid]), COS_TOL)
+
     def test_mori_cuda_graph_replay(self):
         """One capture serves any device-side receive count up to the capture-time
         bound (no host sync), also counts above the DP-metadata estimate."""
@@ -464,7 +493,10 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
         )
         # 4 attention-DP ranks, only the local token count known: 16 now, 24 the
         # largest captured -> rows bound 16 + 3 * 24 = 88, estimate 64.
-        with patch.object(self.mod, "_capture_max_local_tokens", 24), patch.multiple(
+        # A 32-row call cap splits that bound into 32 + 32 + 24 during capture.
+        with self.mod.envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.override(32), patch.object(
+            self.mod, "_capture_max_local_tokens", 24
+        ), patch.multiple(
             "sglang.srt.layers.dp_attention",
             is_dp_attention_enabled=MagicMock(return_value=True),
             get_attention_dp_size=MagicMock(return_value=4),
@@ -479,7 +511,7 @@ class TestMxfp4AiterA8W4MoEMethod(CustomTestCase):
             with torch.cuda.graph(graph):
                 graph_out = method.apply(layer, dispatch_output).hidden_states
         self.assertEqual(tuple(graph_out.shape), (capacity, self.ep.hidden))
-        for valid in (64, 1, 88, 0, 70):
+        for valid in (64, 1, 88, 0, 32, 33, 70):
             with self.subTest(valid=valid):
                 x2, tw2, ti2 = self.ep.mori_recv(rank, capacity, seed=10 + valid)
                 xq2, xs2, x_ref = _mori_fp8(x2)

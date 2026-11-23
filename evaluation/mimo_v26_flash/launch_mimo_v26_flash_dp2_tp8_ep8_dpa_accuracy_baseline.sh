@@ -153,6 +153,7 @@ export MORI_SHMEM_MODE="${MORI_SHMEM_MODE:-ISOLATION}"
 export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-0}"
 export SGLANG_MORI_DISPATCH_DTYPE="${SGLANG_MORI_DISPATCH_DTYPE:-fp8}"
 export SGLANG_MORI_COMBINE_DTYPE="${SGLANG_MORI_COMBINE_DTYPE:-bf16}"
+export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1200}"
 
 # DP2 divides the global chunk and request limit between two workers.
 # Bound decode by one token/request, or the DFlash verify block when enabled.
@@ -316,6 +317,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server \
   --attention-backend aiter \
   "${kv_cache_args[@]}" \
   --page-size 64 \
+  --watchdog-timeout "${WATCHDOG_TIMEOUT}" \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \
   "${custom_all_reduce_args[@]}" \

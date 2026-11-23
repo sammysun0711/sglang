@@ -1,7 +1,7 @@
 # MiMo-V2.6-Flash on MI300X (ROCm 7.14.1, TheRock, PyTorch 2.12).
-# Customer build and serving guide: docker/mimo-docker-container-upgrade-guide.md
+# Customer build and serving guide: evaluation/mimo_v26_flash/build-rocm7.14.1-docker-image-guide.md
 # From the SGLang repository root, using BuildKit:
-#   docker build -f docker/rocm.Dockerfile --target mimo-rocm7141 --build-arg GPU_ARCH=gfx942 -t mimo-flash:rocm7141-gfx942-sglang .
+#   docker build -f docker/rocm.Dockerfile --target mimo-rocm7141 --build-arg GPU_ARCH=gfx942 -t mimo-flash:rocm7.14.1-gfx942-sglang .
 # Use --target mimo-rocm7141-serving for the serving layer without the media tools.
 # To build a customer MoRI fork, pass --build-arg MORI_REPO=<clone-url> --build-arg MORI_COMMIT=<full-sha>.
 #
@@ -159,7 +159,7 @@ RUN cd /opt/tilelang \
 FROM mimo-rocm7141-toolchain AS mimo-rocm7141-serving
 ARG SGL_REPO=https://github.com/sammysun0711/sglang.git
 ARG SGL_BRANCH=mimo-opt-mxfp4-dflash
-ARG SGL_COMMIT=0acf8c172e9e035f47ac9cd0e806ee415c34e07c
+ARG SGL_COMMIT=f2cab7731ce64a1b07799ed2d637f20c6dbb0830
 ARG MAX_JOBS=12
 
 # Fetch release tags/history for setuptools-scm and only materialize the pinned trees.
@@ -174,7 +174,7 @@ RUN cd sglang && cp python/pyproject_other.toml python/pyproject.toml \
 ARG AITER_REPO=https://github.com/sammysun0711/aiter.git
 ARG AITER_BRANCH=integration/mimo-fp4-dflash
 ARG AITER_COMMIT=e595aec16c3c77469ad9d02f2a7c665e5cef1543
-ARG PYHIP_COMMIT=db0b1cfc498d470765dc970b44328192fa6ecd6b
+ARG PYHIP_COMMIT=05142fb773deee77ce024165dd4b986dc4f2cf23
 RUN git clone --branch "$AITER_BRANCH" --filter=blob:none --no-checkout "$AITER_REPO" aiter \
     && git -C aiter merge-base --is-ancestor "$AITER_COMMIT" HEAD \
     && git -C aiter checkout --detach "$AITER_COMMIT" && test "$(git -C aiter rev-parse HEAD)" = "$AITER_COMMIT" \
@@ -207,7 +207,7 @@ RUN echo 'sglang-router==0.3.2 --hash=sha256:ba5a24951e5e0357fe390782fcd1abd8614
     | python -m pip install --only-binary=:all: --no-deps --require-hashes -r /dev/stdin \
     && sglang-router --version && sglang-router launch --help >/dev/null
 # PyHIP probes the physical GPU at import time. Check its metadata here and import it on the serving node.
-RUN python -m pip check && python -c 'import torch, sgl_kernel.common_ops, sglang, triton, flydsl; from importlib.metadata import version; from mori import cpp, ops; print(version("pyhip"), ops.EpDispatchCombineConfig)'
+RUN python -m pip check && python -c 'import torch, sgl_kernel.common_ops, sglang, triton, flydsl; import json, os; from importlib.metadata import distribution; from mori import cpp, ops; pyhip = distribution("pyhip"); assert json.loads(pyhip.read_text("direct_url.json"))["vcs_info"]["commit_id"] == os.environ["PYHIP_COMMIT"]; print(pyhip.version, ops.EpDispatchCombineConfig)'
 # Install the gfx942 builds into the serving and multimodal images.
 COPY --from=mimo-mooncake-build /sgl-workspace/Mooncake /sgl-workspace/Mooncake
 COPY --from=mimo-mooncake-build /mooncake-install/ /

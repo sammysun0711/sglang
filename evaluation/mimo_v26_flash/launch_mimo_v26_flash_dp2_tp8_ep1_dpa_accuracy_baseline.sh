@@ -67,6 +67,7 @@ export SGLANG_MIMO_FUSED_RMS_QKV_QUANT="${SGLANG_MIMO_FUSED_RMS_QKV_QUANT:-1}"
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM=0
 export SGLANG_AITER_MIMO_FRESH_BF16_ASM_VARLEN=0
 export SGLANG_AITER_MIMO_FRESH_BF16_SWA_VARLEN=0
+export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1200}"
 
 # DPA divides both limits by DP2: 16K prefill and 48 requests/group.
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
@@ -136,6 +137,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
   --random-seed "${SERVER_RANDOM_SEED:-12345}"
   --host "${SERVER_HOST:-127.0.0.1}" --port "${SERVER_PORT:-30001}"
   --trust-remote-code --reasoning-parser mimo --tool-call-parser mimo
+  --watchdog-timeout "${WATCHDOG_TIMEOUT}"
   "${dflash_args[@]}"
   "${prefill_args[@]}"
   "$@"

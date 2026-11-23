@@ -54,6 +54,8 @@ def runtime(monkeypatch):
     monkeypatch.setenv("SGLANG_AITER_MEGA_RANK_SYNC", "1")
     monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_QUANT", "a8w4")
     monkeypatch.setattr(mega, "_MEGA_MOE_INSTANCE", {})
+    # The MegaMoEV2 dispatch, also on a gfx942 host (whose experts run MegaMoEGfx942).
+    monkeypatch.setattr(mega, "_is_gfx942", False)
     mega._warn_decode_mtpr_merged.cache_clear()
     # CPU-only PyTorch raises from the real query.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -383,6 +385,82 @@ def test_startup_skips_runs_without_a_decode_capacity(
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(hook, "get_platform", lambda: SimpleNamespace(is_hip=is_hip))
     startup(_cfg(max_running_requests=None, **overrides))
+
+
+@pytest.fixture
+def gfx942_startup(monkeypatch):
+    monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR", "8192")
+    monkeypatch.setattr(
+        hook, "get_platform", lambda: SimpleNamespace(is_hip=True, is_gfx942=True)
+    )
+    monkeypatch.setattr(hook, "resolving_view", lambda server_args: server_args)
+    return hook.validate_flydsl_gfx942_prefill_capacity
+
+
+@pytest.mark.parametrize(
+    ("chunk", "error"),
+    [
+        # Recipe: 16384 over DP8, and a per-rank chunk exactly at the capacity.
+        (2048, None),
+        (8192, None),
+        (8193, "must cover the largest prefill forward"),
+        (-1, "needs chunked prefill"),
+    ],
+)
+def test_gfx942_prefill_chunk_must_fit_the_capacity(gfx942_startup, chunk, error):
+    # gfx942 experts have no fused-MoE fallback: a larger chunk would fail its
+    # first long prefill instead of the startup.
+    cfg = _cfg(chunked_prefill_size=chunk)
+    if error is None:
+        gfx942_startup(cfg)
+    else:
+        with pytest.raises(ValueError, match=error):
+            gfx942_startup(cfg)
+
+
+@pytest.mark.parametrize(
+    ("is_gfx942", "disaggregation_mode"), [(False, "null"), (True, "decode")]
+)
+def test_prefill_capacity_is_not_checked_where_prefill_never_overflows(
+    gfx942_startup, monkeypatch, is_gfx942, disaggregation_mode
+):
+    # Other ROCm GPUs fall back to fused MoE past the capacity; decode nodes do
+    # not prefill.
+    monkeypatch.setattr(
+        hook,
+        "get_platform",
+        lambda: SimpleNamespace(is_hip=True, is_gfx942=is_gfx942),
+    )
+    gfx942_startup(
+        _cfg(chunked_prefill_size=16384, disaggregation_mode=disaggregation_mode)
+    )
+
+
+def test_gfx942_rejects_a_layer_it_cannot_run_before_converting_it(monkeypatch):
+    # The fd2 experts run nowhere but MegaMoE, so an unsupported layer must fail
+    # while its experts are still in the standard layout.
+    converted = []
+    kernels = ModuleType("aiter.ops.flydsl.kernels.mega_moe_gfx942")
+    kernels.eligible = lambda **shape: shape["topk"] == TOPK
+    kernels.MegaMoEGfx942 = SimpleNamespace(
+        prepare_weights=lambda *a, **k: converted.append("fd2")
+    )
+    shuffle = ModuleType("aiter.ops.shuffle")
+    shuffle.shuffle_weight_a16w4 = lambda w, *a: converted.append("w") or w
+    shuffle.shuffle_scale_a16w4 = lambda s, *a: converted.append("s") or s
+    monkeypatch.setitem(sys.modules, kernels.__name__, kernels)
+    monkeypatch.setitem(sys.modules, shuffle.__name__, shuffle)
+    w13 = torch.zeros(32, 2 * 16, 8, dtype=torch.uint8)
+    layer = SimpleNamespace(
+        moe_ep_size=8,
+        hidden_size=16,
+        num_experts=EXPERTS,
+        top_k=TOPK + 1,  # a fused shared expert
+        w13_weight=SimpleNamespace(data=w13, shape=w13.shape),
+    )
+    with pytest.raises(ValueError, match="--disable-shared-experts-fusion"):
+        mega._build_gfx942_weights(layer)
+    assert converted == [] and layer.w13_weight.data is w13
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0.
-"""Aiter MegaMoEV2 (gfx95) and MegaMoEGfx1250 adapters for the SGLang MegaMoE hooks."""
+"""Aiter MegaMoEV2 (gfx95), MegaMoEGfx1250 and MegaMoEGfx942 adapters for the SGLang
+MegaMoE hooks."""
 
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.utils import is_gfx1250_supported
+from sglang.srt.utils import is_gfx942_supported, is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 _MORI_SHMEM_READY = False
 _MEGA_MOE_INSTANCE: dict = {}
 _is_gfx1250 = is_gfx1250_supported()
+_is_gfx942 = is_gfx942_supported()
 
 
 def _import_aiter_megamoe():
@@ -166,6 +168,10 @@ def build_mega_moe_experts_weights(layer) -> None:
             )
         layer._mega_moe_weights_built = True
         return
+    if _is_gfx942:
+        _build_gfx942_weights(layer)
+        layer._mega_moe_weights_built = True
+        return
 
     backend = _import_aiter_megamoe()
 
@@ -203,6 +209,130 @@ def build_mega_moe_experts_weights(layer) -> None:
     layer.w2_weight.data = layer._mega_w2.view(experts, -1)
     w2_scale.data = layer._mega_w2_scale.view(experts, -1)
     layer._mega_moe_weights_built = True
+
+
+def _build_gfx942_weights(layer) -> None:
+    # SGLANG_DSV4_FP4_DEQUANT=1 gives block-FP8 experts, which fp8.py shuffles (16, 16).
+    if layer.w13_weight.data.dtype == torch.float8_e4m3fnuz:
+        quant = "a8w8"
+    else:
+        quant = "a8w4"
+    from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942, eligible
+
+    shape = dict(
+        world_size=layer.moe_ep_size,
+        model_dim=layer.hidden_size,
+        inter_dim=layer.w13_weight.shape[1] // 2,
+        experts=layer.num_experts,
+        topk=layer.top_k,
+    )
+    # Checked before the conversion: the converted experts run nowhere but MegaMoE,
+    # so a batch must never fall back to fused_moe.
+    if not eligible(**shape, quant=quant):
+        raise ValueError(
+            f"gfx942 aiter {quant} MegaMoE does not run this MoE layer ({shape}): it "
+            "runs DeepSeek-V4-Flash's routed experts over EP8 on MI300X, without "
+            "shared expert fusion (--disable-shared-experts-fusion). Pick another "
+            "--moe-a2a-backend."
+        )
+    layer._mega_quant = quant
+    if quant == "a8w8":
+        # Read in place; prepare_weights zeroes the W of zero-scale blocks and
+        # returns the scales as f32.
+        (
+            layer._mega_w1,
+            layer._mega_w1_scale,
+            layer._mega_w2,
+            layer._mega_w2_scale,
+        ) = MegaMoEGfx942.prepare_weights(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+            quant="a8w8",
+        )
+        return
+    # MegaMoEGfx942 takes the a16w4 shuffle with gate_up=False and converts it to its
+    # fd2 form.
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+    experts = layer.w13_weight.shape[0]
+    w13_scale = layer.w13_weight_scale_inv
+    w2_scale = layer.w2_weight_scale_inv
+    w1, w1_scale, w2, w2_scale = MegaMoEGfx942.prepare_weights(
+        shuffle_weight_a16w4(layer.w13_weight.data, 16, False),
+        shuffle_scale_a16w4(
+            w13_scale.data.view(-1, w13_scale.shape[-1]), experts, False
+        ),
+        shuffle_weight_a16w4(layer.w2_weight.data, 16, False),
+        shuffle_scale_a16w4(w2_scale.data.view(-1, w2_scale.shape[-1]), experts, False),
+        w1_gate_up_interleaved=False,
+    )
+    layer._mega_w1, layer._mega_w1_scale = w1, w1_scale
+    layer._mega_w2, layer._mega_w2_scale = w2, w2_scale
+    # Swap the storage so the original experts are freed.
+    layer.w13_weight.data = w1
+    w13_scale.data = w1_scale
+    layer.w2_weight.data = w2
+    w2_scale.data = w2_scale
+
+
+def _get_or_build_mega_moe_gfx942(
+    layer,
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    swiglu_limit: float,
+):
+    rank, world = _ep_rank_world()
+    quant = layer._mega_quant
+    key = (
+        "gfx942",
+        quant,
+        rank,
+        world,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        swiglu_limit,
+    )
+    mega = _MEGA_MOE_INSTANCE.get(key)
+    if mega is not None:
+        return mega
+    _ensure_mori_shmem()
+    from aiter.ops.flydsl.kernels.mega_moe_gfx942 import MegaMoEGfx942
+
+    # Extend steps run the LDS mega kernel; with a decode capacity set, decode steps
+    # run the main kernel at that capacity (the small path). Same for a8w4 and a8w8.
+    decode_mtpr = _decode_mtpr()
+    mega = MegaMoEGfx942(
+        rank=rank,
+        world_size=world,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        w1=layer._mega_w1,
+        w1_scale=layer._mega_w1_scale,
+        w2=layer._mega_w2,
+        w2_scale=layer._mega_w2_scale,
+        max_tok_per_rank=_mtpr(),
+        quant=quant,
+        swiglu_limit=swiglu_limit,
+        small_m_mtprs=(decode_mtpr,),
+        small_m_enabled=decode_mtpr > 0,
+    )
+    logger.info(
+        "Aiter MegaMoEGfx942 %s: max_tok_per_rank=%d, small path mtpr=%d",
+        quant,
+        _mtpr(),
+        mega.small_m_mtpr,
+    )
+    _MEGA_MOE_INSTANCE[key] = mega
+    return mega
 
 
 def _get_or_build_mega_moe(
@@ -344,7 +474,9 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-    if get_is_capture_mode():
+    if get_is_capture_mode() or _is_gfx942:
+        # gfx942 experts are in a form only MegaMoE reads: an oversized batch fails
+        # loudly in _run_mega_routed instead of falling back.
         return True
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
@@ -483,6 +615,25 @@ def _run_mega_routed(
                 x_in.shape[0], ep_world, ep_world * selected_mtpr
             ),
         )[:num_tokens]
+    elif _is_gfx942:
+        mega = _get_or_build_mega_moe_gfx942(
+            moe.experts,
+            model_dim=hidden_size,
+            inter_dim=moe.config.moe_intermediate_size,
+            experts=experts,
+            topk=topk,
+            swiglu_limit=swiglu_limit,
+        )
+        layer = moe.experts
+        mega.bind_weights(
+            layer._mega_w1, layer._mega_w1_scale, layer._mega_w2, layer._mega_w2_scale
+        )
+        if selected_mtpr == mega.small_m_mtpr:
+            output = mega.forward_small_m(
+                x_in, topk_weights, topk_ids, max_tokens=selected_mtpr
+            )[:num_tokens]
+        else:
+            output = mega.forward(x_in, topk_weights, topk_ids)[:num_tokens]
     else:
         mega = _get_or_build_mega_moe(
             moe.experts,

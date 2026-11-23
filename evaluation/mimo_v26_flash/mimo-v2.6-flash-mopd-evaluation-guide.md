@@ -1,6 +1,39 @@
-## 1. Prepare docker image
+## 1. Prepare the MiMo-V2.6-Flash-MOPD image for MI300X (gfx942)
 
-### gfx942
+### Build and start the ROCm 7.14.1 image
+
+Base docker image: `rocm/pytorch:rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.12.0`
+
+Run from the root of the SGLang checkout containing this Dockerfile. The image includes MoRI 1.2.4 and the serving and media dependencies used by the evaluations, please refer details guide and component version in [Build guide and component versions](./build-rocm7.14.1-docker-image-guide.md).
+
+- Build docker image:
+
+```bash
+IMAGE=mimo-flash:rocm7.14.1-gfx942-sgl-f2cab77-aiter-e595aec
+git clone https://github.com/sammysun0711/sglang -b mimo-opt-mxfp4-dflash && cd sglang \
+docker build -f docker/rocm.Dockerfile --target mimo-rocm7141 \
+  --build-arg GPU_ARCH=gfx942 -t "$IMAGE" .
+```
+
+Pass `MORI_REPO` and `MORI_COMMIT` to select a custom fork during docker image build.
+
+- Launch docker container
+
+```bash
+IMAGE=mimo-flash:rocm7.14.1-gfx942-sgl-f2cab77-aiter-e595aec
+MODEL_DIR=/data/models/MiMo-V2.6-Flash-MOPD
+docker run --rm -it --name mimo-flash-rocm-7.14.1 --ipc=host  --network=host --privileged \
+--security-opt seccomp=unconfined --cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE \
+--device=/dev/kfd --device=/dev/dri --device=/dev/mem -v $HOME:/root/workspace \
+-v "$MODEL_DIR:/models/MiMo-V2.6-Flash-MOPD:ro" "$IMAGE" bash
+```
+
+Start the server in this container using section 3 or 4. From a second host terminal, `docker exec -it mimo-flash-rocm-7.14.1 bash`
+
+<details>
+<summary> (Legacy) Prepare docker container with rocm 7.2.0 base docker image </summary>
+
+Base docker image: `rocm/sgl-dev:v0.5.11-rocm720-mi30x-20260510`
 
 ```bash
 docker run -it --name mimo-v26-flash-opt-gfx942 --ipc=host --network=host --privileged --security-opt seccomp=unconfined \
@@ -8,7 +41,7 @@ docker run -it --name mimo-v26-flash-opt-gfx942 --ipc=host --network=host --priv
 -v /data/models:/models  rocm/sgl-dev:v0.5.11-rocm720-mi30x-20260510
 ```
 
-## 2. Environment setup
+## 2. Environment setup for the legacy ROCm 7.2.0 image
 
 ### Clean up pre-installed environment
 
@@ -80,20 +113,20 @@ rm -rf /sgl-workspace/mori
 pip install amd_mori==1.2.4
 ```
 
-## 3. Run DP2/TP8 with dp attention baseline single node prefill benchmark
+</details>
+
+## 3. Run MiMo-v2.6-Flash single node prefill benchmark
 
 The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
 
-The TP8/DP2/EP1 baseline launcher includes the prefill settings: shared SP
+### 3.1. Run DP2/TP8 with DP attention and EP1 prefill benchmark
+
 enabled through `SGLANG_ENABLE_MIMO_SWA_SP=1`, dense TP1, eight Hugging Face
 tokenizer workers, disabled tokenizer batch decode, and a 100-pass prefill
 delayer. Requested memory defaults to `0.75`, including with DFlash enabled.
 Use `TOKENIZER_WORKER_NUM`, `TOKENIZER_BACKEND`, `MEM_FRACTION_STATIC` and
 `PREFILL_DELAYER_MAX_DELAY_PASSES` to override these values, or
-`ENABLE_PREFILL_DELAYER=0` to disable the delayer. No Fastokens overlay is
-required. Additional CLI arguments take precedence over launcher defaults.
-
-### Launch TBO-off server
+`ENABLE_PREFILL_DELAYER=0` to disable the delayer.
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
@@ -108,14 +141,14 @@ SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 ./launch_mimo_v26_flash_dp2_tp8_ep1_dpa_accuracy_baseline.sh
 ```
 
-### Run TBO-off prefill benchmark
+### Run prefill benchmark
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-### Run DP2/TP8 with DP attention and EP8 prefill benchmark
+### 3.2. Run DP2/TP8 with DP attention and EP8 prefill benchmark
 
 Launch global TP8 with DP attention, MORI EP8,
 and DFlash block 8. TBO is disabled in this launcher. The global prefill chunk
@@ -183,36 +216,25 @@ layouts or workspace sizes retain the AITER/reduce-scatter fallback. Full
 attention uses the ordinary output projection and communicator reduction;
 SWA retains its full-head projection.
 
-## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
+## 4. Run MiMo-V2.6-Flash single node decode benchmark with fake prefill
 
-The standalone fake-prefill launcher defines the Flash baseline settings:
+Both EP1 and EP8 run on eight GPUs with global TP8 and two attention TP4 groups. Both use native MXFP4 experts, DFlash block size 8, FlyDSL attention, BF16 target/draft KV, and the fake KV-transfer backend (via `--disaggregation-mode decode --disaggregation-transfer-backend fake`.). The launcher simulates a bonus-inclusive mean acceptance length of 3.5 with `match-expected`. Use the section 3 real-prefill launchers for accuracy tests.
 
-- TP4 x DP2, EP1, DFlash block 8, native MXFP4 weights with FlyDSL A8W4 decode kernel.
-- FlyDSL attention, BF16 target/draft KV, and disabled Quick Reduce/mixed router.
-- It adds `--disaggregation-mode decode --disaggregation-transfer-backend fake`.
-- Acceptance is simulated at length 8 using `SGLANG_SIMULATE_ACC_LEN=3.5` and
-  `SGLANG_SIMULATE_ACC_METHOD=match-expected`, Fake prefill skips prompt computation,
-- so these runs measure performance; use the accuracy launcher with real prefill to evaluate accuracy.
-
-The fake-prefill decode capacity must fit both the full-token and SWA-token
-pools:
+For capacity planning, the following estimates budget all output tokens and one extra full request per DP worker. Here `C` is the concurrency **on that worker**.
 
 ```text
 (C + 1) * (ISL + OSL) <= token_capacity
 (C + 1) * OSL         <= swa_layer_tokens
 ```
 
-Apply these bounds per DP replica, using its admitted request count. Read each
-worker's `token_capacity` from
-`/server_info` -> `internal_states[].memory_usage.token_capacity`, and its
-`swa_layer_tokens` from the server initialization log.
+Read each worker’s full-token capacity from `/server_info` at `internal_states[].memory_usage.token_capacity` and its SWA slots from `swa_layer_tokens` in the launch log.
 
 If SWA is the smaller bound for a short-ISL
 case, increase `SWA_FULL_TOKENS_RATIO` only until the SWA slot count is at
 least the full-token slot count (or the desired concurrency cap). Allocating
 more than that reduces the full-token pool without increasing concurrency.
 
-### Launch server
+### 4.1 Launch the DP2/TP8 w/ DP attention for EP1 attention decode server
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
@@ -222,6 +244,15 @@ SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=512 \
 SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 ./launch_mimo_v26_flash_dp2_tp8_ep1_dpa_decode_fake_prefill_baseline.sh
+```
+
+### 4.2 Launch the DP2/TP8 w/ DP attention for EP8 + MoRI decode server
+
+Start this launcher in place of EP1 for native A8W4 and MoRI all-to-all. On ROCm 7.14.1, cap the full-token KV pool per worker to leave room for target and draft graph capture across all eight ranks. The executable launcher in the merged SGLang pin contains the MoRI-aware path. It sets fake expert routing for this throughput benchmark.
+
+```bash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
+./launch_mimo_v26_flash_dp2_tp8_ep8_dpa_decode_fake_prefill_baseline.sh
 ```
 
 Use `DRY_RUN=1` to inspect the command without starting the server.
@@ -240,8 +271,16 @@ WARMUP_REQUESTS=32 \
 The client uses explicit token IDs, so no four-token subtraction is needed.
 At the 1M context boundary, reserve additional slots for the scheduler:
 use `CASE_SPECS='1040000|1040000|1m|24'` for 1,024 output tokens. An input
-length of `1040000`leaves no scheduler margin and is capped at 1,022 output
-tokens. This margin is separate from tokenizer special tokens.
+length of `1040000` leaves no scheduler margin and can cap the output at
+1,022 tokens. This margin is separate from tokenizer special tokens.
+
+To run all ten EP8 cases from 4K through 1M, keep the same server process and run the client preset in order.
+
+```bash
+cd /sgl-workspace/sglang/evaluation
+BENCHMARK_PRESET=mimo_v26_flash PROMPT_WAVES=4 WARMUP_REQUESTS=32 \
+  ./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh
+```
 
 ### Run decode throughput analysis
 
@@ -286,7 +325,7 @@ same retained samples before normalization. The analyzer also retains
 values.
 
 <details>
-<summary>5. Run DP2/TP4 w/o dp attention baseline single node prefill benchmark</summary>
+<summary>5. (Legacy) Run DP2/TP4 w/o dp attention baseline single node prefill benchmark</summary>
 The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
 
 ### Launch TBO-off server
@@ -341,7 +380,7 @@ existing paths.
 </details>
 
 <details>
-<summary> 6. Run DP2/TP4 w/o dp attention baseline single node decode benchmark with fake prefill</summary>
+<summary> 6. (Legacy) Run DP2/TP4 w/o dp attention baseline single node decode benchmark with fake prefill</summary>
 
 The standalone fake-prefill launcher defines the Flash baseline settings:
 TP4 x DP2, EP1, DFlash block 8, load-time MXFP4-to-FP8 MoE conversion,
@@ -476,10 +515,21 @@ be configured in the server launcher.
 `MIN_GSM8K_ACCURACY=0.97` optionally enforces 97% accuracy;
 `MIN_ACCEPT_LENGTH=4.0` sets the acceptance threshold for every worker.
 
-## 9. Run swe-bench & accuracy benchmark test
+## 9. Run multimodal functional checks
+
+Once the section 3 real-prefill server is ready at `http://127.0.0.1:30001`, run the client in a second shell in the same container. For EP8, start the server with `PERFORMANCE_MODE=0` for real expert routing.
+
+```bash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
+python run_mimo_multimodal_feature_checks.py
+```
+
+The client checks image, audio, video, and mixed concurrent requests across both DP workers. A successful run reports `18/18 checks passed` and writes `summary.md` and `summary.json` in the script directory.
+
+## 10. Run swe-bench & accuracy benchmark test
 
 Follow up customer's swe-bench accuracy verification guide.
 
-## 10. H200 performance evaluation
+## 11. H200 performance evaluation
 
 Follow up customer's shared performance data

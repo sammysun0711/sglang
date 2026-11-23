@@ -1,4 +1,11 @@
-# Usage (to build SGLang ROCm docker image):
+# MiMo-V2.6-Flash on MI300X (ROCm 7.14.1, TheRock, PyTorch 2.12).
+# Customer build and serving guide: evaluation/mimo_v26_flash/build-rocm7.14.1-docker-image-guide.md
+# From the SGLang repository root, using BuildKit:
+#   docker build -f docker/rocm.Dockerfile --target mimo-rocm7141 --build-arg GPU_ARCH=gfx942 -t mimo-flash:rocm7.14.1-gfx942-sglang .
+# Use --target mimo-rocm7141-serving for the serving layer without the media tools.
+# To build a customer MoRI fork, pass --build-arg MORI_REPO=<clone-url> --build-arg MORI_COMMIT=<full-sha>.
+#
+# Existing ROCm 7.0/7.2 build commands used by release CI:
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
@@ -19,6 +26,12 @@ ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+
+ARG BASE_IMAGE_942_ROCM7141=rocm/pytorch:rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.12.0@sha256:cc9b00f90b85c97b015b040fa55c8d1b404b7cacc6ad57d74ee3451c97508da1
+
+# Defaults read by the ROCm 7.0/7.2 build and its CI dependency installer.
+ARG MORI_REPO="https://github.com/ROCm/mori.git"
+ARG MORI_COMMIT="bf99bdf18fc69887a346913ca01c315c2aa9bd4c"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -63,8 +76,177 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="7d604afe5fa7efba63c0dce323b95d9daf2db112"
 
+# Uses the Torch-compatible Triton from the TheRock image.
+FROM ${BASE_IMAGE_942_ROCM7141} AS mimo-rocm7141-toolchain
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+WORKDIR /sgl-workspace
+
+# Keep the ROCm wheels and their local-version suffixes during dependency resolution.
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
+RUN python -c 'from importlib.metadata import version; print("\n".join(f"{p}=={version(p)}" for p in ("torch", "torchvision", "torchaudio", "triton")))' > /etc/mimo-torch-constraints.txt
+ENV PIP_CONSTRAINT=/etc/mimo-torch-constraints.txt
+RUN python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ 'rocm[devel]==7.14.1' \
+    && sdk_root="$(rocm-sdk path --root)" && sdk_cmake="$(rocm-sdk path --cmake)" \
+    && test -f "$sdk_cmake/hip-lang/hip-lang-config.cmake" && test -x "$sdk_root/bin/hipcc" \
+    && ln -sfnT "$sdk_root" /opt/rocm
+# PyTorch extensions and PyHIP use the same TheRock SDK during compilation and JIT.
+ARG GPU_ARCH=gfx942
+ENV ROCM_PATH=/opt/rocm ROCM_HOME=/opt/rocm HIP_PATH=/opt/rocm \
+    CMAKE_PREFIX_PATH=/opt/rocm:/opt/rocm/lib/cmake \
+    PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib \
+    AMDGPU_TARGET=${GPU_ARCH} PYTORCH_ROCM_ARCH=${GPU_ARCH} GPU_ARCHS=${GPU_ARCH} MORI_GPU_ARCHS=${GPU_ARCH} \
+    AITER_USE_SYSTEM_TRITON=1 AITER_ROOT=/sgl-workspace/aiter
+RUN test -x /opt/rocm/llvm/bin/amdgpu-arch && hipcc --version \
+    && python -c 'from torch.utils.cpp_extension import ROCM_HOME, IS_HIP_EXTENSION; assert IS_HIP_EXTENSION and ROCM_HOME == "/opt/rocm"'
+# Keep APT's signature-verification files and downloaded .debs on build-time tmpfs.
+RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt/archives \
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libibverbs-dev libpci-dev libnuma-dev libdrm-dev libelf-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build native extensions with the release SDK and Python; retain the pinned checkouts for inspection.
+FROM mimo-rocm7141-toolchain AS mimo-mooncake-build
+ARG MAX_JOBS=12
+RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt/archives \
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libboost-dev libcurl4-openssl-dev libgoogle-glog-dev libjsoncpp-dev libyaml-cpp-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth=1 --branch 0.5.5 https://github.com/alibaba/yalantinglibs.git /tmp/ylt \
+    && cmake -S /tmp/ylt -B /tmp/ylt-build -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF \
+    && cmake --build /tmp/ylt-build --parallel "$MAX_JOBS" && cmake --install /tmp/ylt-build \
+    && rm -rf /tmp/ylt /tmp/ylt-build
+RUN curl -fsSL --retry 3 https://go.dev/dl/go1.23.8.linux-amd64.tar.gz -o /tmp/go.tar.gz \
+    && echo '45b87381172a58d62c977f27c4683c8681ef36580abecd14fd124d24ca306d3f  /tmp/go.tar.gz' | sha256sum -c - \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz && rm /tmp/go.tar.gz
+ENV PATH=/usr/local/go/bin:${PATH}
+ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
+RUN git clone --filter=blob:none --no-checkout https://github.com/kvcache-ai/Mooncake.git Mooncake \
+    && git -C Mooncake checkout --detach "$MOONCAKE_COMMIT" \
+    && git -C Mooncake submodule update --init --depth=1
+RUN cmake -S Mooncake -B /tmp/mooncake-build -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+        -DUSE_HIP=ON -DUSE_ETCD=ON -DWITH_STORE=ON -DBUILD_EXAMPLES=OFF -DBUILD_UNIT_TESTS=OFF \
+    && cmake --build /tmp/mooncake-build --parallel "$MAX_JOBS" \
+    && cmake --install /tmp/mooncake-build --strip \
+    && mkdir /mooncake-install \
+    && xargs -r -d '\n' -a /tmp/mooncake-build/install_manifest.txt cp --parents -t /mooncake-install -- \
+    && chmod -R u=rwX,go=rX /mooncake-install \
+    && rm -rf /tmp/mooncake-build
+
+FROM mimo-rocm7141-toolchain AS mimo-hadamard-build
+ARG FHT_COMMIT=46efb7d776d38638fc39f3c803eaee3dd7016bd1
+ARG MAX_JOBS=12
+RUN git clone --filter=blob:none --no-checkout https://github.com/jeffdaily/fast-hadamard-transform.git fast-hadamard-transform \
+    && cd fast-hadamard-transform && git checkout --detach "$FHT_COMMIT" \
+    && FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE python -m pip wheel --no-deps --no-build-isolation -w /wheels . \
+    && rm -rf build
+
+FROM mimo-rocm7141-toolchain AS mimo-tilelang-build
+ARG TILELANG_COMMIT=a55a82302bf7f3c5af635b5c9146f728185cc900
+ARG MAX_JOBS=24
+RUN git init -q /opt/tilelang && cd /opt/tilelang \
+    && git remote add origin https://github.com/tile-ai/tilelang.git \
+    && git fetch --depth=1 origin "$TILELANG_COMMIT" && git checkout --detach "$TILELANG_COMMIT" \
+    && git submodule update --init --recursive --depth=1 --jobs=4
+RUN python -m pip install scikit-build-core 'cython>=3' 'z3-solver==4.15.4.0' patchelf
+# The version provider defaults to the historical +cuda.git label. CMake selects HIP explicitly.
+RUN cd /opt/tilelang \
+    && CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=$ROCM_PATH" CMAKE_BUILD_PARALLEL_LEVEL="$MAX_JOBS" \
+       python -m pip wheel -v --no-deps --no-build-isolation --config-settings=wheel.py-api= -w /wheels . \
+    && rm -rf build
+
+FROM mimo-rocm7141-toolchain AS mimo-rocm7141-serving
+ARG SGL_REPO=https://github.com/sammysun0711/sglang.git
+ARG SGL_BRANCH=mimo-opt-mxfp4-dflash
+ARG SGL_COMMIT=f2cab7731ce64a1b07799ed2d637f20c6dbb0830
+ARG MAX_JOBS=12
+
+# Fetch release tags/history for setuptools-scm and only materialize the pinned trees.
+RUN git clone --branch "$SGL_BRANCH" --filter=blob:none --no-checkout "$SGL_REPO" sglang \
+    && git -C sglang merge-base --is-ancestor "$SGL_COMMIT" HEAD \
+    && git -C sglang checkout --detach "$SGL_COMMIT" && test "$(git -C sglang rev-parse HEAD)" = "$SGL_COMMIT"
+RUN cd sglang/sgl-kernel && cp pyproject_rocm.toml pyproject.toml \
+    && python setup_rocm.py bdist_wheel && python -m pip install --no-deps dist/*.whl && rm -rf build dist
+RUN cd sglang && cp python/pyproject_other.toml python/pyproject.toml \
+    && sed -i 's/"compressed-tensors==0.15.0"/"compressed-tensors==0.16.0"/' python/pyproject.toml \
+    && python -m pip install 'apache-tvm-ffi==0.1.9' -e 'python[srt_hip]'
+ARG AITER_REPO=https://github.com/sammysun0711/aiter.git
+ARG AITER_BRANCH=integration/mimo-fp4-dflash
+ARG AITER_COMMIT=e595aec16c3c77469ad9d02f2a7c665e5cef1543
+ARG PYHIP_COMMIT=05142fb773deee77ce024165dd4b986dc4f2cf23
+RUN git clone --branch "$AITER_BRANCH" --filter=blob:none --no-checkout "$AITER_REPO" aiter \
+    && git -C aiter merge-base --is-ancestor "$AITER_COMMIT" HEAD \
+    && git -C aiter checkout --detach "$AITER_COMMIT" && test "$(git -C aiter rev-parse HEAD)" = "$AITER_COMMIT" \
+    && cd aiter && git submodule update --init --depth=1 3rdparty/composable_kernel \
+    && git -C 3rdparty/composable_kernel apply < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch \
+    && sed -i "s|pyhip.git@xiaomi-355-opt|pyhip.git@${PYHIP_COMMIT}|" setup.py \
+    && python -m pip install -r requirements.txt setuptools_scm vcs-versioning \
+    && python -m pip install --no-build-isolation --config-settings editable_mode=compat -e .
+ARG MORI_REPO=
+ARG MORI_COMMIT=f39fa765e897c95995957d0518908cc982a88fc2
+RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt/archives \
+    if [[ -z "$MORI_REPO" ]]; then \
+      test "$MORI_COMMIT" = f39fa765e897c95995957d0518908cc982a88fc2; \
+      apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgrpc++1.51t64; rm -rf /var/lib/apt/lists/*; \
+      echo 'amd_mori==1.2.4 --hash=sha256:52dd1ee81e3f0485e4ddc90e99b42dba64ceb2500ee08564a7ba2f9d1a5ef98c' > /tmp/mori-wheel.txt; \
+      python -m pip install --no-deps --only-binary=:all: --require-hashes -r /tmp/mori-wheel.txt; \
+    else \
+      git clone --filter=blob:none --no-checkout "$MORI_REPO" mori; \
+      git -C mori checkout --detach "$MORI_COMMIT"; test "$(git -C mori rev-parse HEAD)" = "$MORI_COMMIT"; \
+      cd mori; git submodule update --init --depth=1 3rdparty/msgpack-c 3rdparty/spdlog; \
+      python -m pip install 'Cython>=3'; python -m pip install --no-build-isolation .; \
+    fi
+RUN python -m pip install "$ROCM_PATH/share/amd_smi"
+LABEL org.opencontainers.image.revision=$SGL_COMMIT \
+      io.mimo.aiter.revision=$AITER_COMMIT io.mimo.pyhip.revision=$PYHIP_COMMIT \
+      io.mimo.mori.fork=$MORI_REPO io.mimo.mori.revision=$MORI_COMMIT
+ENV SGLANG_USE_AITER=1 SGLANG_DISABLE_CUDNN_CHECK=1 HIP_FORCE_DEV_KERNARG=1
+# The srt_hip extra supplies the gateway's Python dependencies. Install the x86-64 abi3 release wheel.
+RUN echo 'sglang-router==0.3.2 --hash=sha256:ba5a24951e5e0357fe390782fcd1abd861448a87216832dbf2e501a1dd1548eb' \
+    | python -m pip install --only-binary=:all: --no-deps --require-hashes -r /dev/stdin \
+    && sglang-router --version && sglang-router launch --help >/dev/null
+# PyHIP probes the physical GPU at import time. Check its metadata here and import it on the serving node.
+RUN python -m pip check && python -c 'import torch, sgl_kernel.common_ops, sglang, triton, flydsl; import json, os; from importlib.metadata import distribution; from mori import cpp, ops; pyhip = distribution("pyhip"); assert json.loads(pyhip.read_text("direct_url.json"))["vcs_info"]["commit_id"] == os.environ["PYHIP_COMMIT"]; print(pyhip.version, ops.EpDispatchCombineConfig)'
+# Install the gfx942 builds into the serving and multimodal images.
+COPY --from=mimo-mooncake-build /sgl-workspace/Mooncake /sgl-workspace/Mooncake
+COPY --from=mimo-mooncake-build /mooncake-install/ /
+COPY --from=mimo-hadamard-build /sgl-workspace/fast-hadamard-transform /sgl-workspace/fast-hadamard-transform
+COPY --from=mimo-tilelang-build /opt/tilelang /opt/tilelang
+RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt/archives \
+    --mount=type=bind,from=mimo-hadamard-build,source=/wheels,target=/hadamard-wheels \
+    --mount=type=bind,from=mimo-tilelang-build,source=/wheels,target=/tilelang-wheels \
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libgoogle-glog0v6t64 libjsoncpp25 libyaml-cpp0.8 libcurl4t64 \
+    && rm -rf /var/lib/apt/lists/* && ldconfig \
+    && python -m pip install 'z3-solver==4.15.4.0' /hadamard-wheels/*.whl /tilelang-wheels/*.whl \
+    && python -m pip check && test -x /usr/local/bin/mooncake_master
+# TileLang's source-tree loader searches build/lib and build/tvm. Reuse the installed wheel's binaries.
+RUN python -c 'import torch, mooncake.engine, mooncake.store, fast_hadamard_transform, tilelang, xgrammar' \
+    && cd /opt/tilelang && mkdir -p build \
+    && ln -s "$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')/tilelang/lib" build/lib \
+    && ln -s lib build/tvm && python -c 'import tilelang'
+
+# ROCprofiler loads PyTorch's Kineto tool at process startup. Its shared library needs ROCm OpenBLAS.
+ENV ROCP_TOOL_LIBRARIES=/opt/venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so \
+    LD_LIBRARY_PATH=/opt/rocm/lib/host-math/lib:${LD_LIBRARY_PATH}
+RUN python -c 'import ctypes, os; ctypes.CDLL(os.environ["ROCP_TOOL_LIBRARIES"]).rocprofiler_configure'
+
+CMD ["/bin/bash"]
+
+FROM mimo-rocm7141-serving AS mimo-rocm7141
+RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt/archives \
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ffmpeg espeak-ng fonts-dejavu-core && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --only-binary=:all: 'torchcodec==0.13.0' \
+    && python -c 'import av, soundfile, torchaudio, torchvision; from PIL import Image; from torchcodec.decoders import AudioDecoder, VideoDecoder' \
+    && python -m pip check
+
+# Final docker image release target.
+FROM mimo-rocm7141 AS gfx942-rocm7141-release
+
 # ===============================
-# Chosen arch and args
+# Standard ROCm 7.0/7.2 build, selected when no explicit target is requested.
 FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
@@ -103,8 +285,8 @@ ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
-ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="bf99bdf18fc69887a346913ca01c315c2aa9bd4c"
+ARG MORI_REPO
+ARG MORI_COMMIT
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38

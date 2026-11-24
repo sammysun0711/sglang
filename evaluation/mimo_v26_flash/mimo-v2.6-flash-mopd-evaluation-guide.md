@@ -324,6 +324,44 @@ same retained samples before normalization. The analyzer also retains
 `mean_tpot_ms` and `mean_tps_per_request` as explicit mean-based reference
 values.
 
+### Optional: per-request DFlash draft KV ring
+
+The windowed draft only reads the last 1,024 tokens of a request, but its KV pool
+is indexed by the target's slots, so it is as large as the target pool. With
+
+```bash
+SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1
+```
+
+a decode or non-disaggregated server keeps the draft KV in one ring of 1,152
+tokens per request row instead (`slot = row * 1152 + position % 1152`), and the
+freed memory becomes target KV capacity: on the EP8 decode launcher
+`token_capacity` grows from 13.0M to 22.8M tokens per DP replica at the default
+memory settings, with the same step time at equal concurrency. The capacity
+bounds above still apply with the new `token_capacity`. The switch is off by
+default in `launch_mimo_v26_flash_dp2_tp8_ep8_dpa_decode_fake_prefill_baseline.sh`.
+
+Requirements, checked at startup: a draft window
+(`--speculative-draft-window-size`), `SGLANG_DFLASH_FUSED_COMPACT_KV=1`, an
+explicit `--max-running-requests`, no hierarchical cache and no prefix reuse
+(`--disable-radix-cache`). The ring is sized per request row, so a smaller
+`SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS` gives a smaller ring pool.
+
+With real PD disaggregation, start the prefill server with
+
+```bash
+SGLANG_ENABLE_DFLASH_DRAFT_WINDOW_TRANSFER=1
+```
+
+Prefill keeps its draft KV at target slots and sends only the pages of the draft
+window as a separate state component; the decode server with the ring receives
+them into its ring. The switch is implied on a decode server with the ring, and
+may also be set on both servers without a ring to shrink the transfer. When only
+one side transfers the window, the decode server stops at the first request with
+a `PD state mismatch` error that names the switch to set. Only the Mooncake
+transfer backend implements it. `SGLANG_DEBUG_DFLASH_DRAFT_WINDOW_CHECKSUM=1`
+logs a checksum of every transferred window on both servers for validation.
+
 <details>
 <summary>5. (Legacy) Run DP2/TP4 w/o dp attention baseline single node prefill benchmark</summary>
 The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.

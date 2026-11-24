@@ -20,12 +20,13 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -52,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     get_kv_class,
     is_mla_backend,
+    log_dflash_draft_window_checksum,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -83,6 +85,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.speculative.dflash_draft_ring import get_dflash_draft_window
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -318,6 +321,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        # Transfers that pop_preallocated() has prepared but not started yet, as
+        # (receiver, send); see flush_deferred_metadata().
+        self._deferred_metadata: List[Tuple[Any, Callable[[], None]]] = []
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
@@ -408,9 +414,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
-        if self.draft_token_to_kv_pool is not None:
+        if (
+            self.draft_token_to_kv_pool is not None
+            and get_dflash_draft_window(self.draft_token_to_kv_pool) is None
+        ):
             # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
+            # shared with a target model, unless only the DFlash draft window is
+            # transferred: setup_state_kv_args registers that as a state component.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
@@ -575,6 +585,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def resume_memory_occupation(self):
         if hasattr(self.kv_manager, "register_buffer_to_engine"):
             self.kv_manager.register_buffer_to_engine()
+
+    def _defers_metadata(self) -> bool:
+        """True when this server keeps the DFlash draft KV in a per-request ring."""
+        window = get_dflash_draft_window(self.draft_token_to_kv_pool)
+        return window is not None and window.ring_size is not None
+
+    def flush_deferred_metadata(self, synchronize: bool = False) -> None:
+        """Start the transfers pop_preallocated() prepared in this scheduler iteration.
+
+        A draft KV ring row is handed to the next request as soon as its request
+        finishes, while the batch launched before that still writes the finished
+        request's last block into the row. Prefill's remote write of the next
+        request's draft window is not ordered with our GPU stream, so the metadata
+        that starts it is held back until the scheduler has synchronised with every
+        batch launched before the pre-allocation: the caller flushes after it has
+        processed the previous batch's result, or passes ``synchronize`` when it
+        skips that step. A fake transfer writes nothing and is never held back.
+        """
+        if not self._deferred_metadata:
+            return
+        if synchronize:
+            torch.cuda.synchronize()
+        sends, self._deferred_metadata = self._deferred_metadata, []
+        for receiver, send_metadata in sends:
+            # Aborted since pre-allocation: metadata after the abort notice would
+            # revive the room on prefill, which then writes into freed memory.
+            if getattr(receiver, "conclude_state", None) == KVPoll.Failed:
+                continue
+            send_metadata()
 
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
@@ -1035,6 +1074,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            def _draft_window_payload():
+                # Same window positions as prefill, in this server's layout: ring
+                # pages of this request's row, or its target slots without a ring.
+                window = get_dflash_draft_window(self.draft_token_to_kv_pool)
+                return window.page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                    page_size,
+                )
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             for st in state_types:
@@ -1046,6 +1096,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_dsa_payload())
                 elif st == StateType.SWA_RING:
                     state_indices.append(_swa_ring_payload())
+                elif st == StateType.DRAFT_WINDOW:
+                    state_indices.append(_draft_window_payload())
                 else:
                     state_indices.append(None)
 
@@ -1054,12 +1106,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
-            decode_req.kv_receiver.send_metadata(
+            send_metadata = functools.partial(
+                decode_req.kv_receiver.send_metadata,
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
             )
+            if self._defers_metadata() and not _is_fake_transfer(
+                decode_req.req, self.scheduler.server_args
+            ):
+                self._deferred_metadata.append((decode_req.kv_receiver, send_metadata))
+            else:
+                send_metadata()
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1534,6 +1593,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        if envs.SGLANG_DEBUG_DFLASH_DRAFT_WINDOW_CHECKSUM.get() and not (
+            _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+        ):
+            prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+            log_dflash_draft_window_checksum(
+                "decode",
+                prealloc_queue.draft_token_to_kv_pool,
+                prealloc_queue.req_to_token_pool,
+                decode_req.req,
+                len(decode_req.req.origin_input_ids),
+                prealloc_queue.token_to_kv_pool_allocator.page_size,
+            )
+
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
@@ -1751,6 +1823,8 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            # Every batch has been processed before this point: nothing is in flight.
+            self.disagg_decode_prealloc_queue.flush_deferred_metadata()
             if self._engine_paused:
                 continue
 
@@ -1784,6 +1858,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
+                # No result is processed while paused: wait for the batch in flight.
+                self.disagg_decode_prealloc_queue.flush_deferred_metadata(
+                    synchronize=True
+                )
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
@@ -1812,6 +1890,11 @@ class SchedulerDisaggregationDecodeMixin:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
+
+            # The batch that was in flight during this iteration's pre-allocation
+            # has completed (its result was processed above, or earlier in this
+            # iteration): transfers into reused draft KV ring rows may start.
+            self.disagg_decode_prealloc_queue.flush_deferred_metadata()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.

@@ -996,7 +996,12 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
+            elif st in (
+                StateType.SWA,
+                StateType.DSA,
+                StateType.SWA_RING,
+                StateType.DRAFT_WINDOW,
+            ):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1008,6 +1013,24 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DRAFT_WINDOW and (
+                    len(src_indices) != len(dst_indices_local)
+                    or (dst_item_lens and list(dst_item_lens) != list(src_item_lens))
+                ):
+                    # The window is positional and copied page by page: a different
+                    # page count or page size on decode cannot be paired. Fail this
+                    # request (the caller reports the failure) and keep serving.
+                    logger.error(
+                        "DRAFT_WINDOW state mismatch for bootstrap_room %s: pages "
+                        "prefill=%d, decode=%d; page bytes prefill=%s, decode=%s",
+                        req.room,
+                        len(src_indices),
+                        len(dst_indices_local),
+                        list(src_item_lens),
+                        list(dst_item_lens),
+                    )
+                    rc = rc or -1
+                    continue
                 if len(src_indices) != len(dst_indices_local):
                     # SWA_RING is positional: truncating silently misaligns rows
                     # and corrupts KV, so fail loud. Paged SWA/DSA tolerate a
@@ -1297,6 +1320,20 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
+                        if (
+                            ret == 0
+                            and kv_chunk.is_last_chunk
+                            and kv_chunk.state_indices
+                        ):
+                            # State components travel with the last chunk. A failed
+                            # one fails the request like a failed KV chunk: decode
+                            # would otherwise run on state that never arrived.
+                            ret = self.maybe_send_extra(
+                                req,
+                                kv_chunk.state_indices,
+                                executor,
+                                target_rank_registration_info,
+                            )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -1322,14 +1359,6 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices:
-                                self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
-
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req,

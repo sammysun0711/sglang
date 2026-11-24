@@ -722,6 +722,19 @@ class Envs:
     # Plan the windowed DFlash draft from a host-side length bound instead of reading
     # the exact compact lengths back from the device (one blocking sync per step).
     SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND = EnvBool(False)
+    # Keep this server's windowed DFlash draft KV in a small per-request ring instead
+    # of a pool as large as the target's; the freed memory becomes target KV capacity.
+    # For decode and non-disaggregated servers. A decode server with the ring also
+    # receives only the draft window (the transfer switch below is implied there).
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
+    # PD disaggregation: transfer only the pages of the DFlash draft window, as the
+    # DRAFT_WINDOW state component, instead of draft KV for every prompt page. Changes
+    # the transfer, not the storage: set it on the prefill server whenever the decode
+    # server keeps a draft KV ring or sets this switch; the bootstrap rejects a pair
+    # that disagrees.
+    SGLANG_ENABLE_DFLASH_DRAFT_WINDOW_TRANSFER = EnvBool(False)
+    # Log a checksum of every transferred DFlash draft window on prefill and decode.
+    SGLANG_DEBUG_DFLASH_DRAFT_WINDOW_CHECKSUM = EnvBool(False)
     SGLANG_DFLASH_REQUEST_OWNER_VERIFY = EnvBool(False)
     # Opt-in grouped PA for MiMo target DFlash SWA verification.
     SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)

@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import math
 import os
@@ -27,6 +28,15 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
+from sglang.srt.speculative.dflash_draft_ring import (
+    DRAFT_WINDOW_ATTR,
+    DFlashDraftWindow,
+    dflash_draft_kv_ring_problems,
+    dflash_draft_ring_extend_slots,
+    dflash_draft_ring_rows,
+    dflash_draft_ring_size,
+    dflash_draft_window_transfer_problems,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_input_embedding import DFlashInputEmbeddings
@@ -55,6 +65,8 @@ from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
 )
 from sglang.srt.speculative.triton_ops.dflash_compact_kv import (
     compact_dflash_req_to_token,
+    ring_dflash_req_to_token,
+    warmup_ring_dflash_req_to_token,
 )
 from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
     _prepare_dflash_draft_block_unchecked,
@@ -84,6 +96,29 @@ def _get_fused_kv_materialize_helper():
 
         _FusedKVMaterializeHelper = FusedKVMaterializeHelper
     return _FusedKVMaterializeHelper
+
+
+class _DraftRingReqToTokenPool:
+    """Request table of a draft that keeps its KV in a per-request ring.
+
+    Rows are the target's request rows; the ring kernel rewrites a row before
+    every draft forward, so nothing is allocated or freed here. A row only
+    holds the draft window and the block being drafted, not a full context.
+    """
+
+    def __init__(self, num_rows: int, width: int, size: int, device: str):
+        self.size = size
+        self.max_context_len = width
+        self.device = device
+        self.req_to_token = torch.zeros(
+            (num_rows, width), dtype=torch.int32, device=device
+        )
+
+    def available_size(self) -> int:
+        return self.size
+
+    def clear(self) -> None:
+        pass
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -126,6 +161,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
+        # Storage: this server keeps the draft KV in one ring per request row
+        # instead of at the target's slots.
+        self._use_draft_kv_ring = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get()
+        # Transfer: PD moves only the draft window, as its own state component. A
+        # ring cannot receive draft KV by target slot, so a decode ring implies it;
+        # prefill keeps its draft KV at target slots and only changes what it sends.
+        self._use_draft_window_transfer = (
+            server_args.disaggregation_mode != "null"
+            and (
+                envs.SGLANG_ENABLE_DFLASH_DRAFT_WINDOW_TRANSFER.get()
+                or self._use_draft_kv_ring
+            )
+        )
+        if self._use_draft_kv_ring:
+            self._validate_draft_kv_ring(server_args)
+        if self._use_draft_window_transfer:
+            self._validate_draft_window_transfer(server_args)
+        self._draft_ring_size = 0
+        self._draft_ring_rows = 0
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -250,6 +304,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             kv_cache_dtype=self.draft_model_runner.kv_cache_dtype,
             layout=self.draft_parallel_layout,
         )
+        self._draft_cell_size = draft_cell_size
         # MHA pools allocate one additional page for padding/sentinel writes.
         draft_fixed_bytes = draft_cell_size * self.page_size
         logger.info(
@@ -323,8 +378,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFlash mask embedding cache enabled: graph inputs update "
                     "only verified-token rows; eager inputs materialize on demand"
                 )
+        draft_token_cell_size = draft_cell_size
+        if self._use_draft_kv_ring:
+            # One ring per request-table row replaces a draft cell per target token.
+            self._draft_ring_size = dflash_draft_ring_size(
+                int(self.draft_window_size), int(self.page_size), int(self.block_size)
+            )
+            self._draft_ring_rows = dflash_draft_ring_rows(
+                server_args,
+                server_args.max_running_requests // self.model_runner.dp_size,
+            )
+            draft_fixed_bytes += (
+                draft_cell_size * self._draft_ring_rows * self._draft_ring_size
+            )
+            draft_token_cell_size = 0
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFlash draft KV ring: tokens/request=%s, request rows<=%s, reserved bytes=%s",
+                    self._draft_ring_size,
+                    self._draft_ring_rows,
+                    draft_cell_size * self._draft_ring_rows * self._draft_ring_size,
+                )
         self.model_runner.dflash_draft_kv_budget = DFlashKVCacheBudget(
-            self.draft_parallel_layout, draft_cell_size, draft_fixed_bytes
+            self.draft_parallel_layout, draft_token_cell_size, draft_fixed_bytes
         )
         if self.tp_rank == 0:
             logger.info(
@@ -353,6 +429,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
+        # Block slots in the draft KV ring; unused when the draft shares target slots.
+        self._draft_ring_cache_loc_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
@@ -455,6 +535,33 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_parallel_layout, self._draft_server_args
         )
 
+    def _validate_draft_kv_ring(self, server_args: ServerArgs) -> None:
+        """Reject configurations whose draft KV cannot live in a per-request ring."""
+        problems = dflash_draft_kv_ring_problems(
+            server_args,
+            windowed=self.use_compact_draft_cache,
+            fused_compact_kv=(
+                (is_cuda() or is_hip()) and envs.SGLANG_DFLASH_FUSED_COMPACT_KV.get()
+            ),
+        )
+        if problems:
+            raise ValueError(
+                "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING requires " + "; ".join(problems)
+            )
+
+    def _validate_draft_window_transfer(self, server_args: ServerArgs) -> None:
+        """Reject PD setups that cannot send the draft window as a state component."""
+        problems = dflash_draft_window_transfer_problems(
+            server_args, windowed=self.use_compact_draft_cache
+        )
+        if problems:
+            raise ValueError(
+                "Transferring only the DFlash draft window "
+                "(SGLANG_ENABLE_DFLASH_DRAFT_WINDOW_TRANSFER, implied by "
+                "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING on a decode server) requires "
+                + "; ".join(problems)
+            )
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -486,20 +593,54 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
+        # With the draft KV ring, that table addresses a private pool holding
+        # one ring per row of the target request table.
+        if self._use_draft_kv_ring:
+            rows = int(req_to_token_pool.req_to_token.shape[0])
+            if rows > self._draft_ring_rows:
+                raise RuntimeError(
+                    "DFlash draft KV ring was reserved for "
+                    f"{self._draft_ring_rows} request rows, but the request table has {rows}"
+                )
+            memory_pool_config = dataclasses.replace(
+                memory_pool_config, max_total_num_tokens=rows * self._draft_ring_size
+            )
+            # The private table would otherwise be as wide as the target context.
+            draft_req_to_token_pool = _DraftRingReqToTokenPool(
+                num_rows=rows,
+                width=self._draft_ring_size,
+                size=req_to_token_pool.size,
+                device=self.device,
+            )
+        elif self.use_compact_draft_cache:
+            draft_req_to_token_pool = None
+        else:
+            draft_req_to_token_pool = req_to_token_pool
         with self._draft_context():
             self._draft_worker.alloc_memory_pool(
                 memory_pool_config=memory_pool_config,
-                req_to_token_pool=(
-                    None if self.use_compact_draft_cache else req_to_token_pool
-                ),
+                req_to_token_pool=draft_req_to_token_pool,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
         pool = self.draft_model_runner.token_to_kv_pool
+        if self._use_draft_window_transfer:
+            # Read by the disaggregation layer: transfer only the draft window,
+            # listed in this server's layout (ring pages or target slots).
+            setattr(
+                pool,
+                DRAFT_WINDOW_ATTR,
+                DFlashDraftWindow(
+                    window_size=int(self.draft_window_size),
+                    ring_size=(
+                        self._draft_ring_size if self._use_draft_kv_ring else None
+                    ),
+                ),
+            )
         if hasattr(pool, "get_kv_size_bytes"):
             allocated_bytes = pool.get_kv_size_bytes()
             if isinstance(allocated_bytes, tuple):
                 allocated_bytes = sum(allocated_bytes)
-            expected_bytes = self.model_runner.dflash_draft_kv_budget.cell_size * (
+            expected_bytes = self._draft_cell_size * (
                 self.draft_model_runner.max_total_num_tokens + self.page_size
             )
             logger.info(
@@ -537,6 +678,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "SGLANG_ENABLE_DFLASH_DRAFT_LEN_BOUND requires a windowed draft, "
                 "SGLANG_DFLASH_FUSED_COMPACT_KV and AITER unified verification: only "
                 "that path reads the draft lengths on the device"
+            )
+        if self._use_draft_kv_ring:
+            warmup_ring_dflash_req_to_token(
+                self.device,
+                window_size=int(self.draft_window_size),
+                page_size=int(self.page_size),
+                block_size=int(self.block_size),
+                ring_size=self._draft_ring_size,
             )
         logger.info(
             "DFlash draft CUDA graphs: %s",
@@ -648,6 +797,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
+        if self._use_draft_kv_ring:
+            self._draft_ring_cache_loc_buf = torch.empty(
+                (new_cap, block_size), dtype=torch.int64, device=device
+            )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
@@ -1570,9 +1723,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(model_worker_batch.extend_lens)),
             )
+            draft_cache_loc = model_worker_batch.out_cache_loc
+            if self._use_draft_kv_ring:
+                draft_cache_loc = dflash_draft_ring_extend_slots(
+                    model_worker_batch.req_pool_indices,
+                    draft_seq_lens,
+                    ctx_lens,
+                    positions,
+                    self._draft_ring_size,
+                )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=model_worker_batch.out_cache_loc,
+                cache_loc=draft_cache_loc,
                 positions=positions,
             )
 
@@ -1712,22 +1874,38 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        # Slots of the block in the draft KV pool: the target's unless the draft
+        # keeps its own ring.
+        draft_cache_loc_2d = verify_out_cache_loc_2d
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             if self._use_fused_compact_kv:
                 draft_prefix_lens = self._draft_compact_seq_lens_buf[:bs]
-                compact_dflash_req_to_token(
-                    prefix_lens,
-                    model_worker_batch.req_pool_indices,
-                    self.model_runner.req_to_token_pool.req_to_token,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    verify_out_cache_loc_2d,
-                    draft_prefix_lens,
-                    window_size=int(self.draft_window_size),
-                    page_size=int(self.page_size),
-                )
+                if self._use_draft_kv_ring:
+                    draft_cache_loc_2d = self._draft_ring_cache_loc_buf[:bs]
+                    ring_dflash_req_to_token(
+                        prefix_lens,
+                        model_worker_batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        draft_cache_loc_2d,
+                        draft_prefix_lens,
+                        window_size=int(self.draft_window_size),
+                        page_size=int(self.page_size),
+                        ring_size=self._draft_ring_size,
+                    )
+                else:
+                    compact_dflash_req_to_token(
+                        prefix_lens,
+                        model_worker_batch.req_pool_indices,
+                        self.model_runner.req_to_token_pool.req_to_token,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        verify_out_cache_loc_2d,
+                        draft_prefix_lens,
+                        window_size=int(self.draft_window_size),
+                        page_size=int(self.page_size),
+                    )
                 if (
                     self._use_draft_len_bound
                     and draft_input.planning_seq_lens_cpu is not None
@@ -1804,13 +1982,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
 
+        draft_cache_loc = draft_cache_loc_2d.reshape(-1)
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
             input_ids=block_ids.flatten(),
             req_pool_indices=model_worker_batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -2053,8 +2232,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=draft_cache_loc,
+            cache_loc_2d=draft_cache_loc_2d,
             positions=positions,
             commit_lens=commit_lens,
         )

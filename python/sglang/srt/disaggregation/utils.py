@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 from collections import deque
@@ -13,6 +14,10 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.speculative.dflash_draft_ring import (
+    dflash_draft_window_checksum,
+    get_dflash_draft_window,
+)
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -25,6 +30,8 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 #########################
 # Constants & Enums
@@ -604,6 +611,72 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def check_pd_dflash_draft_window(
+    prefill_window_size: Optional[int], decode_window_size: Optional[int]
+) -> None:
+    """Bootstrap check: prefill and decode must agree on the DFlash draft window.
+
+    Each argument is the draft window size of a server that transfers the window
+    as the DRAFT_WINDOW state component, or None for a server that does not (a
+    prefill server built before this check reports None too). State buffers and
+    per-request state indices are matched by position, so a one-sided switch
+    would leave decode's draft KV unwritten, and different window sizes would
+    list different pages; neither fails on its own, the draft just accepts less.
+    """
+    if prefill_window_size == decode_window_size:
+        return
+    if prefill_window_size is None or decode_window_size is None:
+        only = "decode" if prefill_window_size is None else "prefill"
+        raise RuntimeError(
+            f"PD state mismatch: only the {only} server transfers the DFlash draft "
+            "window as a state component. Set "
+            "SGLANG_ENABLE_DFLASH_DRAFT_WINDOW_TRANSFER=1 on the prefill server when "
+            "the decode server sets it or keeps a draft KV ring "
+            "(SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1); otherwise leave both switches "
+            "unset on both servers."
+        )
+    raise RuntimeError(
+        f"PD state mismatch: the prefill server transfers a DFlash draft window of "
+        f"{prefill_window_size} tokens, the decode server one of "
+        f"{decode_window_size}. Both servers must use the same "
+        "--speculative-draft-window-size."
+    )
+
+
+def log_dflash_draft_window_checksum(
+    role: str,
+    draft_token_to_kv_pool,
+    req_to_token_pool,
+    req,
+    seq_len: int,
+    page_size: int,
+) -> None:
+    """SGLANG_DEBUG_DFLASH_DRAFT_WINDOW_CHECKSUM: log this rank's draft window.
+
+    Prefill logs what it sends and decode what it holds once the transfer is
+    done; equal values per (bootstrap room, attention TP rank) mean the window
+    sits where decode's draft will read it.
+    """
+    window = get_dflash_draft_window(draft_token_to_kv_pool)
+    if window is None:
+        return
+    from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+    pages = window.page_indices(
+        req_to_token_pool.req_to_token, req.req_pool_idx, seq_len, page_size
+    )
+    logger.info(
+        "DFlash draft window checksum: role=%s room=%s attn_tp_rank=%s seq_len=%s "
+        "pages=%s value=%08x",
+        role,
+        req.bootstrap_room,
+        get_attention_tp_rank(),
+        seq_len,
+        len(pages),
+        dflash_draft_window_checksum(draft_token_to_kv_pool, pages),
+    )
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -698,6 +771,21 @@ def setup_state_kv_args(
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
+
+    draft_window = get_dflash_draft_window(draft_token_to_kv_pool)
+    # Published at bootstrap, where decode compares it with its own.
+    kv_args.dflash_draft_window_size = (
+        draft_window.window_size if draft_window is not None else None
+    )
+    if draft_window is not None:
+        # Only the draft window is transferred, as a state component of its own:
+        # a ring is not indexed by target slots, so its pages cannot ride along
+        # with the main KV, and prefill then sends the same pages either way.
+        append_state_component(
+            kv_args,
+            StateType.DRAFT_WINDOW,
+            *draft_token_to_kv_pool.get_contiguous_buf_infos(),
+        )
 
     if (
         StateType.MAMBA not in kv_args.state_types

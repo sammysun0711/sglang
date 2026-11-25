@@ -230,15 +230,16 @@ def _build_gfx942_weights(layer) -> None:
     # so a batch must never fall back to fused_moe.
     if not eligible(**shape, quant=quant):
         raise ValueError(
-            f"gfx942 aiter {quant} MegaMoE does not run this MoE layer ({shape}): it "
-            "runs DeepSeek-V4-Flash's routed experts over EP8 on MI300X, without "
-            "shared expert fusion (--disable-shared-experts-fusion). Pick another "
+            f"gfx942 aiter {quant} MegaMoE does not run this MoE layer ({shape}) on "
+            "this GPU; aiter.ops.flydsl.kernels.mega_moe_gfx942.eligible lists what "
+            "it runs (EP8, DeepSeek-V4-Flash's routed experts among others, no fused "
+            "shared expert: --disable-shared-experts-fusion). Pick another "
             "--moe-a2a-backend."
         )
     layer._mega_quant = quant
     if quant == "a8w8":
-        # Read in place; prepare_weights zeroes the W of zero-scale blocks and
-        # returns the scales as f32.
+        # W is read in place (prepare_weights zeroes the W of zero-scale blocks); the
+        # scales come back as new f32 tensors with no zero entries.
         (
             layer._mega_w1,
             layer._mega_w1_scale,
